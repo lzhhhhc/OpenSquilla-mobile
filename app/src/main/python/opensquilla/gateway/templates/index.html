@@ -91,20 +91,24 @@
           z-index: 2147483000 !important;
         }
         .composer-model-routing {
-          /* Session routing anchors ABOVE the input panel instead of the
+          /* Session routing pins just ABOVE the composer dock instead of the
              centered fixed layer: with the keyboard up the dock rides into
              the centered band and the disclaimer pill painted across the
-             menu (z-order inside the glass panel is not reliable). */
-          position: absolute !important;
+             menu. adjustResize moves the dock inside the layout viewport,
+             so a dock-height anchored bottom keeps the menu glued above the
+             composer in every keyboard state. (absolute anchoring here is
+             not usable: the nearest positioned ancestor is the narrow
+             action button, which collapsed the menu into a stick.) */
+          position: fixed !important;
           top: auto !important;
-          bottom: calc(100% + 8px) !important;
+          bottom: calc(var(--composer-dock-h, 12.5rem) + env(safe-area-inset-bottom, 0px) + 12px) !important;
           left: 10px !important;
           right: 10px !important;
           width: auto !important;
           min-width: 0 !important;
           max-width: none !important;
           height: auto !important;
-          max-height: 50vh !important;
+          max-height: 52vh !important;
           margin: 0 !important;
           box-sizing: border-box !important;
           overflow-x: hidden !important;
