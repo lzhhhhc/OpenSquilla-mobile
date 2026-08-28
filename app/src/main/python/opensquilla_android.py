@@ -15,6 +15,18 @@ def serve(home_dir: str) -> int:
     os.environ["HOME"] = home_dir
     os.environ.setdefault("OPENSQUILLA_STATE_DIR", os.path.join(home_dir, "state"))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    # ── Mobile resilience profile ────────────────────────────────────────
+    # EMUI/MagicOS freezes the whole process whenever the app is not the
+    # foreground app — even with an active foreground service. Freezing
+    # pauses the asyncio loop while CLOCK_MONOTONIC keeps running, so every
+    # wall-clock deadline eats the frozen span and expires the instant the
+    # process thaws: the turn then dies with "The connection to the model
+    # provider was interrupted". Give the engine deadlines enough headroom
+    # to survive ordinary background freezes. Explicit operator config and
+    # explicit env still win — setdefault never overrides them.
+    os.environ.setdefault("OPENSQUILLA_AGENT_REQUEST_TIMEOUT", "900")
+    os.environ.setdefault("OPENSQUILLA_AGENT_TOOL_TIMEOUT", "300")
+    os.environ.setdefault("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", "3600")
     # Some libs probe TMPDIR / temp paths; Chaquopy exposes /data/local/tmp as tmp.
     os.environ.setdefault("TMPDIR", os.path.join(home_dir, "tmp"))
     os.makedirs(os.environ["TMPDIR"], exist_ok=True)

@@ -6,6 +6,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -208,6 +209,8 @@ class MainActivity : Activity() {
         Log.d("SQLaunch", "step6 notification done")
         ensureBatteryExemption()
         Log.d("SQLaunch", "step7 battery done")
+        ensureBackgroundKeepAliveHint()
+        Log.d("SQLaunch", "step8 background keepalive hint done")
         Thread {
             waitPort("127.0.0.1", port, timeoutMs = 90_000)
             Log.d("SQLaunch", "step8 port ready, loading url")
@@ -310,7 +313,6 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4211)
         }
     }
-
     private fun ensureBatteryExemption() {
         val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         if (pm.isIgnoringBatteryOptimizations(packageName)) return
@@ -337,6 +339,103 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("暂不", null)
             .show()
+    }
+
+    // ── Background-freeze onboarding (all OEMs) ──────────────────────────────
+    // Most Android OEMs freeze or throttle background processes regardless of
+    // the active foreground service; freezing pauses the asyncio event loop
+    // while clocks keep running, so in-flight turns die the moment the process
+    // thaws ("connection to the model provider was interrupted"). The engine
+    // deadlines now tolerate ordinary freezes, but the durable fix is the
+    // OEM's own keep-alive switches (autostart / background activity /
+    // battery unrestricted / Recents lock). Show the steps once on every
+    // device and deep-link the vendor's own management page when known.
+    private fun ensureBackgroundKeepAliveHint() {
+        val prefs = getPreferences(Context.MODE_PRIVATE)
+        if (prefs.getBoolean("background_keepalive_hint_dismissed", false)) return
+        AlertDialog.Builder(this)
+            .setTitle("允许后台运行")
+            .setMessage(
+                "切出 OpenSquilla 后，部分系统会冻结或限制后台进程，导致进行中的任务中断。\n\n建议在系统设置中：\n" +
+                    "1. 允许 OpenSquilla「自启动 / 关联启动 / 后台运行」（各厂商叫法不同）；\n" +
+                    "2. 电池/省电策略设为不限制（此前已引导）；\n" +
+                    "3. 最近任务界面下拉 OpenSquilla 卡片加锁。"
+            )
+            .setPositiveButton("打开设置") { _, _ ->
+                prefs.edit().putBoolean("background_keepalive_hint_dismissed", true).apply()
+                openOemBackgroundSettings()
+            }
+            .setNegativeButton("下次再说") { _, _ ->
+                prefs.edit().putBoolean("background_keepalive_hint_dismissed", true).apply()
+            }
+            .show()
+    }
+
+    /**
+     * Open the vendor's autostart / background-activity management page for
+     * this app. Every vendor entry is best-effort: unknown components fall
+     * through to the system app-details page, which every Android device has.
+     */
+    private fun openOemBackgroundSettings() {
+        val manufacturer = (Build.MANUFACTURER ?: "").uppercase()
+        val brand = (Build.BRAND ?: "").uppercase()
+        val vendorKey = when {
+            manufacturer.contains("HUAWEI") || manufacturer.contains("HONOR") -> "huawei"
+            manufacturer.contains("XIAOMI") || brand.contains("REDMI") || brand.contains("POCO") -> "xiaomi"
+            manufacturer.contains("OPPO") || manufacturer.contains("REALME")
+                || manufacturer.contains("ONEPLUS") -> "oppo"
+            manufacturer.contains("VIVO") || manufacturer.contains("IQOO") -> "vivo"
+            manufacturer.contains("SAMSUNG") -> "samsung"
+            manufacturer.contains("MEIZU") -> "meizu"
+            manufacturer.contains("TRANSSESSION") || brand.contains("TECNO")
+                || brand.contains("INFINIX") || brand.contains("ITEL") -> "transsion"
+            else -> "generic"
+        }
+        val components: List<Pair<String, String>> = when (vendorKey) {
+            "huawei" -> listOf(
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.appcontrol.activity.StartupAppControlActivity",
+            )
+            "xiaomi" -> listOf(
+                "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+                "com.miui.securitycenter" to "com.miui.powercenter.PowerSettings",
+            )
+            "oppo" -> listOf(
+                "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+                "com.coloros.safecenter" to "com.coloros.safecenter.startup.StartupAppListActivity",
+                "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity",
+            )
+            "vivo" -> listOf(
+                "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+                "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.PurviewTabActivity",
+                "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager",
+            )
+            "meizu" -> listOf(
+                "com.meizu.safe" to "com.meizu.safe.permission.SmartBGActivity",
+                "com.meizu.safe" to "com.meizu.safe.security.ShowAppListActivity",
+            )
+            "transsion" -> listOf(
+                "com.transsion.permissionmanager" to "com.transsion.permissionmanager.permission.StartupAPPsControlActivity",
+            )
+            "samsung" -> listOf(
+                "com.samsung.android.lox" to "com.samsung.android.lox.activity.MainActivity",
+            )
+            else -> emptyList()
+        }
+        for ((packageName, className) in components) {
+            try {
+                startActivity(Intent().setComponent(ComponentName(packageName, className)))
+                return
+            } catch (e: Exception) {
+                // Try the next known component for this vendor.
+            }
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+            )
+        } catch (ignored: Exception) {
+        }
     }
 
     private fun statusBarHeightPx(): Int {
