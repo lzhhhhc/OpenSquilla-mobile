@@ -68,36 +68,17 @@
       @media screen and (max-width: 900px) {
         html { -webkit-text-size-adjust: 100%; }
         body { overflow-x: hidden; }
+        .composer-model-routing,
         .composer-run-mode,
         .composer-add-menu,
         .chat-more-actions-menu {
-          position: fixed !important;
-          top: 50% !important;
-          right: 12px !important;
-          bottom: auto !important;
-          left: 12px !important;
-          width: auto !important;
-          min-width: 0 !important;
-          max-width: none !important;
-          height: auto !important;
-          max-height: calc(100vh - 24px) !important;
-          margin: 0 !important;
-          padding-left: 16px !important;
-          padding-right: 16px !important;
-          box-sizing: border-box !important;
-          overflow-x: hidden !important;
-          overflow-y: auto !important;
-          transform: translate3d(0, -50%, 0) !important;
-          z-index: 2147483000 !important;
-        }
-        .composer-model-routing {
-          /* Session routing pins just ABOVE the composer dock instead of the
+          /* All composer menus pin just ABOVE the composer dock instead of the
              centered fixed layer: with the keyboard up the dock rides into
              the centered band and the disclaimer pill painted across the
              menu. adjustResize moves the dock inside the layout viewport,
-             so a dock-height anchored bottom keeps the menu glued above the
-             composer in every keyboard state. (absolute anchoring here is
-             not usable: the nearest positioned ancestor is the narrow
+             so a dock-height anchored bottom keeps every menu glued above
+             the composer in every keyboard state. (absolute anchoring here
+             is not usable: the nearest positioned ancestor is the narrow
              action button, which collapsed the menu into a stick.) */
           position: fixed !important;
           top: auto !important;
@@ -110,6 +91,8 @@
           height: auto !important;
           max-height: 52vh !important;
           margin: 0 !important;
+          padding-left: 16px !important;
+          padding-right: 16px !important;
           box-sizing: border-box !important;
           overflow-x: hidden !important;
           overflow-y: auto !important;
