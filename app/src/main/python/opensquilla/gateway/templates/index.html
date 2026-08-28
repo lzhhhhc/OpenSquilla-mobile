@@ -68,7 +68,6 @@
       @media screen and (max-width: 900px) {
         html { -webkit-text-size-adjust: 100%; }
         body { overflow-x: hidden; }
-        .composer-model-routing,
         .composer-run-mode,
         .composer-add-menu,
         .chat-more-actions-menu {
@@ -90,6 +89,56 @@
           overflow-y: auto !important;
           transform: translate3d(0, -50%, 0) !important;
           z-index: 2147483000 !important;
+        }
+        .composer-model-routing {
+          /* Session routing anchors ABOVE the input panel instead of the
+             centered fixed layer: with the keyboard up the dock rides into
+             the centered band and the disclaimer pill painted across the
+             menu (z-order inside the glass panel is not reliable). */
+          position: absolute !important;
+          top: auto !important;
+          bottom: calc(100% + 8px) !important;
+          left: 10px !important;
+          right: 10px !important;
+          width: auto !important;
+          min-width: 0 !important;
+          max-width: none !important;
+          height: auto !important;
+          max-height: 50vh !important;
+          margin: 0 !important;
+          box-sizing: border-box !important;
+          overflow-x: hidden !important;
+          overflow-y: auto !important;
+          transform: none !important;
+          background: var(--bg-surface) !important;
+          z-index: 2147483000 !important;
+        }
+        /* The disclaimer pill carries its own backdrop-filter stacking
+           context; without an explicit z-index the panel loses the paint
+           race against it whenever a composer menu is open. */
+        .chat-input-panel {
+          z-index: 1 !important;
+        }
+        /* The router FX strip pans horizontally; on phones it is noise. */
+        .router-fx-header,
+        .router-fx-grid {
+          display: none !important;
+        }
+        /* Compact composer: the forced panel min-height leaves a tall empty
+           box above the keyboard. */
+        .chat-input-panel {
+          min-height: 0 !important;
+        }
+        .chat-composer--new-landing .chat-input-panel {
+          min-height: 0 !important;
+        }
+        .chat-composer:not(.chat-composer--collapsed) .chat-textarea {
+          min-height: 46px !important;
+          max-height: 120px !important;
+          padding: 0.625rem 0.875rem 0.25rem !important;
+        }
+        .chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
+          padding: 0.125rem 0.5rem !important;
         }
         .composer-model-routing *,
         .composer-run-mode *,
