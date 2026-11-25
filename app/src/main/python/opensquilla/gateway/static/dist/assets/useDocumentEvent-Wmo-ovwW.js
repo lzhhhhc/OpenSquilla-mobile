@@ -1,0 +1,2 @@
+import{L as e,R as t}from"./_plugin-vue_export-helper-BR3NOi5Y.js";function n(n,r,i){e(()=>{document.addEventListener(n,r,i)}),t(()=>{document.removeEventListener(n,r,i)})}export{n as t};
+//# sourceMappingURL=useDocumentEvent-Wmo-ovwW.js.map

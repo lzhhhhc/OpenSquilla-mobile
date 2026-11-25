@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import hmac
 import os
@@ -12,16 +13,18 @@ import time
 import unicodedata
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import ExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from functools import partial, wraps
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import structlog
 import yaml
 
 from opensquilla.paths import default_opensquilla_home
+from opensquilla.skills.catalog_policy import is_user_invocable_ordinary
 from opensquilla.skills.eligibility import (
     EligibilityContext,
     diagnose_eligibility,
@@ -48,8 +51,16 @@ from opensquilla.skills.hub.lockfile import (
     compute_sha256,
     compute_tree_sha256,
 )
+from opensquilla.skills.hub.operations import (
+    InstallOperations,
+    InstallOperationStore,
+    current_install_operation,
+    operation_database,
+    report_install_progress_async,
+    run_operation_worker,
+)
 from opensquilla.skills.hub.router import SourceRouter
-from opensquilla.skills.hub.scanner import ScanResult, scan_skill_bundle
+from opensquilla.skills.hub.scanner import ScanResult, scan_skill_tree
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillSource,
@@ -65,6 +76,7 @@ from opensquilla.skills.hub.transaction import (
     fsync_directory,
     fsync_staging_tree,
     guard_retained_recovery_journal,
+    managed_root_identity,
     path_is_occupied,
     recover_pending_skill_transaction,
     remove_transaction_journal,
@@ -72,6 +84,12 @@ from opensquilla.skills.hub.transaction import (
     staging_root,
     validate_transaction_journal_paths,
 )
+from opensquilla.skills.hub.tree_io import (
+    MAX_TREE_ENTRIES,
+    artifact_tree_digest,
+    validate_tree_entry_count,
+)
+from opensquilla.skills.io_worker import run_staging_worker
 from opensquilla.skills.manifest import (
     _parse_skill_frontmatter_strict,
     validate_hub_candidate,
@@ -85,8 +103,8 @@ _SAFE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 _SAFE_TRACKED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FRONTMATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n(.*)$", re.DOTALL)
 _MAX_MANAGED_SKILLS = 200
-_MAX_BUNDLE_ENTRIES = 2_048
-_MAX_BUNDLE_BYTES = 50 * 1024 * 1024
+_MAX_BUNDLE_ENTRIES = MAX_TREE_ENTRIES
+_MAX_BUNDLE_BYTES: int | None = None
 _MAX_BUNDLE_DEPTH = 32
 _DEGRADED_CAPABILITIES_KEY = "degraded_capabilities"
 _SCOPED_TOOL_PERMISSIONS_CAPABILITY = "scoped_tool_permissions"
@@ -149,6 +167,7 @@ async def _run_postflight_worker(
     function: Callable[..., Any],
     /,
     *args: Any,
+    _settling: bool = False,
     **kwargs: Any,
 ) -> Any:
     """Keep transaction fences held until a postflight thread settles.
@@ -156,9 +175,14 @@ async def _run_postflight_worker(
     Cancelling ``asyncio.to_thread`` cannot stop its underlying thread. Defer
     caller cancellation, including repeated requests, until the worker exits so
     rollback cannot race a catalog reload that is still reading managed files.
+    Once exception settlement has begun, let recovery return its proof and
+    diagnostics; the original exception still determines the terminal outcome.
     """
 
-    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    context = contextvars.copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, context.run, partial(function, *args, **kwargs),
+    )
     cancellation: asyncio.CancelledError | None = None
     while not operation.done():
         try:
@@ -169,7 +193,7 @@ async def _run_postflight_worker(
             if cancellation is None:
                 raise
             break
-    if cancellation is not None:
+    if cancellation is not None and not _settling:
         try:
             operation.result()
         except BaseException:
@@ -269,7 +293,9 @@ def _selection_for_spec(
         return SkillSelectionState.SHADOWED
     if not is_skill_available_live(spec.name):
         return SkillSelectionState.DISABLED
-    if spec.disable_model_invocation:
+    if spec.disable_model_invocation and not is_user_invocable_ordinary(
+        spec,
+    ):
         return SkillSelectionState.HIDDEN
     return SkillSelectionState.ACTIVE
 
@@ -417,6 +443,8 @@ class InstallResult:
                 "verdict": self.scan.verdict,
                 "strategy": self.scan.strategy,
                 "findings": [vars(item) for item in self.scan.findings],
+                "totalFindings": self.scan.total_findings,
+                "truncated": self.scan.truncated,
             }
         resolution_payload: dict[str, Any] | None = None
         if self.resolution is not None:
@@ -451,6 +479,10 @@ class InstallResult:
             "rollbackPerformed": self.rollback_performed,
             "catalogGeneration": self.catalog_generation,
             "effectiveFrom": self.effective_from,
+            **({"recoveryRequired": True} if any(
+                item.blocking and item.code == "RECOVERY_REQUIRED"
+                for item in self.diagnostics
+            ) else {}),
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -503,6 +535,7 @@ def _write_bundle(
     }
     try:
         validate_portable_file_paths(canonical_paths.values())
+        validate_tree_entry_count(canonical_paths.values(), limit=_MAX_BUNDLE_ENTRIES)
     except ValueError as exc:
         raise ValueError(f"bundle contains a portable path collision: {exc}") from None
     candidate_dir.mkdir(parents=True, exist_ok=False)
@@ -510,8 +543,8 @@ def _write_bundle(
         relative = canonical_paths[raw_name]
         content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
         total_bytes += len(content)
-        if total_bytes > _MAX_BUNDLE_BYTES:
-            raise ValueError("bundle exceeds the 50 MiB expanded-size limit")
+        if _MAX_BUNDLE_BYTES is not None and total_bytes > _MAX_BUNDLE_BYTES:
+            raise ValueError("bundle exceeds configured expanded-size limit")
         destination = candidate_dir.joinpath(*relative.parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("xb") as handle:
@@ -553,7 +586,7 @@ def _normalize_legacy_manifest(
     resolution: SourceResolution,
     source_id: str,
 ) -> tuple[Path, bool]:
-    allow_community_legacy = source_id in {"clawhub", "github"}
+    allow_community_legacy = source_id in {"clawhub", "skillhub", "github"}
     manifests = [
         child
         for child in candidate_dir.iterdir()
@@ -570,7 +603,14 @@ def _normalize_legacy_manifest(
         )
         raise ValueError(f"bundle must contain exactly one root {expected}")
     manifest = manifests[0]
-    raw = manifest.read_bytes()
+    from opensquilla.skills.manifest import MAX_SKILL_FILE_BYTES
+
+    with manifest.open("rb") as handle:
+        raw = handle.read(MAX_SKILL_FILE_BYTES + 1)
+    if len(raw) > MAX_SKILL_FILE_BYTES:
+        raise _CandidateManifestError(
+            "MANIFEST_TOO_LARGE", f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes",
+        )
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -660,7 +700,13 @@ def _normalize_legacy_manifest(
             sort_keys=False,
             width=1_000,
         ).rstrip()
-        manifest.write_text(f"---\n{rendered}\n---\n{body.strip()}\n", encoding="utf-8")
+        # Keep the normalized bytes identical across platforms; Windows text
+        # translation must not change the installed manifest or its digest.
+        manifest.write_text(
+            f"---\n{rendered}\n---\n{body.strip()}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     return final_dir, changed
 
 
@@ -1137,6 +1183,27 @@ def _update_precondition(entry: LockEntry) -> tuple[str, str, str, str, str]:
     )
 
 
+def _owned_mutation[**Params, Result](
+    function: Callable[Params, Awaitable[Result]],
+) -> Callable[Params, Awaitable[Result]]:
+    @wraps(function)
+    async def owned(*args: Params.args, **kwargs: Params.kwargs) -> Result:
+        service = cast("SkillManagementService", args[0])
+        if service._closing:
+            raise RuntimeError("Skill installation service is closing")
+        task = asyncio.current_task()
+        assert task is not None
+        done = asyncio.get_running_loop().create_future()
+        service._mutation_owners[done] = task
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            service._mutation_owners.pop(done, None)
+            done.set_result(None)
+
+    return owned
+
+
 class SkillManagementService:
     """Dependency-injected, transactional Community Skill manager."""
 
@@ -1159,11 +1226,66 @@ class SkillManagementService:
         self._journal_path = journal_path or default_journal_path(managed_dir)
         self._mutation_lock = mutation_lock or mutation_lock_for(managed_dir)
         self._offline = offline or loader is None
+        self._install_operations: InstallOperations | None = None
+        self._install_operations_preparation_lock = asyncio.Lock()
+        self._install_operations_recovered = False
+        self._closing = False
+        self._mutation_owners: dict[asyncio.Future[None], asyncio.Task[Any]] = {}
         self._recovery_required_diagnostics: tuple[SkillDiagnostic, ...] = ()
         bind_lockfile = getattr(loader, "bind_managed_lockfile", None)
         if callable(bind_lockfile):
             bind_lockfile(lockfile_path)
         self._observe_recovery(list(startup_recovery_diagnostics))
+
+    @property
+    def install_operations(self) -> InstallOperations:
+        if self._install_operations is None:
+            if self._closing:
+                raise RuntimeError("Skill installation service is closing")
+            self._install_operations = InstallOperations(InstallOperationStore(
+                operation_database(self._journal_path),
+                root_id=managed_root_identity(self._managed_dir),
+                initialize=False,
+            ))
+        return self._install_operations
+
+    async def close(self, *, timeout: float | None = None) -> bool:
+        """Settle owned installs before the Gateway closes their dependencies."""
+        self._closing = True
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
+
+        def remaining() -> float | None:
+            return None if deadline is None else max(0.0, deadline - loop.time())
+
+        # Track method completion, not the RPC Task's entire connection lifetime.
+        # The methods own rollback and publication fences even without a receipt.
+        for task in set(self._mutation_owners.values()):
+            if not task.cancelling():
+                task.cancel()
+        operations_clean = True
+        if self._install_operations is not None:
+            operations_clean = await self._install_operations.close(timeout=remaining())
+        pending = set(self._mutation_owners)
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=remaining())
+        return operations_clean and not pending
+
+    async def prepare_install_operations(self, *, recover_orphans: bool = False) -> None:
+        """Prepare receipts after the composition root has acquired its writer lease."""
+        operations = self.install_operations
+
+        def prepare() -> bool:
+            operations.store.initialize()
+            if recover_orphans and not self._install_operations_recovered:
+                if self._journal_path.exists():
+                    return False
+                operations.store.recover_orphans(self._journal_path)
+                return True
+            return self._install_operations_recovered
+
+        async with self._install_operations_preparation_lock:
+            self._install_operations_recovered = await run_operation_worker(prepare)
 
     @property
     def managed_dir(self) -> Path:
@@ -1295,6 +1417,7 @@ class SkillManagementService:
         self,
         identifier: str,
         source_id: str,
+        destination: Path | None = None,
     ) -> tuple[SourceResolution | None, SkillBundle | None, list[SkillDiagnostic]]:
         diagnostics: list[SkillDiagnostic] = []
         try:
@@ -1370,9 +1493,26 @@ class SkillManagementService:
                 )
         if any(item.blocking for item in diagnostics):
             return resolution, None, diagnostics
+        requires_immutable = bool(
+            getattr(source, "requires_immutable_resolution", False)
+        )
+        # Preserve the historical policy for injected ClawHub/GitHub adapters
+        # that predate the capability property.  A fetch-only adapter still
+        # remains compatible because ``modern_resolution`` is false for the
+        # base SkillSource.resolve implementation.
         if (
             modern_resolution
+            and source is not None
+            and not requires_immutable
             and source_id in {"clawhub", "github"}
+            and getattr(type(source), "requires_immutable_resolution", None)
+            is getattr(SkillSource, "requires_immutable_resolution")
+        ):
+            requires_immutable = True
+        if (
+            modern_resolution
+            and source is not None
+            and requires_immutable
             and not resolution.immutable
         ):
             diagnostics.append(
@@ -1390,7 +1530,12 @@ class SkillManagementService:
             return resolution, None, diagnostics
         try:
             fetch_resolved = getattr(source, "fetch_resolved", None) if source else None
-            if callable(fetch_resolved):
+            fetch_into = getattr(source, "fetch_resolved_into", None)
+            streaming_source = getattr(type(source), "fetch_resolved_into", None)
+            if (destination is not None and callable(fetch_into)
+                    and streaming_source is not SkillSource.fetch_resolved_into):
+                bundle = await fetch_into(resolution, destination)
+            elif callable(fetch_resolved):
                 bundle = await fetch_resolved(resolution)
             else:
                 bundle = await self._router.fetch(identifier, source_id)
@@ -1430,7 +1575,8 @@ class SkillManagementService:
             return resolution, None, diagnostics
         if (
             modern_resolution
-            and source_id in {"clawhub", "github"}
+            and source is not None
+            and requires_immutable
             and not resolution.immutable
         ):
             diagnostics.append(
@@ -1621,7 +1767,7 @@ class SkillManagementService:
             )
             if reload_result.success:
                 try:
-                    verify(self._loader.snapshot())
+                    await _run_postflight_worker(verify, self._loader.snapshot())
                 except RuntimeError:
                     pass
         reload_payload = reload_result.to_dict()
@@ -1662,7 +1808,10 @@ class SkillManagementService:
         candidate = verified_state.get("candidate")
         selected = bool(verified_state.get("selected", False))
         generation = int(verified_state.get("generation", reload_result.generation) or 0)
-        actual_tree = compute_tree_sha256(target) if target.exists() else ""
+        actual_tree = (
+            await _run_postflight_worker(compute_tree_sha256, target)
+            if target.exists() else ""
+        )
         if actual_tree != expected_tree:
             if not any(item.code == "POSTFLIGHT_TREE_DRIFT" for item in diagnostics):
                 diagnostics.append(
@@ -1969,6 +2118,7 @@ class SkillManagementService:
             compatibility=_entry_compatibility(entry),
         )
 
+    @_owned_mutation
     async def install(
         self,
         identifier: str,
@@ -2006,7 +2156,29 @@ class SkillManagementService:
             )
             return self._recovery_required_result(recovery_name)
 
-        resolution, bundle, diagnostics = await self._resolve_and_fetch(identifier, source_id)
+        await report_install_progress_async("downloading")
+        transaction_id = uuid.uuid4().hex
+        transaction_root = staging_root(self._managed_dir) / transaction_id
+        raw_candidate = transaction_root / "_candidate"
+        try:
+            ensure_safe_transaction_roots(self._managed_dir)
+            transaction_root.mkdir(parents=True, exist_ok=False)
+            resolution, bundle, diagnostics = await self._resolve_and_fetch(
+                identifier, source_id, raw_candidate,
+            )
+        except BaseException as exc:
+            cleanup_staging_transaction_reservation(
+                managed_dir=self._managed_dir, transaction_id=transaction_id,
+            )
+            if not isinstance(exc, Exception):
+                raise
+            return self._failure(
+                name=update_name or "", message=str(exc),
+                diagnostics=[_diagnostic(
+                    "CANDIDATE_PREPARATION_FAILED", str(exc),
+                    phase=DiagnosticPhase.ARCHIVE, blocking=True,
+                )], resolution=None,
+            )
         candidate_compatibility = SkillCompatibilityState.INSTRUCTION_ONLY
 
         def fail_before_mutation(
@@ -2053,19 +2225,13 @@ class SkillManagementService:
             )
 
         if resolution is None or bundle is None:
+            cleanup_staging_transaction_reservation(
+                managed_dir=self._managed_dir, transaction_id=transaction_id,
+            )
             return fail_before_mutation(
                 fallback_name="",
                 message=diagnostics[-1].message if diagnostics else "Source fetch failed",
             )
-        artifact_digest = str(
-            getattr(resolution, "artifact_digest", "")
-            or getattr(resolution, "expected_digest", "")
-            or _bundle_digest(bundle.files)
-        )
-        transaction_id = uuid.uuid4().hex
-        transaction_root = staging_root(self._managed_dir) / transaction_id
-        raw_candidate = transaction_root / "_candidate"
-
         def cleanup_pre_journal_reservation() -> None:
             diagnostics.extend(
                 cleanup_staging_transaction_reservation(
@@ -2076,8 +2242,24 @@ class SkillManagementService:
 
         try:
             ensure_safe_transaction_roots(self._managed_dir)
-            transaction_root.mkdir(parents=True, exist_ok=False)
-            _write_bundle(bundle.files, raw_candidate, bundle.file_modes)
+            if bundle.directory is None:
+                await run_staging_worker(
+                    _write_bundle, bundle.files, raw_candidate, bundle.file_modes,
+                )
+            elif bundle.directory != raw_candidate:
+                raise ValueError("Source returned a directory outside its staging reservation")
+            validate_tree_entry_count(
+                path.relative_to(raw_candidate).as_posix() for path in raw_candidate.rglob("*")
+            )
+            artifact_digest = str(
+                getattr(resolution, "artifact_digest", "")
+                or getattr(resolution, "expected_digest", "")
+                or (
+                    await run_staging_worker(artifact_tree_digest, bundle.directory)
+                    if bundle.directory
+                    else await run_staging_worker(_bundle_digest, bundle.files)
+                )
+            )
             candidate_dir, normalized = _normalize_legacy_manifest(
                 raw_candidate,
                 bundle=bundle,
@@ -2112,8 +2294,8 @@ class SkillManagementService:
                 return result
             spec = validation.spec
             name = spec.name
-            installed_tree = compute_tree_sha256(candidate_dir)
-            legacy_tree = compute_sha256(candidate_dir)
+            installed_tree = await run_staging_worker(compute_tree_sha256, candidate_dir)
+            legacy_tree = await run_staging_worker(compute_sha256, candidate_dir)
             manifest_digest = hashlib.sha256(
                 (candidate_dir / "SKILL.md").read_bytes()
             ).hexdigest()
@@ -2122,7 +2304,8 @@ class SkillManagementService:
                 resolution,
                 identifier,
             )
-            scan_result = scan_skill_bundle(_candidate_files(candidate_dir))
+            await report_install_progress_async("scanning")
+            scan_result = await run_staging_worker(scan_skill_tree, candidate_dir)
             risk_confirmation_details: dict[str, Any] = {}
             risk_acknowledged = False
             if scan_result.verdict == "dangerous":
@@ -2148,7 +2331,7 @@ class SkillManagementService:
                 diagnostics.append(
                     _diagnostic(
                         "SCAN_CONFIRMATION_REQUIRED",
-                        f"Security scan found {len(scan_result.findings)} blocking finding(s)",
+                        f"Security scan found {scan_result.total_findings} blocking finding(s)",
                         phase=DiagnosticPhase.SECURITY,
                         blocking=True,
                         hint=(
@@ -2173,6 +2356,9 @@ class SkillManagementService:
                         },
                     )
                 )
+        except asyncio.CancelledError:
+            cleanup_pre_journal_reservation()
+            raise
         except _CandidateManifestError as exc:
             diagnostics.append(
                 _diagnostic(
@@ -2222,582 +2408,604 @@ class SkillManagementService:
         publication_barrier: Any | None = None
         durably_committed = False
         success_result: InstallResult | None = None
+        # Keep rollback and publication cleanup inside the writer admission.
+        mutation_acquired = False
         try:
-            async with self._mutation_lock:
-                recovery = recover_pending_skill_transaction(
-                    managed_dir=self._managed_dir,
-                    lockfile_path=self._lockfile_path,
-                    journal_path=self._journal_path,
-                )
-                recovery = guard_retained_recovery_journal(
-                    recovery,
-                    journal_path=self._journal_path,
-                )
-                self._observe_recovery(recovery)
-                diagnostics.extend(recovery)
-                if any(item.blocking for item in recovery):
-                    raise RuntimeError(recovery[-1].message)
+            await self._mutation_lock.acquire()
+            mutation_acquired = True
+            recovery = await _run_postflight_worker(recover_pending_skill_transaction,
+                managed_dir=self._managed_dir,
+                lockfile_path=self._lockfile_path,
+                journal_path=self._journal_path,
+            )
+            recovery = guard_retained_recovery_journal(
+                recovery,
+                journal_path=self._journal_path,
+            )
+            self._observe_recovery(recovery)
+            diagnostics.extend(recovery)
+            if any(item.blocking for item in recovery):
+                raise RuntimeError(recovery[-1].message)
 
-                lockfile = Lockfile.load(self._lockfile_path)
-                if lockfile.mutation_blocked:
-                    raise LockfileMutationBlockedError(
-                        self._lockfile_path,
-                        lockfile.diagnostics,
-                    )
-                if update_name is not None:
-                    storage_key = update_name
-                    old_entry = lockfile.get(storage_key)
-                else:
-                    package_matches = _installed_package_matches(
-                        lockfile,
-                        source_id=source_id,
-                        source_package_id=source_package_id,
-                        requested_identifier=identifier,
-                    )
-                    if len(package_matches) > 1:
-                        package_keys = [item[0] for item in package_matches]
-                        message = (
-                            "Multiple tracked installs claim the same source package; "
-                            "repair or uninstall the duplicate records before installing"
-                        )
-                        diagnostics.append(
-                            _diagnostic(
-                                "AMBIGUOUS_PACKAGE",
-                                message,
-                                phase=DiagnosticPhase.LOCK,
-                                blocking=True,
-                                hint=(
-                                    "Select each duplicate by installId and remove all but "
-                                    "the intended install."
-                                ),
-                                details={
-                                    "sourcePackageId": source_package_id,
-                                    "storageKeys": package_keys,
-                                },
-                            )
-                        )
-                        raise RuntimeError(message)
-                    if package_matches:
-                        storage_key, old_entry = package_matches[0]
-                    else:
-                        if source_id == "clawhub":
-                            ambiguous_legacy_matches = _ambiguous_legacy_clawhub_matches(
-                                lockfile,
-                                source_package_id=source_package_id,
-                            )
-                            if ambiguous_legacy_matches:
-                                message = (
-                                    "An owner-qualified ClawHub package cannot claim an "
-                                    "ownerless v1 install with the same slug"
-                                )
-                                diagnostics.append(
-                                    _diagnostic(
-                                        "AMBIGUOUS_PACKAGE_OWNER",
-                                        message,
-                                        phase=DiagnosticPhase.LOCK,
-                                        blocking=True,
-                                        hint=(
-                                            "Update the legacy install by its stored bare "
-                                            "slug to bind its publisher, or uninstall it "
-                                            "before installing this exact package."
-                                        ),
-                                        details={
-                                            "sourcePackageId": source_package_id,
-                                            "storageKeys": [
-                                                storage_key
-                                                for storage_key, _entry in (
-                                                    ambiguous_legacy_matches
-                                                )
-                                            ],
-                                        },
-                                    )
-                                )
-                                raise RuntimeError(message)
-                        if replace_source:
-                            replacement_keys = lockfile.keys_for_manifest_name(name)
-                            if len(replacement_keys) > 1:
-                                message = (
-                                    f"Skill name {name!r} matches multiple installs; "
-                                    "replaceSource requires an exact install identity"
-                                )
-                                diagnostics.append(
-                                    _diagnostic(
-                                        "AMBIGUOUS_INSTALL",
-                                        message,
-                                        phase=DiagnosticPhase.LOCK,
-                                        blocking=True,
-                                        hint=(
-                                            "Update or uninstall the intended install by "
-                                            "installId before replacing its source."
-                                        ),
-                                        details={"storageKeys": replacement_keys},
-                                    )
-                                )
-                                raise RuntimeError(message)
-                            if replacement_keys:
-                                storage_key = replacement_keys[0]
-                                old_entry = lockfile.get(storage_key)
-                                continue_allocation = False
-                            else:
-                                continue_allocation = True
-                        else:
-                            continue_allocation = True
-                        if continue_allocation:
-                            storage_key = _allocate_install_key(
-                                lockfile,
-                                managed_dir=self._managed_dir,
-                                preferred=preferred_storage_key,
-                                source_package_id=source_package_id,
-                            )
-                            old_entry = None
-                try:
-                    target = (
-                        _entry_target(self._managed_dir, storage_key, old_entry)
-                        if old_entry is not None
-                        else self._managed_dir / storage_key
-                    )
-                except ValueError as exc:
-                    diagnostics.append(
-                        _diagnostic(
-                            "STORE_PATH_UNSAFE",
-                            str(exc),
-                            phase=DiagnosticPhase.STORE,
-                            blocking=True,
-                            hint="Repair or restore the tracked lock entry before mutation.",
-                        )
-                    )
-                    raise RuntimeError(str(exc)) from exc
-                _retarget_candidate_diagnostics(
-                    diagnostics,
-                    candidate_dir=candidate_dir,
-                    target=target,
+            lockfile = Lockfile.load(self._lockfile_path)
+            if lockfile.mutation_blocked:
+                raise LockfileMutationBlockedError(
+                    self._lockfile_path,
+                    lockfile.diagnostics,
                 )
-                rollback = rollback_root(self._managed_dir) / transaction_id / target.name
-                if update_name is not None and (
-                    old_entry is None
-                    or expected_update is None
-                    or _update_precondition(old_entry) != expected_update
-                ):
+            if update_name is not None:
+                storage_key = update_name
+                old_entry = lockfile.get(storage_key)
+            else:
+                package_matches = _installed_package_matches(
+                    lockfile,
+                    source_id=source_id,
+                    source_package_id=source_package_id,
+                    requested_identifier=identifier,
+                )
+                if len(package_matches) > 1:
+                    package_keys = [item[0] for item in package_matches]
                     message = (
-                            f"Tracked state for {update_name!r} changed while its update "
-                        "artifact was being fetched"
+                        "Multiple tracked installs claim the same source package; "
+                        "repair or uninstall the duplicate records before installing"
                     )
                     diagnostics.append(
                         _diagnostic(
-                            "UPDATE_PRECONDITION_CHANGED",
+                            "AMBIGUOUS_PACKAGE",
                             message,
                             phase=DiagnosticPhase.LOCK,
                             blocking=True,
-                            hint="Retry the update against the current lock entry.",
+                            hint=(
+                                "Select each duplicate by installId and remove all but "
+                                "the intended install."
+                            ),
+                            details={
+                                "sourcePackageId": source_package_id,
+                                "storageKeys": package_keys,
+                            },
                         )
                     )
                     raise RuntimeError(message)
-                if path_is_occupied(target) and old_entry is None:
-                    raise RuntimeError(
-                        f"Refusing to overwrite occupied untracked managed path {target}"
-                    )
-                if old_entry is not None:
-                    if not target.is_dir() or target.is_symlink():
-                        raise RuntimeError(f"Tracked Skill path is missing or unsafe: {target}")
-                    current_digest = _installed_digest(target, old_entry)
-                    expected_digest = old_entry.tree_sha256 or old_entry.sha256
-                    if expected_digest and current_digest != expected_digest:
-                        raise RuntimeError(
-                            f"Local drift detected for {name!r}; update/install was not applied"
-                        )
-                    old_package_id = _entry_package_identity(old_entry)
-                    legacy_clawhub_upgrade = _is_legacy_clawhub_package_upgrade(
-                        old_entry,
-                        source_package_id,
-                        requested_identifier=identifier,
-                    )
-                    replacing_package = bool(
-                        (old_entry.source and old_entry.source != source_id)
-                        or (
-                            old_package_id
-                            and source_package_id
-                            and old_package_id != source_package_id
-                            and not legacy_clawhub_upgrade
-                        )
-                    )
-                    if replacing_package and not replace_source:
-                        raise RuntimeError(
-                            "Replacing a same-name installation from a different package "
-                            "requires replaceSource=true"
-                        )
-                    resolved_revision = str(getattr(resolution, "revision", "") or "")
-                    prior_revision = old_entry.resolved_revision
-                    prior_tree = old_entry.tree_sha256 or old_entry.sha256
-                    same_immutable_package_revision = bool(
-                        resolution.immutable
-                        and old_entry.source == source_id
-                        and old_package_id
-                        and source_package_id
-                        and old_package_id == source_package_id
-                        and resolved_revision
-                        and resolved_revision == prior_revision
-                    )
-                    artifact_changed = bool(
-                        old_entry.artifact_sha256
-                        and artifact_digest
-                        and old_entry.artifact_sha256 != artifact_digest
-                    )
-                    tree_changed = bool(prior_tree and prior_tree != installed_tree)
-                    risk_override_reusable = bool(
-                        risk_confirmation_pending
-                        and old_entry.accepted_risk_override
-                        and same_immutable_package_revision
-                        and prior_tree
-                        and prior_tree == installed_tree
-                        and old_entry.artifact_sha256
-                        and artifact_digest
-                        and old_entry.artifact_sha256 == artifact_digest
-                    )
-                    if risk_confirmation_pending and not risk_override_reusable:
-                        reject_unconfirmed_risk()
-                    if same_immutable_package_revision and (
-                        tree_changed or artifact_changed
-                    ):
-                        message = (
-                            f"Source returned different content for immutable revision "
-                            f"{resolved_revision!r} of Skill {name!r}"
-                        )
-                        diagnostics.append(
-                            _diagnostic(
-                                "SOURCE_IMMUTABILITY_VIOLATION",
-                                message,
-                                phase=DiagnosticPhase.SECURITY,
-                                blocking=True,
-                                hint=(
-                                    "Do not trust or publish this revision; retry only after "
-                                    "the source exposes a new immutable revision."
-                                ),
-                                details={
-                                    "revision": resolved_revision,
-                                    "treeChanged": tree_changed,
-                                    "artifactChanged": artifact_changed,
-                                },
-                            )
-                        )
-                        raise RuntimeError(message)
-                    tree_unchanged = bool(prior_tree and prior_tree == installed_tree)
-                    artifact_unchanged = bool(
-                        old_entry.artifact_sha256
-                        and artifact_digest
-                        and old_entry.artifact_sha256 == artifact_digest
-                    )
-                    if (
-                        same_immutable_package_revision
-                        and tree_unchanged
-                        and artifact_unchanged
-                    ):
-                        diagnostics.append(
-                            _diagnostic(
-                                "ALREADY_CURRENT",
-                                f"Skill {name!r} already uses the resolved revision",
-                                phase=DiagnosticPhase.SOURCE,
-                                severity=DiagnosticSeverity.INFO,
-                                details={"revision": resolved_revision},
-                            )
-                        )
-                        current_spec, current_selected, generation, _ = (
-                            self._snapshot_state(name, target, diagnostics)
-                        )
-                        if self._loader is None:
-                            current_spec = spec
-                            current_selected = False
-                        lifecycle = lifecycle_for_candidate(
-                            spec=current_spec,
-                            selected=current_selected,
-                            tracked=True,
-                            offline=self._loader is None,
-                            compatibility=candidate_compatibility,
-                            diagnostics=diagnostics,
-                        )
-                        cleanup_pre_journal_reservation()
-                        return InstallResult(
-                            success=True,
-                            unchanged=True,
-                            name=name,
-                            message=f"Skill {name!r} is already current",
-                            scan=scan_result,
-                            path=str(target),
-                            installed=True,
-                            active=(
-                                lifecycle.selection_state is SkillSelectionState.ACTIVE
-                                and lifecycle.load_state
-                                in {
-                                    SkillLoadState.LOADED,
-                                    SkillLoadState.SERVING_PREVIOUS,
-                                }
-                            ),
-                            instruction_usable=bool(lifecycle.usable is True),
-                            install_id=old_entry.install_id,
-                            lifecycle=lifecycle,
-                            resolution=resolution,
-                            diagnostics=diagnostics,
-                            catalog_generation=generation,
-                            effective_from=(
-                                "next_turn"
-                                if self._loader is not None
-                                else "next_start"
-                            ),
-                        )
+                if package_matches:
+                    storage_key, old_entry = package_matches[0]
                 else:
-                    if risk_confirmation_pending:
-                        reject_unconfirmed_risk()
-                    installed_count = sum(
-                        1
-                        for child in self._managed_dir.iterdir()
-                        if child.is_dir() and not child.name.startswith(".")
-                    ) if self._managed_dir.exists() else 0
-                    if installed_count >= _MAX_MANAGED_SKILLS:
-                        raise RuntimeError(
-                            f"Managed Skill layer already contains {_MAX_MANAGED_SKILLS} entries"
+                    if source_id == "clawhub":
+                        ambiguous_legacy_matches = _ambiguous_legacy_clawhub_matches(
+                            lockfile,
+                            source_package_id=source_package_id,
                         )
-
-                # Snapshot only after this writer owns the per-managed-root
-                # lock.  Capturing it before waiting would let a later failed
-                # writer roll the live catalog back past an earlier writer
-                # that committed while it was queued.
-                if self._loader is not None:
-                    old_snapshot = self._loader.snapshot()
-                    generation = int(getattr(old_snapshot, "generation", 0) or 0)
-
-                ensure_safe_transaction_roots(self._managed_dir)
-                staged_for_publish = transaction_root / target.name
-                if candidate_dir != staged_for_publish:
-                    if path_is_occupied(staged_for_publish):
-                        raise RuntimeError(
-                            f"Staging path is already occupied: {staged_for_publish}"
+                        if ambiguous_legacy_matches:
+                            message = (
+                                "An owner-qualified ClawHub package cannot claim an "
+                                "ownerless v1 install with the same slug"
+                            )
+                            diagnostics.append(
+                                _diagnostic(
+                                    "AMBIGUOUS_PACKAGE_OWNER",
+                                    message,
+                                    phase=DiagnosticPhase.LOCK,
+                                    blocking=True,
+                                    hint=(
+                                        "Update the legacy install by its stored bare "
+                                        "slug to bind its publisher, or uninstall it "
+                                        "before installing this exact package."
+                                    ),
+                                    details={
+                                        "sourcePackageId": source_package_id,
+                                        "storageKeys": [
+                                            storage_key
+                                            for storage_key, _entry in (
+                                                ambiguous_legacy_matches
+                                            )
+                                        ],
+                                    },
+                                )
+                            )
+                            raise RuntimeError(message)
+                    if replace_source:
+                        replacement_keys = lockfile.keys_for_manifest_name(name)
+                        if len(replacement_keys) > 1:
+                            message = (
+                                f"Skill name {name!r} matches multiple installs; "
+                                "replaceSource requires an exact install identity"
+                            )
+                            diagnostics.append(
+                                _diagnostic(
+                                    "AMBIGUOUS_INSTALL",
+                                    message,
+                                    phase=DiagnosticPhase.LOCK,
+                                    blocking=True,
+                                    hint=(
+                                        "Update or uninstall the intended install by "
+                                        "installId before replacing its source."
+                                    ),
+                                    details={"storageKeys": replacement_keys},
+                                )
+                            )
+                            raise RuntimeError(message)
+                        if replacement_keys:
+                            storage_key = replacement_keys[0]
+                            old_entry = lockfile.get(storage_key)
+                            continue_allocation = False
+                        else:
+                            continue_allocation = True
+                    else:
+                        continue_allocation = True
+                    if continue_allocation:
+                        storage_key = _allocate_install_key(
+                            lockfile,
+                            managed_dir=self._managed_dir,
+                            preferred=preferred_storage_key,
+                            source_package_id=source_package_id,
                         )
-                    os.replace(candidate_dir, staged_for_publish)
-                    candidate_dir = staged_for_publish
-                rollback.parent.mkdir(parents=True, exist_ok=True)
-                journal = SkillTransactionJournal.prepare(
-                    operation="update" if old_entry else "install",
+                        old_entry = None
+            try:
+                target = (
+                    _entry_target(self._managed_dir, storage_key, old_entry)
+                    if old_entry is not None
+                    else self._managed_dir / storage_key
+                )
+            except ValueError as exc:
+                diagnostics.append(
+                    _diagnostic(
+                        "STORE_PATH_UNSAFE",
+                        str(exc),
+                        phase=DiagnosticPhase.STORE,
+                        blocking=True,
+                        hint="Repair or restore the tracked lock entry before mutation.",
+                    )
+                )
+                raise RuntimeError(str(exc)) from exc
+            _retarget_candidate_diagnostics(
+                diagnostics,
+                candidate_dir=candidate_dir,
+                target=target,
+            )
+            rollback = rollback_root(self._managed_dir) / transaction_id / target.name
+            if update_name is not None and (
+                old_entry is None
+                or expected_update is None
+                or _update_precondition(old_entry) != expected_update
+            ):
+                message = (
+                        f"Tracked state for {update_name!r} changed while its update "
+                    "artifact was being fetched"
+                )
+                diagnostics.append(
+                    _diagnostic(
+                        "UPDATE_PRECONDITION_CHANGED",
+                        message,
+                        phase=DiagnosticPhase.LOCK,
+                        blocking=True,
+                        hint="Retry the update against the current lock entry.",
+                    )
+                )
+                raise RuntimeError(message)
+            if path_is_occupied(target) and old_entry is None:
+                raise RuntimeError(
+                    f"Refusing to overwrite occupied untracked managed path {target}"
+                )
+            if old_entry is not None:
+                if not target.is_dir() or target.is_symlink():
+                    raise RuntimeError(f"Tracked Skill path is missing or unsafe: {target}")
+                current_digest = await _run_postflight_worker(
+                    _installed_digest, target, old_entry,
+                )
+                expected_digest = old_entry.tree_sha256 or old_entry.sha256
+                if expected_digest and current_digest != expected_digest:
+                    raise RuntimeError(
+                        f"Local drift detected for {name!r}; update/install was not applied"
+                    )
+                old_package_id = _entry_package_identity(old_entry)
+                legacy_clawhub_upgrade = _is_legacy_clawhub_package_upgrade(
+                    old_entry,
+                    source_package_id,
+                    requested_identifier=identifier,
+                )
+                replacing_package = bool(
+                    (old_entry.source and old_entry.source != source_id)
+                    or (
+                        old_package_id
+                        and source_package_id
+                        and old_package_id != source_package_id
+                        and not legacy_clawhub_upgrade
+                    )
+                )
+                if replacing_package and not replace_source:
+                    raise RuntimeError(
+                        "Replacing a same-name installation from a different package "
+                        "requires replaceSource=true"
+                    )
+                resolved_revision = str(getattr(resolution, "revision", "") or "")
+                prior_revision = old_entry.resolved_revision
+                prior_tree = old_entry.tree_sha256 or old_entry.sha256
+                same_immutable_package_revision = bool(
+                    resolution.immutable
+                    and old_entry.source == source_id
+                    and old_package_id
+                    and source_package_id
+                    and old_package_id == source_package_id
+                    and resolved_revision
+                    and resolved_revision == prior_revision
+                )
+                artifact_changed = bool(
+                    old_entry.artifact_sha256
+                    and artifact_digest
+                    and old_entry.artifact_sha256 != artifact_digest
+                )
+                tree_changed = bool(prior_tree and prior_tree != installed_tree)
+                risk_override_reusable = bool(
+                    risk_confirmation_pending
+                    and old_entry.accepted_risk_override
+                    and same_immutable_package_revision
+                    and prior_tree
+                    and prior_tree == installed_tree
+                    and old_entry.artifact_sha256
+                    and artifact_digest
+                    and old_entry.artifact_sha256 == artifact_digest
+                )
+                if risk_confirmation_pending and not risk_override_reusable:
+                    reject_unconfirmed_risk()
+                if same_immutable_package_revision and (
+                    tree_changed or artifact_changed
+                ):
+                    message = (
+                        f"Source returned different content for immutable revision "
+                        f"{resolved_revision!r} of Skill {name!r}"
+                    )
+                    diagnostics.append(
+                        _diagnostic(
+                            "SOURCE_IMMUTABILITY_VIOLATION",
+                            message,
+                            phase=DiagnosticPhase.SECURITY,
+                            blocking=True,
+                            hint=(
+                                "Do not trust or publish this revision; retry only after "
+                                "the source exposes a new immutable revision."
+                            ),
+                            details={
+                                "revision": resolved_revision,
+                                "treeChanged": tree_changed,
+                                "artifactChanged": artifact_changed,
+                            },
+                        )
+                    )
+                    raise RuntimeError(message)
+                tree_unchanged = bool(prior_tree and prior_tree == installed_tree)
+                artifact_unchanged = bool(
+                    old_entry.artifact_sha256
+                    and artifact_digest
+                    and old_entry.artifact_sha256 == artifact_digest
+                )
+                if (
+                    same_immutable_package_revision
+                    and tree_unchanged
+                    and artifact_unchanged
+                ):
+                    diagnostics.append(
+                        _diagnostic(
+                            "ALREADY_CURRENT",
+                            f"Skill {name!r} already uses the resolved revision",
+                            phase=DiagnosticPhase.SOURCE,
+                            severity=DiagnosticSeverity.INFO,
+                            details={"revision": resolved_revision},
+                        )
+                    )
+                    current_spec, current_selected, generation, _ = (
+                        self._snapshot_state(name, target, diagnostics)
+                    )
+                    if self._loader is None:
+                        current_spec = spec
+                        current_selected = False
+                    lifecycle = lifecycle_for_candidate(
+                        spec=current_spec,
+                        selected=current_selected,
+                        tracked=True,
+                        offline=self._loader is None,
+                        compatibility=candidate_compatibility,
+                        diagnostics=diagnostics,
+                    )
+                    cleanup_pre_journal_reservation()
+                    return InstallResult(
+                        success=True,
+                        unchanged=True,
+                        name=name,
+                        message=f"Skill {name!r} is already current",
+                        scan=scan_result,
+                        path=str(target),
+                        installed=True,
+                        active=(
+                            lifecycle.selection_state is SkillSelectionState.ACTIVE
+                            and lifecycle.load_state
+                            in {
+                                SkillLoadState.LOADED,
+                                SkillLoadState.SERVING_PREVIOUS,
+                            }
+                        ),
+                        instruction_usable=bool(lifecycle.usable is True),
+                        install_id=old_entry.install_id,
+                        lifecycle=lifecycle,
+                        resolution=resolution,
+                        diagnostics=diagnostics,
+                        catalog_generation=generation,
+                        effective_from=(
+                            "next_turn"
+                            if self._loader is not None
+                            else "next_start"
+                        ),
+                    )
+            else:
+                if risk_confirmation_pending:
+                    reject_unconfirmed_risk()
+                installed_count = sum(
+                    1
+                    for child in self._managed_dir.iterdir()
+                    if child.is_dir() and not child.name.startswith(".")
+                ) if self._managed_dir.exists() else 0
+                if installed_count >= _MAX_MANAGED_SKILLS:
+                    raise RuntimeError(
+                        f"Managed Skill layer already contains {_MAX_MANAGED_SKILLS} entries"
+                    )
+
+            # Snapshot only after this writer owns the per-managed-root
+            # lock.  Capturing it before waiting would let a later failed
+            # writer roll the live catalog back past an earlier writer
+            # that committed while it was queued.
+            if self._loader is not None:
+                old_snapshot = self._loader.snapshot()
+                generation = int(getattr(old_snapshot, "generation", 0) or 0)
+
+            ensure_safe_transaction_roots(self._managed_dir)
+            staged_for_publish = transaction_root / target.name
+            if candidate_dir != staged_for_publish:
+                if path_is_occupied(staged_for_publish):
+                    raise RuntimeError(
+                        f"Staging path is already occupied: {staged_for_publish}"
+                    )
+                os.replace(candidate_dir, staged_for_publish)
+                candidate_dir = staged_for_publish
+            rollback.parent.mkdir(parents=True, exist_ok=True)
+            journal = SkillTransactionJournal.prepare(
+                operation="update" if old_entry else "install",
+                managed_dir=self._managed_dir,
+                name=target.name,
+                target=target,
+                staging=candidate_dir,
+                rollback=rollback,
+                lockfile_path=self._lockfile_path,
+            )
+            await report_install_progress_async("committing")
+            fsync_staging_tree(candidate_dir)
+            fsync_directory(rollback.parent)
+            fsync_directory(rollback.parent.parent)
+            journal.write(self._journal_path)
+            if self._loader is not None:
+                barrier_factory = getattr(
+                    self._loader,
+                    "catalog_publication_barrier",
+                    None,
+                )
+                if callable(barrier_factory):
+                    publication_barrier = publication_stack.enter_context(
+                        barrier_factory(reason="skill.management.publish")
+                    )
+            guard = (
+                self._loader.mutation_guard(reason="skill.management.publish")
+                if self._loader is not None
+                else nullcontext()
+            )
+            with guard:
+                validate_transaction_journal_paths(
+                    journal,
                     managed_dir=self._managed_dir,
-                    name=target.name,
-                    target=target,
-                    staging=candidate_dir,
-                    rollback=rollback,
                     lockfile_path=self._lockfile_path,
                 )
-                fsync_staging_tree(candidate_dir)
-                fsync_directory(rollback.parent)
-                fsync_directory(rollback.parent.parent)
-                journal.write(self._journal_path)
-                if self._loader is not None:
-                    barrier_factory = getattr(
-                        self._loader,
-                        "catalog_publication_barrier",
-                        None,
-                    )
-                    if callable(barrier_factory):
-                        publication_barrier = publication_stack.enter_context(
-                            barrier_factory(reason="skill.management.publish")
-                        )
-                guard = (
-                    self._loader.mutation_guard(reason="skill.management.publish")
-                    if self._loader is not None
-                    else nullcontext()
+                if path_is_occupied(target):
+                    os.replace(target, rollback)
+                    fsync_directory(target.parent)
+                    fsync_directory(rollback.parent)
+                    fsync_directory(rollback.parent.parent)
+                    journal.advance("old_moved", self._journal_path)
+                os.replace(candidate_dir, target)
+                fsync_directory(candidate_dir.parent)
+                fsync_directory(target.parent)
+                journal.advance("new_moved", self._journal_path)
+                install_id = (
+                    old_entry.install_id
+                    if old_entry and old_entry.install_id
+                    else uuid.uuid4().hex
                 )
-                with guard:
+                meta = bundle.meta or getattr(resolution, "meta", None)
+                entry_extra: dict[str, Any] = {
+                    "files": [
+                        path.relative_to(target).as_posix()
+                        for path in sorted(target.rglob("*"))
+                        if path.is_file()
+                    ],
+                    "file_modes": _installed_file_modes(bundle),
+                }
+                degraded_capabilities = _degraded_capabilities_from_diagnostics(
+                    diagnostics
+                )
+                if degraded_capabilities:
+                    entry_extra[_DEGRADED_CAPABILITIES_KEY] = degraded_capabilities
+                lockfile.add(
+                    storage_key,
+                    LockEntry(
+                        source=source_id,
+                        identifier=identifier,
+                        version=str(getattr(resolution, "version", "") or ""),
+                        installed_at=time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                        path=str(target),
+                        sha256=legacy_tree,
+                        license=str(getattr(meta, "license", "") or ""),
+                        upstream_url=str(
+                            getattr(resolution, "upstream_url", "")
+                            or getattr(meta, "homepage", "")
+                            or ""
+                        ),
+                        source_trust=str(
+                            getattr(resolution, "trust_state", "")
+                            or getattr(meta, "trust_level", "")
+                            or "community"
+                        ),
+                        origin_source=str(
+                            getattr(meta, "origin_source", "") or ""
+                        ),
+                        signature_status=str(
+                            getattr(meta, "signature_status", "") or ""
+                        ),
+                        content_hash=str(
+                            getattr(meta, "content_hash", "") or ""
+                        ),
+                        scan_verdict=scan_result.verdict,
+                        scan_strategy=scan_result.strategy,
+                        scan_findings=[vars(item) for item in scan_result.findings],
+                        install_id=install_id,
+                        manifest_name=name,
+                        directory_name=target.name,
+                        relative_path=target.name,
+                        requested_identifier=identifier,
+                        resolved_identifier=str(
+                            getattr(resolution, "canonical_identifier", "") or identifier
+                        ),
+                        resolved_version=str(
+                            getattr(resolution, "version", "") or ""
+                        ),
+                        resolved_revision=str(
+                            getattr(resolution, "revision", "") or ""
+                        ),
+                        artifact_sha256=artifact_digest,
+                        tree_sha256=installed_tree,
+                        file_count=sum(1 for path in target.rglob("*") if path.is_file()),
+                        total_bytes=sum(
+                            path.stat().st_size
+                            for path in target.rglob("*")
+                            if path.is_file()
+                        ),
+                        parser_version="community-instruction-v1",
+                        dialect="instruction-first",
+                        source_package_id=source_package_id,
+                        accepted_risk_override=risk_acknowledged,
+                        extra=entry_extra,
+                    ),
+                )
+                lockfile.save(self._lockfile_path)
+                fsync_directory(self._lockfile_path.parent)
+                journal.advance("lock_written", self._journal_path)
+
+            candidate, selected, generation, reload_payload = (
+                await self._reload_and_verify(
+                    name=name,
+                    target=target,
+                    expected_tree=installed_tree,
+                    expected_manifest_digest=manifest_digest,
+                    expected_previous_generation=generation,
+                    diagnostics=diagnostics,
+                )
+            )
+            if any(item.blocking for item in diagnostics):
+                raise RuntimeError(diagnostics[-1].message)
+
+            if self._loader is None:
+                candidate = spec
+                selected = False
+            lifecycle = lifecycle_for_candidate(
+                spec=candidate,
+                selected=selected,
+                tracked=True,
+                offline=self._loader is None,
+                compatibility=candidate_compatibility,
+                diagnostics=diagnostics,
+            )
+            active = lifecycle.selection_state is SkillSelectionState.ACTIVE
+            instruction_usable = bool(lifecycle.usable is True)
+            success_result = InstallResult(
+                success=True,
+                name=name,
+                message=_committed_install_message(
+                    name,
+                    lifecycle,
+                    online=self._loader is not None,
+                    updated=old_entry is not None,
+                ),
+                scan=scan_result,
+                path=str(target),
+                installed=True,
+                active=active,
+                instruction_usable=instruction_usable,
+                install_id=install_id,
+                lifecycle=lifecycle,
+                resolution=resolution,
+                diagnostics=diagnostics,
+                reload=reload_payload,
+                catalog_generation=generation,
+                effective_from="next_turn" if self._loader is not None else "next_start",
+            )
+            if journal is not None:
+                if journal.install_operation_id:
+                    journal.install_receipt = success_result.to_dict()
+                journal.advance("committed", self._journal_path)
+            durably_committed = True
+            if publication_barrier is not None:
+                publication_barrier.commit()
+            try:
+                operation = current_install_operation()
+                if operation is not None:
+                    await operation.store.finish_async(
+                        operation.owner, operation.id, success_result.to_dict(),
+                    )
+                if journal is not None:
                     validate_transaction_journal_paths(
                         journal,
                         managed_dir=self._managed_dir,
                         lockfile_path=self._lockfile_path,
                     )
-                    if path_is_occupied(target):
-                        os.replace(target, rollback)
-                        fsync_directory(target.parent)
-                        fsync_directory(rollback.parent)
-                        fsync_directory(rollback.parent.parent)
-                        journal.advance("old_moved", self._journal_path)
-                    os.replace(candidate_dir, target)
-                    fsync_directory(candidate_dir.parent)
-                    fsync_directory(target.parent)
-                    journal.advance("new_moved", self._journal_path)
-                    install_id = (
-                        old_entry.install_id
-                        if old_entry and old_entry.install_id
-                        else uuid.uuid4().hex
-                    )
-                    meta = bundle.meta or getattr(resolution, "meta", None)
-                    entry_extra: dict[str, Any] = {
-                        "files": [
-                            path.relative_to(target).as_posix()
-                            for path in sorted(target.rglob("*"))
-                            if path.is_file()
-                        ],
-                        "file_modes": _installed_file_modes(bundle),
-                    }
-                    degraded_capabilities = _degraded_capabilities_from_diagnostics(
-                        diagnostics
-                    )
-                    if degraded_capabilities:
-                        entry_extra[_DEGRADED_CAPABILITIES_KEY] = degraded_capabilities
-                    lockfile.add(
-                        storage_key,
-                        LockEntry(
-                            source=source_id,
-                            identifier=identifier,
-                            version=str(getattr(resolution, "version", "") or ""),
-                            installed_at=time.strftime(
-                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                            ),
-                            path=str(target),
-                            sha256=legacy_tree,
-                            license=str(getattr(meta, "license", "") or ""),
-                            upstream_url=str(
-                                getattr(resolution, "upstream_url", "")
-                                or getattr(meta, "homepage", "")
-                                or ""
-                            ),
-                            source_trust=str(
-                                getattr(resolution, "trust_state", "")
-                                or getattr(meta, "trust_level", "")
-                                or "community"
-                            ),
-                            scan_verdict=scan_result.verdict,
-                            scan_strategy=scan_result.strategy,
-                            scan_findings=[vars(item) for item in scan_result.findings],
-                            install_id=install_id,
-                            manifest_name=name,
-                            directory_name=target.name,
-                            relative_path=target.name,
-                            requested_identifier=identifier,
-                            resolved_identifier=str(
-                                getattr(resolution, "canonical_identifier", "") or identifier
-                            ),
-                            resolved_version=str(
-                                getattr(resolution, "version", "") or ""
-                            ),
-                            resolved_revision=str(
-                                getattr(resolution, "revision", "") or ""
-                            ),
-                            artifact_sha256=artifact_digest,
-                            tree_sha256=installed_tree,
-                            file_count=sum(1 for path in target.rglob("*") if path.is_file()),
-                            total_bytes=sum(
-                                path.stat().st_size
-                                for path in target.rglob("*")
-                                if path.is_file()
-                            ),
-                            parser_version="community-instruction-v1",
-                            dialect="instruction-first",
-                            source_package_id=source_package_id,
-                            accepted_risk_override=risk_acknowledged,
-                            extra=entry_extra,
-                        ),
-                    )
-                    lockfile.save(self._lockfile_path)
-                    fsync_directory(self._lockfile_path.parent)
-                    journal.advance("lock_written", self._journal_path)
-
-                candidate, selected, generation, reload_payload = (
-                    await self._reload_and_verify(
-                        name=name,
-                        target=target,
-                        expected_tree=installed_tree,
-                        expected_manifest_digest=manifest_digest,
-                        expected_previous_generation=generation,
-                        diagnostics=diagnostics,
-                    )
-                )
-                if any(item.blocking for item in diagnostics):
-                    raise RuntimeError(diagnostics[-1].message)
-
-                if self._loader is None:
-                    candidate = spec
-                    selected = False
-                lifecycle = lifecycle_for_candidate(
-                    spec=candidate,
-                    selected=selected,
-                    tracked=True,
-                    offline=self._loader is None,
-                    compatibility=candidate_compatibility,
-                    diagnostics=diagnostics,
-                )
-                active = lifecycle.selection_state is SkillSelectionState.ACTIVE
-                instruction_usable = bool(lifecycle.usable is True)
-                success_result = InstallResult(
-                    success=True,
-                    name=name,
-                    message=_committed_install_message(
-                        name,
-                        lifecycle,
-                        online=self._loader is not None,
-                        updated=old_entry is not None,
-                    ),
-                    scan=scan_result,
-                    path=str(target),
-                    installed=True,
-                    active=active,
-                    instruction_usable=instruction_usable,
-                    install_id=install_id,
-                    lifecycle=lifecycle,
-                    resolution=resolution,
-                    diagnostics=diagnostics,
-                    reload=reload_payload,
-                    catalog_generation=generation,
-                    effective_from="next_turn" if self._loader is not None else "next_start",
-                )
+                if rollback.exists():
+                    shutil.rmtree(rollback)
+                    fsync_directory(rollback.parent)
                 if journal is not None:
-                    journal.advance("committed", self._journal_path)
-                durably_committed = True
-                if publication_barrier is not None:
-                    publication_barrier.commit()
-                try:
-                    if journal is not None:
-                        validate_transaction_journal_paths(
-                            journal,
-                            managed_dir=self._managed_dir,
-                            lockfile_path=self._lockfile_path,
-                        )
-                    if rollback.exists():
-                        shutil.rmtree(rollback)
-                        fsync_directory(rollback.parent)
-                    if journal is not None:
-                        retained = cleanup_empty_transaction_directories(
-                            journal,
-                            managed_dir=self._managed_dir,
-                            lockfile_path=self._lockfile_path,
-                        )
-                        if retained:
-                            raise OSError(
-                                "transaction reservation is not empty: "
-                                + ", ".join(str(path) for path in retained)
-                            )
-                    remove_transaction_journal(self._journal_path)
-                except Exception as cleanup_error:
-                    diagnostics.append(
-                        _diagnostic(
-                            "TRANSACTION_CLEANUP_PENDING",
-                            f"Committed install cleanup is pending: {cleanup_error}",
-                            phase=DiagnosticPhase.STORE,
-                            severity=DiagnosticSeverity.WARNING,
-                            details={"journal": str(self._journal_path)},
-                        )
+                    retained = cleanup_empty_transaction_directories(
+                        journal,
+                        managed_dir=self._managed_dir,
+                        lockfile_path=self._lockfile_path,
                     )
-                try:
-                    log.info(
-                        "skill.management_committed",
-                        name=name,
-                        source=source_id,
-                        active=active,
-                        generation=generation,
-                    )
-                except Exception as log_error:
-                    diagnostics.append(
-                        _diagnostic(
-                            "POST_COMMIT_REPORTING_FAILED",
-                            f"Skill committed, but commit logging failed: {log_error}",
-                            phase=DiagnosticPhase.STORE,
-                            severity=DiagnosticSeverity.WARNING,
+                    if retained:
+                        raise OSError(
+                            "transaction reservation is not empty: "
+                            + ", ".join(str(path) for path in retained)
                         )
+                remove_transaction_journal(self._journal_path)
+            except Exception as cleanup_error:
+                diagnostics.append(
+                    _diagnostic(
+                        "TRANSACTION_CLEANUP_PENDING",
+                        f"Committed install cleanup is pending: {cleanup_error}",
+                        phase=DiagnosticPhase.STORE,
+                        severity=DiagnosticSeverity.WARNING,
+                        details={"journal": str(self._journal_path)},
                     )
-                return success_result
+                )
+            try:
+                log.info(
+                    "skill.management_committed",
+                    name=name,
+                    source=source_id,
+                    active=active,
+                    generation=generation,
+                )
+            except Exception as log_error:
+                diagnostics.append(
+                    _diagnostic(
+                        "POST_COMMIT_REPORTING_FAILED",
+                        f"Skill committed, but commit logging failed: {log_error}",
+                        phase=DiagnosticPhase.STORE,
+                        severity=DiagnosticSeverity.WARNING,
+                    )
+                )
+            return success_result
         except BaseException as exc:
             if durably_committed and success_result is not None:
                 if publication_barrier is not None:
@@ -2826,7 +3034,8 @@ class SkillManagementService:
                 )
             rollback_performed = False
             if journal is not None and path_is_occupied(self._journal_path):
-                recovery = recover_pending_skill_transaction(
+                recovery = await _run_postflight_worker(recover_pending_skill_transaction,
+                    _settling=True,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
                     journal_path=self._journal_path,
@@ -2847,12 +3056,11 @@ class SkillManagementService:
                         restore(old_snapshot, reason="skill.management.rollback")
                     elif old_snapshot is not None:
                         try:
-                            async with self._mutation_lock:
-                                await _run_postflight_worker(
-                                    self._loader.reload,
-                                    force=True,
-                                    reason="skill.management.rollback",
-                                )
+                            await _run_postflight_worker(
+                                self._loader.reload,
+                                force=True,
+                                reason="skill.management.rollback",
+                            )
                         except Exception:
                             diagnostics.append(
                                 _diagnostic(
@@ -2883,9 +3091,7 @@ class SkillManagementService:
                     drifted = True
             if journal is None or not path_is_occupied(self._journal_path):
                 cleanup_pre_journal_reservation()
-            if not isinstance(exc, Exception):
-                raise
-            return self._failure(
+            failure_result = self._failure(
                 name=name,
                 message=str(exc) or type(exc).__name__,
                 diagnostics=diagnostics,
@@ -2904,9 +3110,24 @@ class SkillManagementService:
                 install_id=old_entry.install_id if old_entry is not None else "",
                 compatibility=_entry_compatibility(old_entry),
             )
+            if not isinstance(exc, Exception):
+                operation = current_install_operation()
+                if isinstance(exc, asyncio.CancelledError) and operation is not None:
+                    payload = failure_result.to_dict()
+                    payload["cancelled"] = not payload.get("recoveryRequired", False)
+                    if payload["cancelled"]:
+                        payload["message"] = "Skill installation cancelled"
+                    await operation.store.finish_async(operation.owner, operation.id, payload)
+                raise
+            return failure_result
         finally:
-            publication_stack.close()
+            try:
+                publication_stack.close()
+            finally:
+                if mutation_acquired:
+                    self._mutation_lock.release()
 
+    @_owned_mutation
     async def update(
         self,
         name: str | None = None,
@@ -3068,6 +3289,7 @@ class SkillManagementService:
             )
         return results
 
+    @_owned_mutation
     async def uninstall(
         self,
         name: str = "",
@@ -3109,196 +3331,199 @@ class SkillManagementService:
         publication_barrier: Any | None = None
         durably_committed = False
         success_result: InstallResult | None = None
+        # Keep rollback and publication cleanup inside the writer admission.
+        mutation_acquired = False
         try:
-            async with self._mutation_lock:
-                recovery = recover_pending_skill_transaction(
+            await self._mutation_lock.acquire()
+            mutation_acquired = True
+            recovery = await _run_postflight_worker(recover_pending_skill_transaction,
+                managed_dir=self._managed_dir,
+                lockfile_path=self._lockfile_path,
+                journal_path=self._journal_path,
+            )
+            recovery = guard_retained_recovery_journal(
+                recovery,
+                journal_path=self._journal_path,
+            )
+            self._observe_recovery(recovery)
+            diagnostics.extend(recovery)
+            if any(item.blocking for item in recovery):
+                raise RuntimeError(recovery[-1].message)
+            ensure_safe_transaction_roots(self._managed_dir)
+            lockfile = Lockfile.load(self._lockfile_path)
+            if lockfile.mutation_blocked:
+                raise LockfileMutationBlockedError(
+                    self._lockfile_path,
+                    lockfile.diagnostics,
+                )
+            try:
+                resolved_key = self._resolve_install_key(
+                    lockfile,
+                    name,
+                    install_id=install_id,
+                )
+            except LockfileIdentityAmbiguousError as exc:
+                diagnostics.append(
+                    _diagnostic(
+                        "AMBIGUOUS_INSTALL",
+                        str(exc),
+                        phase=DiagnosticPhase.LOCK,
+                        blocking=True,
+                        hint="Retry with the exact installId.",
+                        details={"storageKeys": list(exc.candidates)},
+                    )
+                )
+                raise RuntimeError(str(exc)) from exc
+            if resolved_key is None:
+                raise RuntimeError(
+                    f"Skill install {(install_id or name)!r} is not tracked"
+                )
+            storage_key = resolved_key
+            entry = lockfile.get(storage_key)
+            if entry is None:
+                raise RuntimeError(f"Skill install {storage_key!r} is not tracked")
+            display_name = entry.manifest_name or storage_key
+            try:
+                target = _entry_target(self._managed_dir, storage_key, entry)
+            except ValueError as exc:
+                diagnostics.append(
+                    _diagnostic(
+                        "STORE_PATH_UNSAFE",
+                        str(exc),
+                        phase=DiagnosticPhase.STORE,
+                        blocking=True,
+                        hint="Repair or restore the tracked lock entry before mutation.",
+                    )
+                )
+                raise RuntimeError(str(exc)) from exc
+            rollback = rollback_root(self._managed_dir) / transaction_id / target.name
+            staging = staging_root(self._managed_dir) / transaction_id / target.name
+            if not target.is_dir() or target.is_symlink():
+                raise RuntimeError(f"Tracked Skill directory is missing or unsafe: {target}")
+            expected = entry.tree_sha256 or entry.sha256
+            actual = _installed_digest(target, entry)
+            if expected and expected != actual and not allow_drift:
+                raise RuntimeError(
+                    "Local drift detected; pass an explicit drift confirmation to uninstall"
+                )
+            # See install/update: the rollback baseline must include every
+            # writer that committed before this mutation acquired the
+            # shared managed-root lock.
+            if self._loader is not None:
+                old_snapshot = self._loader.snapshot()
+                generation = int(getattr(old_snapshot, "generation", 0) or 0)
+            rollback.parent.mkdir(parents=True, exist_ok=True)
+            journal = SkillTransactionJournal.prepare(
+                operation="uninstall",
+                managed_dir=self._managed_dir,
+                name=target.name,
+                target=target,
+                staging=staging,
+                rollback=rollback,
+                lockfile_path=self._lockfile_path,
+            )
+            fsync_directory(rollback.parent)
+            fsync_directory(rollback.parent.parent)
+            fsync_directory(rollback.parent.parent.parent)
+            journal.write(self._journal_path)
+            if self._loader is not None:
+                barrier_factory = getattr(
+                    self._loader,
+                    "catalog_publication_barrier",
+                    None,
+                )
+                if callable(barrier_factory):
+                    publication_barrier = publication_stack.enter_context(
+                        barrier_factory(reason="skill.management.uninstall")
+                    )
+            guard = (
+                self._loader.mutation_guard(reason="skill.management.uninstall")
+                if self._loader is not None
+                else nullcontext()
+            )
+            with guard:
+                validate_transaction_journal_paths(
+                    journal,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
-                    journal_path=self._journal_path,
                 )
-                recovery = guard_retained_recovery_journal(
-                    recovery,
-                    journal_path=self._journal_path,
-                )
-                self._observe_recovery(recovery)
-                diagnostics.extend(recovery)
-                if any(item.blocking for item in recovery):
-                    raise RuntimeError(recovery[-1].message)
-                ensure_safe_transaction_roots(self._managed_dir)
-                lockfile = Lockfile.load(self._lockfile_path)
-                if lockfile.mutation_blocked:
-                    raise LockfileMutationBlockedError(
-                        self._lockfile_path,
-                        lockfile.diagnostics,
-                    )
-                try:
-                    resolved_key = self._resolve_install_key(
-                        lockfile,
-                        name,
-                        install_id=install_id,
-                    )
-                except LockfileIdentityAmbiguousError as exc:
-                    diagnostics.append(
-                        _diagnostic(
-                            "AMBIGUOUS_INSTALL",
-                            str(exc),
-                            phase=DiagnosticPhase.LOCK,
-                            blocking=True,
-                            hint="Retry with the exact installId.",
-                            details={"storageKeys": list(exc.candidates)},
-                        )
-                    )
-                    raise RuntimeError(str(exc)) from exc
-                if resolved_key is None:
-                    raise RuntimeError(
-                        f"Skill install {(install_id or name)!r} is not tracked"
-                    )
-                storage_key = resolved_key
-                entry = lockfile.get(storage_key)
-                if entry is None:
-                    raise RuntimeError(f"Skill install {storage_key!r} is not tracked")
-                display_name = entry.manifest_name or storage_key
-                try:
-                    target = _entry_target(self._managed_dir, storage_key, entry)
-                except ValueError as exc:
-                    diagnostics.append(
-                        _diagnostic(
-                            "STORE_PATH_UNSAFE",
-                            str(exc),
-                            phase=DiagnosticPhase.STORE,
-                            blocking=True,
-                            hint="Repair or restore the tracked lock entry before mutation.",
-                        )
-                    )
-                    raise RuntimeError(str(exc)) from exc
-                rollback = rollback_root(self._managed_dir) / transaction_id / target.name
-                staging = staging_root(self._managed_dir) / transaction_id / target.name
-                if not target.is_dir() or target.is_symlink():
-                    raise RuntimeError(f"Tracked Skill directory is missing or unsafe: {target}")
-                expected = entry.tree_sha256 or entry.sha256
-                actual = _installed_digest(target, entry)
-                if expected and expected != actual and not allow_drift:
-                    raise RuntimeError(
-                        "Local drift detected; pass an explicit drift confirmation to uninstall"
-                    )
-                # See install/update: the rollback baseline must include every
-                # writer that committed before this mutation acquired the
-                # shared managed-root lock.
-                if self._loader is not None:
-                    old_snapshot = self._loader.snapshot()
-                    generation = int(getattr(old_snapshot, "generation", 0) or 0)
-                rollback.parent.mkdir(parents=True, exist_ok=True)
-                journal = SkillTransactionJournal.prepare(
-                    operation="uninstall",
-                    managed_dir=self._managed_dir,
-                    name=target.name,
-                    target=target,
-                    staging=staging,
-                    rollback=rollback,
-                    lockfile_path=self._lockfile_path,
-                )
+                os.replace(target, rollback)
+                fsync_directory(target.parent)
                 fsync_directory(rollback.parent)
                 fsync_directory(rollback.parent.parent)
-                fsync_directory(rollback.parent.parent.parent)
-                journal.write(self._journal_path)
-                if self._loader is not None:
-                    barrier_factory = getattr(
-                        self._loader,
-                        "catalog_publication_barrier",
-                        None,
-                    )
-                    if callable(barrier_factory):
-                        publication_barrier = publication_stack.enter_context(
-                            barrier_factory(reason="skill.management.uninstall")
-                        )
-                guard = (
-                    self._loader.mutation_guard(reason="skill.management.uninstall")
-                    if self._loader is not None
-                    else nullcontext()
-                )
-                with guard:
-                    validate_transaction_journal_paths(
-                        journal,
-                        managed_dir=self._managed_dir,
-                        lockfile_path=self._lockfile_path,
-                    )
-                    os.replace(target, rollback)
-                    fsync_directory(target.parent)
-                    fsync_directory(rollback.parent)
-                    fsync_directory(rollback.parent.parent)
-                    journal.advance("old_moved", self._journal_path)
-                    lockfile.remove(storage_key)
-                    lockfile.save(self._lockfile_path)
-                    fsync_directory(self._lockfile_path.parent)
-                    journal.advance("lock_written", self._journal_path)
-                if self._loader is not None:
-                    generation, reload_payload = await self._reload_uninstall_and_verify(
-                        target=target,
-                        expected_previous_generation=generation,
-                        diagnostics=diagnostics,
-                    )
-                    if any(item.blocking for item in diagnostics):
-                        raise RuntimeError(diagnostics[-1].message)
-                lifecycle = SkillLifecycle(
-                    install_state=SkillInstallState.MISSING,
-                    load_state=(
-                        SkillLoadState.VALIDATED_OFFLINE
-                        if self._loader is None
-                        else SkillLoadState.NOT_DISCOVERED
-                    ),
-                    selection_state=SkillSelectionState.SHADOWED,
-                    compatibility_state=SkillCompatibilityState.INSTRUCTION_ONLY,
-                    readiness_state=SkillReadinessState.UNKNOWN,
-                    invocation=SkillInvocationCapabilities(sandbox_execution="unknown"),
-                )
-                success_result = InstallResult(
-                    success=True,
-                    name=display_name,
-                    message=f"Uninstalled {display_name!r}",
-                    installed=False,
-                    active=False,
-                    instruction_usable=False,
-                    install_id=entry.install_id,
-                    lifecycle=lifecycle,
+                journal.advance("old_moved", self._journal_path)
+                lockfile.remove(storage_key)
+                lockfile.save(self._lockfile_path)
+                fsync_directory(self._lockfile_path.parent)
+                journal.advance("lock_written", self._journal_path)
+            if self._loader is not None:
+                generation, reload_payload = await self._reload_uninstall_and_verify(
+                    target=target,
+                    expected_previous_generation=generation,
                     diagnostics=diagnostics,
-                    reload=reload_payload,
-                    catalog_generation=generation,
-                    effective_from="next_turn" if self._loader is not None else "next_start",
                 )
-                journal.advance("committed", self._journal_path)
-                durably_committed = True
-                if publication_barrier is not None:
-                    publication_barrier.commit()
-                try:
-                    validate_transaction_journal_paths(
-                        journal,
-                        managed_dir=self._managed_dir,
-                        lockfile_path=self._lockfile_path,
+                if any(item.blocking for item in diagnostics):
+                    raise RuntimeError(diagnostics[-1].message)
+            lifecycle = SkillLifecycle(
+                install_state=SkillInstallState.MISSING,
+                load_state=(
+                    SkillLoadState.VALIDATED_OFFLINE
+                    if self._loader is None
+                    else SkillLoadState.NOT_DISCOVERED
+                ),
+                selection_state=SkillSelectionState.SHADOWED,
+                compatibility_state=SkillCompatibilityState.INSTRUCTION_ONLY,
+                readiness_state=SkillReadinessState.UNKNOWN,
+                invocation=SkillInvocationCapabilities(sandbox_execution="unknown"),
+            )
+            success_result = InstallResult(
+                success=True,
+                name=display_name,
+                message=f"Uninstalled {display_name!r}",
+                installed=False,
+                active=False,
+                instruction_usable=False,
+                install_id=entry.install_id,
+                lifecycle=lifecycle,
+                diagnostics=diagnostics,
+                reload=reload_payload,
+                catalog_generation=generation,
+                effective_from="next_turn" if self._loader is not None else "next_start",
+            )
+            journal.advance("committed", self._journal_path)
+            durably_committed = True
+            if publication_barrier is not None:
+                publication_barrier.commit()
+            try:
+                validate_transaction_journal_paths(
+                    journal,
+                    managed_dir=self._managed_dir,
+                    lockfile_path=self._lockfile_path,
+                )
+                shutil.rmtree(rollback)
+                fsync_directory(rollback.parent)
+                retained = cleanup_empty_transaction_directories(
+                    journal,
+                    managed_dir=self._managed_dir,
+                    lockfile_path=self._lockfile_path,
+                )
+                if retained:
+                    raise OSError(
+                        "transaction reservation is not empty: "
+                        + ", ".join(str(path) for path in retained)
                     )
-                    shutil.rmtree(rollback)
-                    fsync_directory(rollback.parent)
-                    retained = cleanup_empty_transaction_directories(
-                        journal,
-                        managed_dir=self._managed_dir,
-                        lockfile_path=self._lockfile_path,
+                remove_transaction_journal(self._journal_path)
+            except Exception as cleanup_error:
+                diagnostics.append(
+                    _diagnostic(
+                        "TRANSACTION_CLEANUP_PENDING",
+                        f"Committed uninstall cleanup is pending: {cleanup_error}",
+                        phase=DiagnosticPhase.STORE,
+                        severity=DiagnosticSeverity.WARNING,
+                        details={"journal": str(self._journal_path)},
                     )
-                    if retained:
-                        raise OSError(
-                            "transaction reservation is not empty: "
-                            + ", ".join(str(path) for path in retained)
-                        )
-                    remove_transaction_journal(self._journal_path)
-                except Exception as cleanup_error:
-                    diagnostics.append(
-                        _diagnostic(
-                            "TRANSACTION_CLEANUP_PENDING",
-                            f"Committed uninstall cleanup is pending: {cleanup_error}",
-                            phase=DiagnosticPhase.STORE,
-                            severity=DiagnosticSeverity.WARNING,
-                            details={"journal": str(self._journal_path)},
-                        )
-                    )
-                return success_result
+                )
+            return success_result
         except BaseException as exc:
             if durably_committed and success_result is not None:
                 if publication_barrier is not None:
@@ -3327,7 +3552,8 @@ class SkillManagementService:
                 )
             rollback_performed = False
             if journal is not None and path_is_occupied(self._journal_path):
-                recovery = recover_pending_skill_transaction(
+                recovery = await _run_postflight_worker(recover_pending_skill_transaction,
+                    _settling=True,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
                     journal_path=self._journal_path,
@@ -3345,12 +3571,11 @@ class SkillManagementService:
                     restore(old_snapshot, reason="skill.management.uninstall.rollback")
                 elif old_snapshot is not None:
                     try:
-                        async with self._mutation_lock:
-                            rollback_reload = await _run_postflight_worker(
-                                self._loader.reload,
-                                force=True,
-                                reason="skill.management.uninstall.rollback",
-                            )
+                        rollback_reload = await _run_postflight_worker(
+                            self._loader.reload,
+                            force=True,
+                            reason="skill.management.uninstall.rollback",
+                        )
                         reload_payload = rollback_reload.to_dict()
                     except Exception:
                         diagnostics.append(
@@ -3422,7 +3647,11 @@ class SkillManagementService:
                 compatibility=_entry_compatibility(entry),
             )
         finally:
-            publication_stack.close()
+            try:
+                publication_stack.close()
+            finally:
+                if mutation_acquired:
+                    self._mutation_lock.release()
 
 
 def build_management_service(

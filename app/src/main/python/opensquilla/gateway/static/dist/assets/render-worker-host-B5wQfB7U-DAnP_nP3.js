@@ -1,0 +1,2 @@
+var e=``+new URL(new URL(`render-worker-1uPAxMZr-BVANRzzR.js`,import.meta.url).href,``+import.meta.url).href;function t(){return new Worker(e,{type:`module`})}export{t as createRenderWorker};
+//# sourceMappingURL=render-worker-host-B5wQfB7U-DAnP_nP3.js.map

@@ -17,7 +17,7 @@ from opensquilla.sandbox.run_context import (
     run_context_for_subagent,
     run_context_from_origin_payload,
 )
-from opensquilla.session.keys import normalize_agent_id, parse_agent_id
+from opensquilla.session.keys import is_sidechat_key, normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (
     CRON_AGENT_ALLOW,
@@ -41,7 +41,6 @@ class SourceKind(StrEnum):
 
 
 PRINCIPAL_HOST_EXECUTE_METADATA_KEY = "principal_host_execute"
-_ARTIFACT_MUTATION_WRITER_NAMES = frozenset({"document_apply", "document_patch"})
 
 
 @dataclass(frozen=True)
@@ -78,6 +77,11 @@ class RouteEnvelope:
     metadata: dict[str, Any] = field(default_factory=dict)
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     sandbox_run_context_fresh: bool = False
+    # Trusted producer declaration of optional services that must be ready
+    # before the runtime may reserve this turn.  This is deliberately a
+    # separate field from ``metadata``: channel/web payloads are untrusted and
+    # must never be able to manufacture a readiness or lifecycle claim.
+    required_services: tuple[str, ...] = field(default=(), kw_only=True)
     # Process-local services attached only after durable acceptance. Keeping
     # them out of ``metadata`` prevents serialization of live handles.
     runtime_services: dict[str, Any] = field(
@@ -85,6 +89,10 @@ class RouteEnvelope:
         repr=False,
         compare=False,
     )
+    # Immutable session generation captured when this turn is admitted. Keep
+    # this additive field last so older positional RouteEnvelope construction
+    # retains its existing argument layout.
+    session_epoch: int | None = None
 
     def delivery_fields(self) -> dict[str, Any]:
         """Return session routing fields derived from the reply target."""
@@ -126,6 +134,9 @@ def build_channel_route_envelope(
     session_prefix: str,
     agent_id: str | None = None,
     channel_type: str | None = None,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for a normalized inbound channel message."""
     metadata = dict(msg.metadata or {})
@@ -152,6 +163,7 @@ def build_channel_route_envelope(
         source_name=session_prefix,
         agent_id=resolved_agent_id,
         session_key=session_key,
+        session_id=session_id,
         sender_id=msg.sender_id,
         account_id=account_id,
         channel_type=resolved_channel_type,
@@ -174,6 +186,8 @@ def build_channel_route_envelope(
         delivery_context=delivery_context,
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
+        session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -185,11 +199,13 @@ def build_cli_route_envelope(
     channel_id: str = "cli:agent",
     sender_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
     interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
     elevated: str | None = None,
     run_mode: str | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for local CLI input."""
     resolved_interaction_mode = _interaction_mode(interaction_mode)
@@ -219,6 +235,8 @@ def build_cli_route_envelope(
         input_provenance={"kind": "cli_message", "source": source_name},
         metadata=metadata,
         interaction_mode=resolved_interaction_mode,
+        session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -231,9 +249,11 @@ def build_web_route_envelope(
     sender_id: str | None = None,
     channel_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     tool_source_kind: str | None = None,
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for Web/RPC-originated input."""
     resolved_channel_id = channel_id or (f"web:{conn_id}" if conn_id else "web")
@@ -265,6 +285,8 @@ def build_web_route_envelope(
         delivery_context={"sender_id": sender_id, "channel_id": resolved_channel_id},
         metadata=metadata,
         interaction_mode=InteractionMode.INTERACTIVE,
+        session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -274,6 +296,9 @@ def build_cron_route_envelope(
     session_key: str,
     agent_id: str | None = None,
     delivery: Any | None = None,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+    required_services: tuple[str, ...] = ("cron",),
 ) -> RouteEnvelope:
     """Build a route for scheduler-originated agent work or delivery."""
     resolved_delivery = delivery if delivery is not None else getattr(job, "delivery", None)
@@ -339,6 +364,7 @@ def build_cron_route_envelope(
         source_name="cron",
         agent_id=_agent_id(agent_id, session_key),
         session_key=session_key,
+        session_id=session_id,
         sender_id=sender_id,
         channel_type="cron",
         channel_name="cron",
@@ -348,6 +374,8 @@ def build_cron_route_envelope(
         delivery_context=delivery_context,
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
+        session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -356,6 +384,10 @@ def build_subagent_route_envelope(
     session_key: str,
     parent_session_key: str,
     agent_id: str | None = None,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+    parent_session_id: str | None = None,
+    parent_session_epoch: int | None = None,
     run_id: str | None = None,
     parent_task_id: str | None = None,
     spawn_depth: int = 0,
@@ -366,6 +398,9 @@ def build_subagent_route_envelope(
     run_mode: str | RunMode | None = None,
     sandbox_run_context: Any | None = None,
     sandbox_mounts: list[dict[str, Any]] | None = None,
+    collaboration_mode: str = "default",
+    allowed_tools: set[str] | frozenset[str] | None = None,
+    denied_tools: set[str] | frozenset[str] = frozenset(),
 ) -> RouteEnvelope:
     """Build a route for a child subagent run."""
     metadata: dict[str, Any] = {
@@ -375,6 +410,19 @@ def build_subagent_route_envelope(
         "spawn_depth": spawn_depth,
         "origin": origin,
     }
+    if collaboration_mode == "plan":
+        metadata["required_collaboration_mode"] = "plan"
+    if allowed_tools is not None:
+        metadata["parent_allowed_tools"] = sorted(allowed_tools)
+    metadata["parent_denied_tools"] = sorted(denied_tools)
+    if isinstance(parent_session_id, str) and parent_session_id:
+        metadata["parent_session_id"] = parent_session_id
+    if (
+        isinstance(parent_session_epoch, int)
+        and not isinstance(parent_session_epoch, bool)
+        and parent_session_epoch >= 0
+    ):
+        metadata["parent_session_epoch"] = parent_session_epoch
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = bool(principal_is_owner)
     if principal_host_execute is not None:
@@ -444,6 +492,7 @@ def build_subagent_route_envelope(
         source_name="subagent",
         agent_id=_agent_id(agent_id, session_key),
         session_key=session_key,
+        session_id=session_id,
         channel_type="subagent",
         channel_name="subagent",
         channel_id=run_id,
@@ -456,6 +505,7 @@ def build_subagent_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
         sandbox_run_context_fresh=run_context_payload is not None,
+        session_epoch=session_epoch,
     )
 
 
@@ -530,6 +580,10 @@ def tool_context_from_envelope(
             denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
         denied_tools = set(SUBAGENT_TOOL_DENY)
+        denied_tools.update(envelope.metadata.get("parent_denied_tools") or ())
+        parent_allowlist = envelope.metadata.get("parent_allowed_tools")
+        if isinstance(parent_allowlist, list):
+            allowed_tools = set(parent_allowlist)
     guest_safe = bool(envelope.metadata.get("guest_safe"))
     if guest_safe:
         from opensquilla.tools.visibility import guest_safe_tool_allowlist
@@ -542,6 +596,12 @@ def tool_context_from_envelope(
         )
     source_kind = envelope.metadata.get("tool_source_kind") or envelope.source_kind.value
     source_name = envelope.metadata.get("tool_source_name") or envelope.source_name
+    if caller_kind is CallerKind.CHANNEL:
+        # Adapter metadata describes platform messages, never the trusted
+        # execution surface. In particular it cannot opt into the WebUI
+        # permission matrix or bypass bounded channel handlers.
+        source_kind = envelope.source_kind.value
+        source_name = envelope.source_name
     legacy_elevated = envelope.metadata.get("elevated")
     elevated = None
     run_mode_value = envelope.metadata.get("run_mode")
@@ -589,81 +649,18 @@ def tool_context_from_envelope(
         sandbox_mounts = _filtered_legacy_sandbox_mounts(
             envelope.metadata.get("sandbox_mounts")
         )
-    artifact_context = envelope.runtime_services.get("artifact_context")
-    artifact_session = envelope.runtime_services.get("artifact_session")
-    desktop_artifact_bridge = envelope.runtime_services.get("desktop_artifact_bridge")
-    artifact_preview_service = envelope.runtime_services.get("artifact_preview_service")
-    artifact_event_emitter = envelope.runtime_services.get("artifact_event_emitter")
-    generated_artifact_adopter = envelope.runtime_services.get(
-        "generated_artifact_adopter"
-    )
-    artifact_tool_names: object = getattr(artifact_context, "tool_names", frozenset())
-    surfaced_tools: set[str] | None = None
-    exclusive_tools: frozenset[str] | None = None
-    artifact_mutation_attempt_controller: Any | None = None
-    artifact_candidate_loop_controller: Any | None = None
-    from opensquilla.gateway.artifact_contexts import (
-        DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY,
-        BoundDocumentContext,
-        BoundPromptAnnotationContext,
-    )
-
+    generated_artifact_adopter = envelope.runtime_services.get("generated_artifact_adopter")
+    workspace_preview_opener = envelope.runtime_services.get("workspace_preview_opener")
+    desktop_browser = None
     if (
-        isinstance(artifact_context, (BoundDocumentContext, BoundPromptAnnotationContext))
-        and artifact_session is not None
-        and caller_kind is CallerKind.WEB
+        caller_kind is CallerKind.WEB
         and interaction_mode is InteractionMode.INTERACTIVE
         and is_owner
         and not guest_safe
-        and isinstance(artifact_tool_names, frozenset)
     ):
-        surfaced_tools = set(artifact_tool_names)
-        if isinstance(artifact_context, BoundPromptAnnotationContext):
-            exclusive_tools = frozenset(artifact_tool_names)
-            allowed_tools = (
-                set(exclusive_tools)
-                if allowed_tools is None
-                else set(allowed_tools) & exclusive_tools
-            )
-        elif isinstance(artifact_context, BoundDocumentContext):
-            # A workspace file is not the bound Document. Keep ordinary read/search and
-            # authoring capabilities additive, but fail closed on the three direct source
-            # mutators that models commonly mistake for a Document update.
-            denied_tools.update(DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY)
-        if _ARTIFACT_MUTATION_WRITER_NAMES & artifact_tool_names:
-            task_id = str(envelope.metadata.get("task_id") or "").strip()
-            document_id = str(getattr(artifact_context, "document_id", "") or "").strip()
-            revision_id = str(getattr(artifact_context, "revision_id", "") or "").strip()
-            if task_id and document_id and revision_id:
-                from opensquilla.artifact_session import (
-                    ArtifactCandidateLoopController,
-                    ArtifactMutationAttemptController,
-                    ArtifactSessionService,
-                )
+        from opensquilla.browser import get_desktop_browser
 
-                if isinstance(artifact_session, ArtifactSessionService):
-                    if (
-                        isinstance(artifact_context, BoundPromptAnnotationContext)
-                        and "document_finish" in artifact_tool_names
-                    ):
-                        artifact_candidate_loop_controller = ArtifactCandidateLoopController(
-                            artifact_session,
-                            document_id=document_id,
-                            base_revision_id=revision_id,
-                            turn_id=task_id,
-                        )
-                    else:
-                        artifact_mutation_attempt_controller = ArtifactMutationAttemptController(
-                            artifact_session,
-                            document_id=document_id,
-                            base_revision_id=revision_id,
-                            turn_id=task_id,
-                        )
-    else:
-        artifact_event_emitter = None
-        desktop_artifact_bridge = None
-    if not callable(artifact_event_emitter):
-        artifact_event_emitter = None
+        desktop_browser = get_desktop_browser()
     if not (
         callable(generated_artifact_adopter)
         and caller_kind is CallerKind.WEB
@@ -673,14 +670,8 @@ def tool_context_from_envelope(
         and not guest_safe
     ):
         generated_artifact_adopter = None
-    if desktop_artifact_bridge is not None:
-        from opensquilla.gateway.desktop_artifact_bridge import (
-            DesktopArtifactBridgeClient,
-        )
-
-        if not isinstance(desktop_artifact_bridge, DesktopArtifactBridgeClient):
-            desktop_artifact_bridge = None
     ctx = ToolContext(
+        selected_skills=tuple(envelope.metadata.get("selected_skills") or ()),
         is_owner=is_owner,
         channel_admin_verified=channel_admin_verified,
         caller_kind=caller_kind,
@@ -702,6 +693,7 @@ def tool_context_from_envelope(
         sandbox_mounts=sandbox_mounts,
         sandbox_run_context=sandbox_run_context,
         session_key=envelope.session_key,
+        session_epoch=envelope.session_epoch,
         channel_kind=envelope.channel_name or envelope.channel_type,
         channel_id=envelope.channel_id,
         sender_id=envelope.sender_id,
@@ -709,7 +701,6 @@ def tool_context_from_envelope(
         source_name=source_name,
         allowed_tools=allowed_tools,
         denied_tools=denied_tools,
-        surfaced_tools=surfaced_tools,
         elevated=elevated,
         tool_policy=(
             envelope.metadata.get("tool_policy") if cron_trusted else None
@@ -737,31 +728,59 @@ def tool_context_from_envelope(
         ),
         plan_storage=envelope.runtime_services.get("plan_storage"),
         plan_event_emitter=envelope.runtime_services.get("plan_event_emitter"),
+        process_event_emitter=envelope.runtime_services.get("process_event_emitter"),
         user_input_provider=envelope.runtime_services.get("user_input_provider"),
+        suspend_compute_slot=envelope.runtime_services.get("suspend_compute_slot"),
+        update_progress=envelope.runtime_services.get("update_progress"),
+        usage_root_turn_id=envelope.metadata.get("usage_root_turn_id"),
         plan_revision=envelope.runtime_services.get("plan_revision"),
         plan_run=envelope.runtime_services.get("plan_run"),
-        goal_context=envelope.runtime_services.get("goal_context"),
-        goal_service=envelope.runtime_services.get("goal_service"),
-        artifact_context=artifact_context,
-        artifact_session=artifact_session,
-        desktop_artifact_bridge=desktop_artifact_bridge,
-        artifact_event_emitter=artifact_event_emitter,
-        generated_artifact_adopter=generated_artifact_adopter,
-        exclusive_tools=exclusive_tools,
-        artifact_mutation_attempt_controller=(
-            artifact_mutation_attempt_controller
+        goal_context=(
+            None if is_sidechat_key(envelope.session_key)
+            else envelope.runtime_services.get("goal_context")
         ),
-        artifact_candidate_loop_controller=artifact_candidate_loop_controller,
-        artifact_preview_service=artifact_preview_service,
+        goal_service=(
+            None if is_sidechat_key(envelope.session_key)
+            else envelope.runtime_services.get("goal_service")
+        ),
+        generated_artifact_adopter=generated_artifact_adopter,
+        artifact_source_paths=getattr(generated_artifact_adopter, "source_paths", {}),
+        desktop_browser=desktop_browser,
         turn_cleanup_callbacks=list(
             envelope.runtime_services.get("turn_cleanup_callbacks") or ()
         ),
+        session_id=envelope.session_id,
+        workspace_preview_opener=(
+            workspace_preview_opener
+            if callable(workspace_preview_opener)
+            and caller_kind is CallerKind.WEB
+            and envelope.source_kind is SourceKind.WEB
+            and interaction_mode is InteractionMode.INTERACTIVE
+            and is_owner
+            and not guest_safe
+            else None
+        ),
     )
+    from opensquilla.workspace_files import normalize_workspace_files
+
+    ctx.workspace_files = normalize_workspace_files(envelope.metadata.get("workspace_files"))
+    scopes = envelope.runtime_services.get("workspace_preview_scopes")
+    if isinstance(scopes, list):
+        ctx.workspace_preview_scopes = [dict(item) for item in scopes if isinstance(item, dict)]
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,
         # never from mutable metadata. Execution-time workspace validation is
         # the only ingress that sets this field for ordinary turns.
         setattr(ctx, "_sandbox_run_context_fresh", True)
+    if caller_kind is CallerKind.CHANNEL and not channel_admin_verified:
+        from opensquilla.tools.workspace_authoring import attest_channel_workspace
+
+        attest_channel_workspace(
+            ctx,
+            binding_kind=envelope.runtime_services.get("execution_workspace_binding_kind"),
+            binding_root=envelope.runtime_services.get("execution_workspace_binding_root"),
+            fresh=sandbox_run_context_fresh,
+        )
     if caller_kind is CallerKind.CRON:
         if not cron_trusted:
             ctx = apply_tool_policy_layer(

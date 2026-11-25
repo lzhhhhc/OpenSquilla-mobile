@@ -27,7 +27,13 @@ from opensquilla.onboarding.search_specs import (
     search_provider_catalog_payload,
 )
 from opensquilla.search.canonical import run_canonical_web_search
-from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, Recency, SearchMode, SearchOptions
+from opensquilla.search.types import (
+    DEFAULT_SEARCH_FETCH_TOP_K,
+    DEFAULT_SEARCH_MAX_RESULTS,
+    Recency,
+    SearchMode,
+    SearchOptions,
+)
 
 search_app = typer.Typer(help="Configure and inspect web search providers.")
 
@@ -59,13 +65,13 @@ def search_list(
         print_json(search_provider_catalog_payload())
         return
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Search providers")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("label", no_wrap=True)
-    table.add_column("runtime", no_wrap=True)
-    table.add_column("requires key", no_wrap=True)
-    table.add_column("env key")
+    table.add_column("provider", overflow="fold")
+    table.add_column("label", overflow="fold")
+    table.add_column("runtime", overflow="fold")
+    table.add_column("requires key", overflow="fold")
+    table.add_column("env key", overflow="fold")
     for spec in list_search_provider_setup_specs():
         table.add_row(
             spec.provider_id,
@@ -96,15 +102,15 @@ def search_status(
         print_json(payload)
         return
 
-    console = Console(width=140, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Search status")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("active", no_wrap=True)
-    table.add_column("configured", no_wrap=True)
-    table.add_column("buildable", no_wrap=True)
-    table.add_column("network", no_wrap=True)
-    table.add_column("fallback")
-    table.add_column("error")
+    table.add_column("provider", overflow="fold")
+    table.add_column("active", overflow="fold")
+    table.add_column("configured", overflow="fold")
+    table.add_column("buildable", overflow="fold")
+    table.add_column("network", overflow="fold")
+    table.add_column("fallback", overflow="fold")
+    table.add_column("error", overflow="fold")
     network_blocked = str(payload.get("networkBlockedReason") or "")
     table.add_row(
         str(payload.get("provider") or ""),
@@ -212,11 +218,11 @@ def search_query(
         typer.secho(f"Search failed: {message}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Search: {query}")
-    table.add_column("Title")
-    table.add_column("URL")
-    table.add_column("Snippet")
+    table.add_column("Title", overflow="fold")
+    table.add_column("URL", overflow="fold")
+    table.add_column("Snippet", overflow="fold")
     for row in payload.get("results", []):
         table.add_row(
             str(row.get("title") or ""),
@@ -257,7 +263,7 @@ def _run_local_research_query(
         max_results=(
             max_results if max_results is not None else (limit if limit is not None else 10)
         ),
-        fetch_top_k=fetch_top_k if fetch_top_k is not None else 3,
+        fetch_top_k=fetch_top_k if fetch_top_k is not None else DEFAULT_SEARCH_FETCH_TOP_K,
         max_chars_per_source=max_chars_per_source if max_chars_per_source is not None else 1500,
         include_domains=tuple(include_domains or ()),
         exclude_domains=tuple(exclude_domains or ()),
@@ -270,7 +276,7 @@ def _run_local_research_query(
 async def _web_search_fetcher(url: str, max_chars: int) -> dict[str, object]:
     from opensquilla.tools.builtin.web_fetch import run_web_fetch_payload
 
-    return await run_web_fetch_payload(url, max_chars=max_chars)
+    return await run_web_fetch_payload(url, max_chars=max_chars, _search_excerpt=True)
 
 
 def _emit_invalid_request(message: str, *, json_output: bool) -> NoReturn:
@@ -282,15 +288,15 @@ def _emit_invalid_request(message: str, *, json_output: bool) -> NoReturn:
 
 
 def _print_research_results(query: str, payload: dict[str, Any]) -> None:
-    console = Console(width=180, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Research search: {query}")
-    table.add_column("Rank", no_wrap=True)
-    table.add_column("Title")
-    table.add_column("Domain", no_wrap=True)
-    table.add_column("Provider", no_wrap=True)
-    table.add_column("Fetched", no_wrap=True)
-    table.add_column("URL")
-    table.add_column("Excerpt")
+    table.add_column("Rank", overflow="fold")
+    table.add_column("Title", overflow="fold")
+    table.add_column("Domain", overflow="fold")
+    table.add_column("Provider", overflow="fold")
+    table.add_column("Fetched", overflow="fold")
+    table.add_column("URL", overflow="fold")
+    table.add_column("Excerpt", overflow="fold")
     for index, row in enumerate(payload.get("results", []), start=1):
         if not isinstance(row, dict):
             continue
@@ -329,11 +335,11 @@ def search_benchmark(
         print_json(payload)
         return
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Search benchmark: {profile}")
-    table.add_column("Metric")
-    table.add_column("v1", justify="right")
-    table.add_column("v2", justify="right")
+    table.add_column("Metric", overflow="fold")
+    table.add_column("v1", justify="right", overflow="fold")
+    table.add_column("v2", justify="right", overflow="fold")
     for metric in (
         "p50_latency_ms",
         "p95_latency_ms",
@@ -459,7 +465,7 @@ def search_configure(
     )
     typer.echo(f"Search provider configured: {provider}")
     typer.echo(f"Config: {persist.path}")
-    warning_console = Console(file=sys.stdout, width=160, force_terminal=False)
+    warning_console = Console(file=sys.stdout, force_terminal=False)
     for warning in env_reference_warnings(result.config):
         warning_console.print(warning_panel(warning))
     if persist.backup_path:

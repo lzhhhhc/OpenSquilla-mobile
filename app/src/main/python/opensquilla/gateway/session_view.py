@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import json
-import re
-import unicodedata
 from typing import Any
 
-from opensquilla.chat.flattened_tool_markers import is_flattened_tool_result_dump
 from opensquilla.session.keys import derive_chat_type, parse_agent_id
+from opensquilla.session.title_quality import is_refusal_title
+from opensquilla.session.title_text import (
+    _is_generic_webchat_title,
+)
+from opensquilla.session.title_text import (
+    _truncate_title_graphemes as _truncate_title_graphemes,
+)
+from opensquilla.session.title_text import (
+    derive_transcript_title as derive_transcript_title,
+)
 
 _CHANNEL_SURFACES = frozenset(
     {
@@ -21,11 +27,6 @@ _CHANNEL_SURFACES = frozenset(
         "matrix",
         "telegram",
     }
-)
-_TIME_PREFIX_RE = re.compile(
-    r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} "
-    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
-    r"[A-Za-z0-9_+\-/]+\]\n"
 )
 
 
@@ -196,19 +197,20 @@ def _title(
     surface: str,
     transcript_title: str | None = None,
 ) -> str:
-    for attr in ("display_name", "derived_title", "subject"):
-        value = _display(getattr(session, attr, None))
-        if value:
-            if (
-                session_kind == "chat"
-                and surface == "webchat"
-                and transcript_title
-                and _is_generic_webchat_title(value, effective_agent_id)
-            ):
-                continue
-            return value
+    stored = _metadata_title(
+        session, effective_agent_id, session_kind, surface,
+    )
+    if stored:
+        return stored
     if transcript_title:
         return transcript_title
+    # Placeholders remain a fallback for genuinely unnamed sessions. A stored
+    # meaningful title must not depend on transcript availability or indexing.
+    placeholder = _metadata_title(
+        session, effective_agent_id, session_kind, surface, include_generic=True,
+    )
+    if placeholder:
+        return placeholder
     if session_kind == "chat" and surface == "webchat":
         if effective_agent_id != "main":
             return _humanize(effective_agent_id)
@@ -234,6 +236,84 @@ def _title(
             return f"{target}{suffix}"
         return f"{_humanize(surface)} conversation"
     return key or "Unknown session"
+
+
+def session_title_from_metadata(
+    session: Any, *, channel_types: dict[str, str] | None = None,
+) -> str:
+    """Return an authoritative stored title, excluding placeholders/refusals.
+
+    Read projections use the same precedence as the displayed title to avoid
+    fetching transcript text that cannot affect the result.
+    """
+    key = str(getattr(session, "session_key", "") or "")
+    origin = getattr(session, "origin", None)
+    origin_map = origin if isinstance(origin, dict) else {}
+    surface = _surface(session, key, origin_map, channel_types)
+    effective_agent_id = _effective_agent_id(session, key)
+    session_kind = _session_kind(session, key, surface, origin_map)
+    return _metadata_title(
+        session, effective_agent_id, session_kind, surface,
+    )
+
+
+def _metadata_title(
+    session: Any, effective_agent_id: str, session_kind: str, surface: str,
+    *, include_generic: bool = False,
+) -> str:
+    recover_refusal = _has_refused_chat_title(
+        session, effective_agent_id, session_kind, surface
+    )
+    for attr in ("display_name", "derived_title", "subject"):
+        value = _display(getattr(session, attr, None))
+        if value:
+            if recover_refusal and attr in {"display_name", "derived_title"}:
+                continue
+            if (
+                session_kind == "chat"
+                and surface == "webchat"
+                and not include_generic
+                and _is_generic_webchat_title(value, effective_agent_id)
+            ):
+                continue
+            return value
+    return ""
+
+
+def has_refused_chat_title(
+    session: Any, *, channel_types: dict[str, str] | None = None
+) -> bool:
+    """Whether an automatic chat title needs read-time refusal recovery.
+
+    Explicit display names and task/cron names remain authoritative.  Reuse
+    this predicate when a read path needs to fetch fallback transcript text.
+    """
+
+    key = str(getattr(session, "session_key", "") or "")
+    origin = getattr(session, "origin", None)
+    origin_map = origin if isinstance(origin, dict) else {}
+    surface = _surface(session, key, origin_map, channel_types)
+    return _has_refused_chat_title(
+        session,
+        _effective_agent_id(session, key),
+        _session_kind(session, key, surface, origin_map),
+        surface,
+    )
+
+
+def _has_refused_chat_title(
+    session: Any, effective_agent_id: str, session_kind: str, surface: str
+) -> bool:
+    if session_kind not in {"chat", "channel"}:
+        return False
+    if not is_refusal_title(getattr(session, "derived_title", None)):
+        return False
+    display_name = _display(getattr(session, "display_name", None))
+    return not display_name or (
+        session_kind == "chat"
+        and surface == "webchat"
+        and _is_generic_webchat_title(display_name, effective_agent_id)
+    )
 
 
 def _subtitle(
@@ -327,7 +407,7 @@ def _last_activity_at(session: Any, task_rows: list[Any], now_ms: int) -> int:
 
 
 def _interactive(session_kind: str, surface: str) -> bool:
-    return session_kind == "chat" and surface == "webchat"
+    return session_kind == "cron" or (session_kind == "chat" and surface == "webchat")
 
 
 def _channel_context(session: Any, surface: str) -> dict[str, str] | None:
@@ -433,157 +513,3 @@ def _parent_label(key: str) -> str:
 def _humanize(value: str) -> str:
     cleaned = value.replace("_", " ").replace("-", " ").strip()
     return cleaned[:1].upper() + cleaned[1:] if cleaned else ""
-
-
-def _is_regional_indicator(char: str) -> bool:
-    return 0x1F1E6 <= ord(char) <= 0x1F1FF
-
-
-def _is_grapheme_extend(char: str) -> bool:
-    codepoint = ord(char)
-    return (
-        unicodedata.category(char) in {"Mn", "Mc", "Me"}
-        or 0xFE00 <= codepoint <= 0xFE0F
-        or 0xE0100 <= codepoint <= 0xE01EF
-        or 0x1F3FB <= codepoint <= 0x1F3FF
-        or 0xE0020 <= codepoint <= 0xE007F
-    )
-
-
-def _hangul_syllable_type(char: str) -> str | None:
-    """Return the UAX #29 Hangul class used by grapheme rules GB6-GB8."""
-
-    codepoint = ord(char)
-    if 0x1100 <= codepoint <= 0x115F or 0xA960 <= codepoint <= 0xA97C:
-        return "L"
-    if 0x1160 <= codepoint <= 0x11A7 or 0xD7B0 <= codepoint <= 0xD7C6:
-        return "V"
-    if 0x11A8 <= codepoint <= 0x11FF or 0xD7CB <= codepoint <= 0xD7FB:
-        return "T"
-    if 0xAC00 <= codepoint <= 0xD7A3:
-        return "LV" if (codepoint - 0xAC00) % 28 == 0 else "LVT"
-    return None
-
-
-def _hangul_extends_cluster(previous: str, current: str) -> bool:
-    previous_type = _hangul_syllable_type(previous)
-    current_type = _hangul_syllable_type(current)
-    return bool(
-        (previous_type == "L" and current_type in {"L", "V", "LV", "LVT"})
-        or (previous_type in {"LV", "V"} and current_type in {"V", "T"})
-        or (previous_type in {"LVT", "T"} and current_type == "T")
-    )
-
-
-def _title_grapheme_clusters(text: str) -> list[str]:
-    """Group display-title text without splitting common user graphemes."""
-
-    clusters: list[str] = []
-    cluster = ""
-    join_next = False
-    regional_indicators = 0
-    for char in text:
-        regional = _is_regional_indicator(char)
-        extends_cluster = (
-            bool(cluster)
-            and (
-                join_next
-                or char == "\u200d"
-                or _is_grapheme_extend(char)
-                or _hangul_extends_cluster(cluster[-1], char)
-                or (regional and regional_indicators == 1)
-            )
-        )
-        if cluster and not extends_cluster:
-            clusters.append(cluster)
-            cluster = ""
-            regional_indicators = 0
-        cluster += char
-        regional_indicators = regional_indicators + 1 if regional else 0
-        join_next = char == "\u200d" or "VIRAMA" in unicodedata.name(char, "")
-    if cluster:
-        clusters.append(cluster)
-    return clusters
-
-
-def _truncate_title_graphemes(text: str, max_chars: int) -> str:
-    suffix = "..."
-    prefix_budget = max(0, max_chars - len(suffix))
-    prefix: list[str] = []
-    prefix_chars = 0
-    for cluster in _title_grapheme_clusters(text):
-        if prefix_chars + len(cluster) > prefix_budget:
-            break
-        prefix.append(cluster)
-        prefix_chars += len(cluster)
-    return "".join(prefix).rstrip() + suffix
-
-
-def derive_transcript_title(content: Any, *, max_chars: int = 34) -> str:
-    text = _content_text(content)
-    if not text:
-        return ""
-    text = _TIME_PREFIX_RE.sub("", text, count=1)
-    if is_flattened_tool_result_dump(text):
-        return ""
-    cleaned = re.sub(r"\s+", " ", text).strip()
-    cleaned = cleaned.strip("\"'` ")
-    if not cleaned:
-        return ""
-    if len(cleaned) <= max_chars:
-        return cleaned
-    return _truncate_title_graphemes(cleaned, max_chars)
-
-
-def _content_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        raw = content.strip()
-        if not raw:
-            return ""
-        if raw[0] in "[{":
-            try:
-                return _content_text(json.loads(raw))
-            except Exception:
-                return raw
-        return raw
-    if isinstance(content, dict):
-        for key in (
-            "text",
-            "message",
-            "semantic_message",
-            "prompt",
-            "query",
-            "content",
-        ):
-            value = content.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for value in content.values():
-            nested = _content_text(value)
-            if nested:
-                return nested
-        return ""
-    if isinstance(content, list):
-        for value in content:
-            nested = _content_text(value)
-            if nested:
-                return nested
-    return ""
-
-
-def _is_generic_webchat_title(value: str, effective_agent_id: str) -> bool:
-    normalized = value.strip().lower().replace("_", " ").replace("-", " ")
-    generic = {
-        "",
-        "chat",
-        "current session",
-        "direct chat",
-        "new chat",
-        "web chat",
-        "webchat",
-    }
-    if normalized in generic:
-        return True
-    return normalized == effective_agent_id.strip().lower()

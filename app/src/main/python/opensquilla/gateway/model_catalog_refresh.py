@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
+import hmac
 import json
 import math
 import os
+import secrets
 import stat
 import tempfile
 import time
@@ -61,7 +62,8 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-TOKENRHYTHM_SNAPSHOT_SCHEMA_VERSION = 1
+TOKENRHYTHM_SNAPSHOT_SCHEMA_VERSION = 2
+_LIFECYCLE_FINGERPRINT_KEY = secrets.token_bytes(32)
 TOKENRHYTHM_SUCCESS_TTL_SECONDS = 3600.0
 TOKENRHYTHM_FAILURE_BACKOFF_SECONDS = 300.0
 TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS = 5.0
@@ -135,12 +137,13 @@ def _canonical_base_url(value: str) -> str:
 
 
 def _digest(domain: str, *parts: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(f"opensquilla:{domain}:v1".encode())
-    for part in parts:
-        digest.update(b"\0")
-        digest.update(part.encode())
-    return digest.hexdigest()
+    # These lifecycle comparisons never leave memory; unlike the persisted
+    # authority identity they need no restart-stable credential derivative.
+    return hmac.new(
+        _LIFECYCLE_FINGERPRINT_KEY,
+        json.dumps((domain, *parts), separators=(",", ":")).encode(),
+        "sha256",
+    ).hexdigest()
 
 
 def _tokenrhythm_request(
@@ -168,7 +171,7 @@ def _tokenrhythm_request(
             proxy=proxy_value,
         ),
         public_transport_fingerprint=tokenrhythm_public_transport_fingerprint(
-            proxy=proxy_value,
+            proxy=proxy_value, api_key=key,
         ),
     )
 
@@ -645,6 +648,18 @@ def _error_failure_kind(error: BaseException | None) -> str:
     return ProviderFailureKind.UNKNOWN.value
 
 
+def _is_declared_access_rejection(error: BaseException | None) -> bool:
+    """A denied entitlement fetch cannot validate a previously cached grant.
+
+    A 403 does not prove invalid credentials, so keep its generic failure
+    classification separate from this authenticated catalog access policy.
+    """
+    return (
+        isinstance(error, httpx.HTTPStatusError)
+        and error.response.status_code in {401, 403}
+    )
+
+
 def _first_capability(
     declared: TokenRhythmDeclaredModel,
     published: TokenRhythmPublishedModel | None,
@@ -813,7 +828,7 @@ class TokenRhythmCatalogCoordinator:
         self._aligned_at: dict[str, float] = {}
         self._ephemeral_aligned_at: dict[str, float] = {}
         self._failures: dict[tuple[str, str], float] = {}
-        self._last_declared_errors: dict[str, BaseException] = {}
+        self._last_declared_errors: dict[str, dict[str, BaseException]] = {}
         self._inflight: dict[tuple[str, str], asyncio.Task[_RefreshOutcome]] = {}
         # Source flights may outlive the operation that first awaited them
         # (callers use shield for singleflight). Keep a drain reference even
@@ -1210,10 +1225,14 @@ class TokenRhythmCatalogCoordinator:
 
         try:
             if source == "published":
+                from opensquilla.desktop_account import is_account_credential
+                account_options = ({"api_key": request.api_key}
+                                   if is_account_credential(request.api_key) else {})
                 published = await asyncio.wait_for(
                     fetch_tokenrhythm_published(
                         proxy=request.proxy,
                         timeout=TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS,
+                        **account_options,
                     ),
                     timeout=TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS,
                 )
@@ -1402,9 +1421,11 @@ class TokenRhythmCatalogCoordinator:
             else dict(entitlement.models) if entitlement is not None else {}
         )
         declared_available = transient_declared is not None or entitlement is not None
+        # A draft proxy has its own transport. Its authentication failure
+        # must not hide the same account's working saved connection.
         error = declared_error or self._last_declared_errors.get(
-            request.authority_identity
-        )
+            request.authority_identity, {}
+        ).get(request.transport_fingerprint)
         return _CatalogView(
             published=dict(self._published.models),
             declared=declared,
@@ -1724,7 +1745,11 @@ class TokenRhythmCatalogCoordinator:
             if fetch_declared:
                 if outcome.declared is not None:
                     transient_declared = outcome.declared
-                    self._last_declared_errors.pop(request.authority_identity, None)
+                    errors = self._last_declared_errors.get(request.authority_identity)
+                    if errors is not None:
+                        errors.pop(request.transport_fingerprint, None)
+                        if not errors:
+                            self._last_declared_errors.pop(request.authority_identity, None)
                     self._failures.pop(
                         (request.transport_fingerprint, "declared"), None
                     )
@@ -1754,9 +1779,21 @@ class TokenRhythmCatalogCoordinator:
                             )
                         )
                 elif outcome.declared_error is not None:
-                    self._last_declared_errors[
-                        request.authority_identity
-                    ] = outcome.declared_error
+                    if (
+                        persist_entitlement
+                        and _is_declared_access_rejection(outcome.declared_error)
+                    ):
+                        # A denied entitlement fetch is not a transient outage.
+                        # Revoke only this saved authority; draft probes must not
+                        # erase the active account's durable entitlement.
+                        self._entitlements.pop(request.authority_identity, None)
+                        self._ephemeral_entitlements.pop(request.authority_identity, None)
+                        self._aligned_at.pop(request.authority_identity, None)
+                        self._ephemeral_aligned_at.pop(request.authority_identity, None)
+                        should_persist = True
+                    self._last_declared_errors.setdefault(
+                        request.authority_identity, {}
+                    )[request.transport_fingerprint] = outcome.declared_error
                     self._failures[
                         (request.transport_fingerprint, "declared")
                     ] = outcome.completed_at
@@ -2016,7 +2053,11 @@ class TokenRhythmCatalogCoordinator:
         force: bool,
         persist_entitlement: bool,
         activate: bool,
+        cache_only: bool = False,
     ) -> _CatalogView:
+        if cache_only:
+            async with self._lock:
+                return self._view_locked(request, now=float(self._clock()))
         return await self.refresh(
             request,
             force=force,
@@ -2177,6 +2218,7 @@ async def discover_tokenrhythm_models(
     force: bool = False,
     persist_entitlement: bool = False,
     config: object | None = None,
+    cache_only: bool = False,
 ) -> ProviderModelsDiscoverResult:
     """Admin discovery entry point returning the additive onboarding contract."""
 
@@ -2205,6 +2247,7 @@ async def discover_tokenrhythm_models(
             force=force,
             persist_entitlement=persist_entitlement,
             activate=activate,
+            cache_only=cache_only,
         )
     except Exception as error:  # noqa: BLE001 - discovery returns typed failure
         return ProviderModelsDiscoverResult(
@@ -2214,26 +2257,37 @@ async def discover_tokenrhythm_models(
             detail="TokenRhythm model catalog refresh failed.",
             catalog={"lastSyncedAt": None, "stale": True},
         )
+    catalog_status = {
+        **view.catalog,
+        "cacheHit": view.declared_available,
+        "accessRejected": bool(
+            view.declared_error is not None
+            and _is_declared_access_rejection(view.declared_error)
+        ),
+    }
     infos = _model_infos(
         view.published,
         view.declared,
         catalog=coordinator._catalog,
         request=request,
     )
-    if not view.declared_available and view.declared_error is not None:
+    if view.declared_error is not None:
+        retained = infos if not catalog_status["accessRejected"] else []
         return ProviderModelsDiscoverResult(
             ok=False,
             provider_id=provider_id,
             failure_kind=_error_failure_kind(view.declared_error),
             detail="TokenRhythm authenticated model catalog is unavailable.",
-            catalog=view.catalog,
+            source="live" if retained else "none",
+            models=_discovery_rows(retained),
+            catalog=catalog_status,
         )
     return ProviderModelsDiscoverResult(
         ok=True,
         provider_id=provider_id,
         source="live" if infos else "none",
         models=_discovery_rows(infos),
-        catalog=view.catalog,
+        catalog=catalog_status,
     )
 
 

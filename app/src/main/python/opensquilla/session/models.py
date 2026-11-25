@@ -198,6 +198,10 @@ class SessionNode(SQLModel, table=True):
     # and continue to resolve the Agent/default OpenSquilla workspace.
     workspace_id: str | None = Field(default=None, index=True)
 
+    # Backend-owned execution root for new ordinary tasks. NULL is the legacy
+    # path-resolution contract, not a request to allocate a new directory.
+    execution_workspace: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
     # Agent id for multi-agent support
     agent_id: str = "main"
 
@@ -227,6 +231,11 @@ class TranscriptEntry(SQLModel, table=True):
     tool_calls: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
     tool_call_id: str | None = None
     reasoning_content: str | None = None
+    # Accepted provider messages, separate from the turn's display aggregates.
+    # None identifies legacy rows whose original message boundaries are unknown.
+    assistant_replay: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON), repr=False
+    )
     turn_usage: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     # Gateway-owned causal identity shared by every durable row in one turn.
     # Additive JSON keeps older readers and pre-identity transcript rows valid.
@@ -349,6 +358,10 @@ class GoalRecord(SQLModel, table=True):
     cache_write_tokens: int = 0
     total_tokens: int = 0
 
+    usage_accounting_version: int = 1
+    usage_coverage: str = "complete"
+    usage_accounting_started_at_ms: int | None = None
+
     pause_reason: str | None = None
     blocked_reason: str | None = None
     terminal_reason: str | None = None
@@ -401,7 +414,6 @@ class SessionSummary(SQLModel, table=True):
     removed_count: int = 0
     kept_count: int = 0
     chunk_count: int = 0
-    flush_receipt_status: str = "unknown"
     # The transcript entry id up to which this summary covers (inclusive)
     covered_through_id: int = 0
     created_at: int = Field(default_factory=_now_ms)
@@ -435,7 +447,7 @@ class SessionContextState(SQLModel, table=True):
 
 
 class MemoryDurableReceipt(SQLModel, table=True):
-    """Durable ledger row for memory checkpoint and flush outcomes."""
+    """Durable ledger row for deterministic memory checkpoint outcomes."""
 
     __tablename__ = "memory_durable_receipts"
 
@@ -445,7 +457,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     turn_id: str | None = Field(default=None, index=True)
     scope: str = Field(index=True)
     source_path: str | None = None
-    target_path: str | None = None
     content_hash: str | None = None
     coverage_turn_id: str | None = Field(default=None, index=True)
     coverage_hash: str | None = Field(default=None, index=True)
@@ -453,8 +464,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     idempotency_key: str = Field(index=True, unique=True)
     status: str = Field(index=True)
     reason: str | None = None
-    attempt_count: int = 0
-    next_retry_at_ms: int | None = None
     created_at: int = Field(default_factory=_now_ms)
     updated_at: int = Field(default_factory=_now_ms)
     schema_version: int = 1
@@ -501,56 +510,4 @@ class TurnIngressReceipt(SQLModel, table=True):
     message_id: str
     task_id: str | None = Field(default=None, index=True)
     accepted_at: int = Field(default_factory=_now_ms)
-    schema_version: int = 1
-
-
-class MetaControlIntent(SQLModel, table=True):
-    """Durable authorization for one hidden MetaSkill control turn.
-
-    ``correlation_id`` is namespaced (``request:<client id>`` for a manual
-    launch and ``nonce:<nonce>`` for a failed-step replay), so it contains no
-    prompt or provider credential material.  Acceptance coordinates are bound
-    in the same transaction as the turn-ingress receipt.
-    """
-
-    __tablename__ = "meta_control_intents"
-
-    intent_id: str = Field(default_factory=_new_uuid, primary_key=True)
-    session_key: str = Field(index=True, max_length=512)
-    control_kind: str = Field(max_length=16)
-    correlation_id: str = Field(max_length=272)
-    meta_skill_name: str = Field(max_length=256)
-    replay_run_id: str | None = None
-    replay_mode: str | None = Field(default=None, max_length=32)
-    status: str = Field(default="staged", max_length=16)
-    accepted_source_scope: str | None = Field(default=None, max_length=256)
-    accepted_request_session_key: str | None = Field(default=None, max_length=512)
-    accepted_client_request_id: str | None = Field(default=None, max_length=256)
-    accepted_request_fingerprint: str | None = Field(default=None, max_length=128)
-    accepted_message_id: str | None = None
-    accepted_task_id: str | None = Field(default=None, index=True)
-    created_at: int = Field(default_factory=_now_ms)
-    updated_at: int = Field(default_factory=_now_ms)
-    schema_version: int = 1
-
-
-class MetaLaunchDraft(SQLModel, table=True):
-    """Unaccepted manual MetaSkill request retained for crash recovery.
-
-    The launch text is user-authored content and receives the same local
-    session-database treatment as a transcript message.  It is never copied to
-    logs or provider metadata.  ``client_request_id`` is the stable identity
-    used by ``meta.run`` and the eventual hidden ``chat.send``.
-    """
-
-    __tablename__ = "meta_launch_drafts"
-
-    draft_id: str = Field(default_factory=_new_uuid, primary_key=True)
-    session_key: str = Field(index=True, max_length=512)
-    client_request_id: str = Field(max_length=256)
-    meta_skill_name: str = Field(max_length=256)
-    launch_text: str = Field(max_length=128_000)
-    created_at: int = Field(default_factory=_now_ms)
-    updated_at: int = Field(default_factory=_now_ms)
-    expires_at: int
     schema_version: int = 1

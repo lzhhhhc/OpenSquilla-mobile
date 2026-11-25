@@ -567,6 +567,7 @@ def new_goal(
         session_epoch=session_epoch,
         goal_id=goal_id,
         objective=normalized,
+        usage_accounting_started_at_ms=timestamp,
         status=GoalStatus.ACTIVE.value,
         state_revision=1,
         objective_revision=1,
@@ -642,16 +643,18 @@ def goal_snapshot(
             "cacheWriteTokens": goal.cache_write_tokens,
             "totalTokens": goal.total_tokens,
         },
+        "usageAccountingStartedAtMs": goal.usage_accounting_started_at_ms,
+        "usageCoverage": (
+            "partial_history"
+            if not goal.usage_accounting_version and goal.usage_coverage == "complete"
+            else goal.usage_coverage
+        ),
         "pauseReason": goal.pause_reason,
         # ``blocked_reason`` is also the bounded, internal hand-off slot for
         # the blocker that preceded a Resume.  It is current public state only
         # while the Goal itself is blocked; active/paused snapshots must not
         # present that historical context as a live blocker.
-        "blockedReason": (
-            goal.blocked_reason
-            if goal.status == GoalStatus.BLOCKED.value
-            else None
-        ),
+        "blockedReason": (goal.blocked_reason if goal.status == GoalStatus.BLOCKED.value else None),
         "terminalReason": goal.terminal_reason,
         "createdAt": goal.created_at_ms,
         "updatedAt": goal.updated_at_ms,

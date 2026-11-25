@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from opensquilla.skills.hub.contracts import (
@@ -183,6 +184,14 @@ class SkillMeta:
     tags: list[str] = field(default_factory=list)
     platforms: list[str] = field(default_factory=list)
     canonical_identifier: str = ""
+    # Provenance fields are intentionally additive.  Older sources may leave
+    # them empty while modern registries can expose the upstream origin and
+    # their own integrity status without overloading ``homepage`` or
+    # ``trust_level``.
+    upstream_url: str = ""
+    origin_source: str = ""
+    signature_status: str = ""
+    content_hash: str = ""
 
     @property
     def canonical_identity(self) -> str:
@@ -264,6 +273,7 @@ class SkillBundle:
     meta: SkillMeta | None = None
     resolution: SourceResolution | None = None
     file_modes: dict[str, int] = field(default_factory=dict)
+    directory: Path | None = None
 
     @property
     def skill_md(self) -> str | None:
@@ -303,6 +313,21 @@ class SkillSource(ABC):
 
         return await self.fetch(resolution.requested_identifier)
 
+    async def fetch_resolved_into(
+        self,
+        resolution: SourceResolution,
+        destination: Path,
+    ) -> SkillBundle | None:
+        """Write to service-owned staging; legacy source adapters remain supported."""
+        from opensquilla.skills.hub.tree_io import write_legacy_bundle
+        from opensquilla.skills.io_worker import run_staging_worker
+
+        bundle = await self.fetch_resolved(resolution)
+        if bundle is not None:
+            await run_staging_worker(write_legacy_bundle, bundle, destination)
+            bundle.directory = destination
+        return bundle
+
     @abstractmethod
     async def inspect(self, identifier: str) -> SkillMeta | None:
         """Get metadata for a skill without downloading."""
@@ -316,3 +341,14 @@ class SkillSource(ABC):
     @abstractmethod
     def trust_level(self) -> str:
         """Trust level: 'builtin', 'trusted', or 'community'."""
+
+    @property
+    def requires_immutable_resolution(self) -> bool:
+        """Whether management must install only an immutable resolution.
+
+        Legacy adapters and test doubles can keep the historical fetch-only
+        contract. Registry adapters that hand off a versioned archive should
+        opt in so the policy does not need a growing source-name allowlist.
+        """
+
+        return False

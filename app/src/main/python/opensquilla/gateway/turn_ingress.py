@@ -2,30 +2,28 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import uuid
-from collections.abc import Awaitable
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.application.turn_admission import AdmitTurnResult
+from opensquilla.application.turn_input import TurnRequestIdentity as TurnRequestIdentity
+from opensquilla.application.turn_input import complete_durable_ingress as complete_durable_ingress
+from opensquilla.contracts.local_path_references import normalize_local_path_references
+from opensquilla.contracts.selected_skills import normalize_selected_skills
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.storage import TurnAcceptanceResult
 
-
-@dataclass(frozen=True)
-class TurnRequestIdentity:
-    source_scope: str
-    request_session_key: str
-    client_request_id: str
-    request_fingerprint: str
-
-
 _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("message", ("message",)),
+    ("turn_command", ("turnCommand",)),
     ("display_text", ("displayText", "display_text")),
     ("attachments", ("attachments",)),
+    ("workspace_files", ("workspaceFiles",)),
+    ("selected_skills", ("selectedSkills",)),
+    ("local_path_references", ("localPathReferences",)),
     ("intent", ("intent",)),
     (
         "initial_collaboration_mode",
@@ -40,6 +38,9 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "initial_routing_mode",
         ("initialRoutingMode", "initial_routing_mode"),
     ),
+    ("initial_model", ("initialModel", "initial_model")),
+    ("initial_provider", ("initialProvider", "initial_provider")),
+    ("router_control_event", ("routerControlEvent", "router_control_event")),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),
@@ -50,6 +51,8 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("run_kind", ("runKind", "run_kind")),
     ("workspace_id", ("workspaceId", "workspace_id")),
+    ("page_context", ("pageContext",)),
+    # Historical fingerprints keep already accepted requests replayable after retirement.
     (
         "prompt_annotation_ids",
         ("promptAnnotationIds", "prompt_annotation_ids"),
@@ -58,12 +61,22 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def _canonical_fingerprint_payload(params: dict[str, Any]) -> dict[str, Any]:
+def _canonical_fingerprint_payload(params: Mapping[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for canonical_name, aliases in _FINGERPRINT_FIELDS:
         for alias in aliases:
             if alias in params:
                 value = params[alias]
+                if canonical_name == "local_path_references":
+                    value = list(normalize_local_path_references(
+                        value, message=params.get("message", ""),
+                    ))
+                    if not value:
+                        break
+                if canonical_name == "selected_skills":
+                    value = list(normalize_selected_skills(value))
+                    if not value:
+                        break
                 if canonical_name == "document_context" and isinstance(value, dict):
                     value = {
                         "document_id": value.get("documentId", value.get("document_id")),
@@ -89,7 +102,7 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Unsupported request fingerprint value: {type(value).__name__}")
 
 
-def request_fingerprint(params: dict[str, Any]) -> str:
+def request_fingerprint(params: Mapping[str, Any]) -> str:
     """Hash stable logical request fields without retaining user content."""
 
     encoded = json.dumps(
@@ -103,11 +116,11 @@ def request_fingerprint(params: dict[str, Any]) -> str:
 
 
 def request_identity(
-    params: dict[str, Any],
+    params: Mapping[str, Any],
     *,
     request_session_key: str,
     source_scope: str,
-    fingerprint_params: dict[str, Any] | None = None,
+    fingerprint_params: Mapping[str, Any] | None = None,
 ) -> TurnRequestIdentity:
     raw_request_id = params.get("clientRequestId", params.get("client_request_id"))
     if raw_request_id is None:
@@ -132,9 +145,9 @@ def accepted_turn_payload(
     result: TurnAcceptanceResult,
     *,
     client_request_id: str,
-) -> dict[str, Any]:
+) -> AdmitTurnResult:
     receipt = result.receipt
-    payload = {
+    payload: AdmitTurnResult = {
         "status": "accepted",
         "accepted": True,
         "key": receipt.accepted_session_key,
@@ -151,23 +164,3 @@ def accepted_turn_payload(
         payload["task_status"] = task_status
         payload["taskStatus"] = task_status
     return payload
-
-
-async def complete_durable_ingress[T](awaitable: Awaitable[T]) -> T:
-    """Finish an ingress commit/activation pair even if its caller is cancelled.
-
-    Once queue admission has been reserved, cancellation must not split the
-    durable acceptance transaction from runtime activation.  The inner task is
-    shielded and repeated cancellation requests are deferred until that small
-    critical section settles.  Returning its result intentionally consumes the
-    caller cancellation: a disconnected transport may drop the response, while
-    its stable request id makes a later replay safe.
-    """
-
-    task = asyncio.ensure_future(awaitable)
-    while True:
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                return task.result()

@@ -22,11 +22,15 @@ future prompt-failure early-yield branch.
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+import structlog
+
 from opensquilla.provider.protocol import configured_provider_id
-from opensquilla.tools.types import is_goal_owned_main_default_turn
+from opensquilla.tools.types import CallerKind, is_goal_owned_main_default_turn
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.attachment_stage import (
@@ -36,8 +40,10 @@ if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.transcript_snapshot import (
         TurnTranscriptSnapshot,
     )
+    from opensquilla.identity.project_instructions import ProjectRulesSnapshot
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
+    from opensquilla.provider.selector import ProviderConfig
     from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
@@ -66,6 +72,8 @@ class RouterHistoryReplayRequest:
         default=None,
         repr=False,
     )
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,7 @@ class RunPipelineRequest:
     prev_assistant_text: str | None = None
     prev_assistant_usage: dict[str, Any] | None = None
     history_user_texts: list[str] | None = None
+    model_router_context: dict[str, Any] | None = field(default=None, repr=False)
     history_capacity_estimated_tokens: int = 0
     history_capacity_message_count: int = 0
     history_capacity_estimate_complete: bool = True
@@ -119,6 +128,15 @@ class RunPipelineRequest:
         default=None,
         repr=False,
     )
+    bound_user_message_id: str | None = field(default=None, repr=False)
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
+    transcript_snapshot: TurnTranscriptSnapshot[Any] | None = field(
+        default=None,
+        repr=False,
+    )
+    # Reference data appended after routing, excluding the base prompt's dynamic suffix.
+    additional_request_context_tokens: int = 0
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -148,6 +166,9 @@ class PromptAssemblerPort(Protocol):
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        webui_rendering: bool = False,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -185,6 +206,8 @@ class RouterContextPort(Protocol):
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]: ...
 
 @runtime_checkable
@@ -299,6 +322,14 @@ class PromptAssemblerStageInput:
         default=None,
         repr=False,
     )
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+    project_rules_snapshot: ProjectRulesSnapshot | None = field(default=None, repr=False)
+    on_initial_provider_ready: Callable[[ProviderConfig], None] | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -319,8 +350,8 @@ class PromptAssemblerStageOutput:
       or ``None``.
     - ``request_context_prompt``: the dynamic context for non-cached
       prefix, or ``None``.
-    - ``resolved_model``: the final model id (explicit > pipeline >
-      selector).
+    - ``resolved_model``: the final selector deployment's model id, falling
+      back to the explicit or pipeline model when no selector is available.
     - ``provider_name``: the provider's name attribute or class name.
     - ``session_id_for_log``: the durable session_id for trace_context.
     - ``trace_context_session_id``: the same value, surfaced explicitly so
@@ -371,6 +402,8 @@ class PromptAssemblerStage:
       SessionManager read.
     - ``memory_fingerprint.memory_mode_fingerprint`` — config method call,
       defensive (port returns ``None`` to mean "skip").
+    - ``on_initial_provider_ready`` — optional synchronous observer of the
+      already-selected physical deployment; observer failures are logged only.
 
     Exception model: re-raises any exception from the ports. The harness
     catches it through the existing CancelledError / Exception terminal
@@ -411,32 +444,48 @@ class PromptAssemblerStage:
         # Local imports keep the module import-cycle-free.
         from opensquilla.engine.turn_runner.outcome import StageOutcome
 
-        # 1. Assemble identity prompt. A PromptAnnotation turn carries an
-        # explicit tool ceiling and must not inherit workspace bootstrap text
-        # or its absolute path into any provider strategy.
+        extra_context = inp.extra_prompt_context
+        plan_reference_parts: list[str] = []
+        reference_keys = {
+            "Current Plan Revision", "Approved Plan Proposal", "Previous Plan Progress",
+        }
+        if extra_context and reference_keys.intersection(extra_context):
+            extra_context = dict(extra_context)
+            for key in tuple(extra_context):
+                if key in reference_keys:
+                    plan_reference_parts.append(f"## {key}\n\n{extra_context.pop(key)}")
         prompt_metadata: dict[str, Any] = {}
-        restricted_tool_boundary = bool(
-            inp.effective_tool_context is not None
-            and getattr(inp.effective_tool_context, "exclusive_tools", None) is not None
+        authorized_tools = getattr(inp.effective_tool_context, "authorized_tool_names", None)
+        persistence_tools = (
+            frozenset(authorized_tools) & {"memory_save", "memory_get"}
+            if authorized_tools is not None else None
         )
+        prompt_options: dict[str, Any] = {}
+        if inp.project_rules_snapshot is not None:
+            prompt_options["project_rules_snapshot"] = inp.project_rules_snapshot
+        if persistence_tools is not None:
+            prompt_options["persistence_tools"] = persistence_tools
         base_prompt = self._prompt_assembler.assemble_prompt(
             inp.agent_id,
             inp.tool_defs,
             session_key=inp.session_key,
             semantic_message=inp.semantic_input,
-            extra_context=(None if restricted_tool_boundary else inp.extra_prompt_context),
+            extra_context=extra_context,
             prompt_metadata=prompt_metadata,
-            bootstrap_context_mode=(
-                "restricted_tool_boundary"
-                if restricted_tool_boundary
-                else inp.bootstrap_context_mode
-            ),
+            bootstrap_context_mode=(inp.bootstrap_context_mode),
             fresh_user_session=inp.fresh_user_session,
-            workspace_dir=(
-                None
-                if restricted_tool_boundary
-                else getattr(inp.effective_tool_context, "workspace_dir", None)
+            workspace_dir=(getattr(inp.effective_tool_context, "workspace_dir", None)),
+            webui_rendering=(
+                getattr(inp.effective_tool_context, "caller_kind", None) is CallerKind.WEB
             ),
+            **prompt_options,
+        )
+        from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
+        from opensquilla.token_estimation import estimate_tokens
+
+        base_prompt = with_collaboration_instructions(base_prompt, inp.effective_tool_context)
+        additional_request_context_tokens = (
+            estimate_tokens("\n\n".join(plan_reference_parts)) if plan_reference_parts else 0
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -453,6 +502,14 @@ class PromptAssemblerStage:
         }
         if inp.transcript_snapshot is not None:
             router_context_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+        if (
+            inp.expected_session_id is not None
+            or inp.expected_session_epoch is not None
+        ):
+            router_context_kwargs["expected_session_id"] = inp.expected_session_id
+            router_context_kwargs["expected_session_epoch"] = (
+                inp.expected_session_epoch
+            )
         router_context = await self._router_context.fetch_router_context(
             inp.session_key,
             **router_context_kwargs,
@@ -512,6 +569,7 @@ class PromptAssemblerStage:
             cloned_selector=inp.cloned_selector,
             tool_defs=inp.tool_defs,
             base_prompt=base_prompt,
+            additional_request_context_tokens=additional_request_context_tokens,
             attachments=inp.attachments,
             attachment_materialization=inp.attachment_materialization,
             semantic_message=inp.semantic_input,
@@ -520,6 +578,7 @@ class PromptAssemblerStage:
             prev_assistant_text=router_context.get("prev_assistant_text"),
             prev_assistant_usage=router_context.get("prev_assistant_usage"),
             history_user_texts=router_context.get("history_user_texts"),
+            model_router_context=router_context,
             history_capacity_estimated_tokens=max(
                 0,
                 int(router_context.get("history_capacity_estimated_tokens") or 0),
@@ -542,12 +601,7 @@ class PromptAssemblerStage:
             tool_context=inp.effective_tool_context,
             normalization_metadata=inp.normalization_metadata,
             input_provenance=inp.input_provenance,
-            # PromptAnnotation turns are projected independently from the
-            # ordinary workspace/skill environment.  Passing ``None`` here
-            # is only half of that boundary; ``TurnRunner._run_pipeline``
-            # also suppresses its legacy global-loader fallback whenever the
-            # same exclusive ToolContext is present.
-            skill_catalog=(None if restricted_tool_boundary else inp.skill_catalog),
+            skill_catalog=(inp.skill_catalog),
             usage_execution_context=inp.usage_execution_context,
             provider_request_correlation=inp.provider_request_correlation,
             router_history_replay_request=(
@@ -557,16 +611,23 @@ class PromptAssemblerStage:
                     ),
                     bound_user_message_id=inp.bound_user_message_id,
                     transcript_snapshot=inp.transcript_snapshot,
+                    expected_session_id=inp.expected_session_id,
+                    expected_session_epoch=inp.expected_session_epoch,
                 )
                 if inp.attachments
                 else None
             ),
+            bound_user_message_id=inp.bound_user_message_id,
+            transcript_snapshot=inp.transcript_snapshot,
+            expected_session_id=inp.expected_session_id,
+            expected_session_epoch=inp.expected_session_epoch,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 
         # 4. Merge prompt + tool metadata
         turn.metadata.update(prompt_metadata)
         turn.metadata.update(inp.tool_metadata)
+        turn.metadata.update(inp.provider_metadata)
 
         # 5. Memory fingerprint merge (defensive — port returns None to skip)
         fingerprint = self._memory_fingerprint.memory_mode_fingerprint()
@@ -583,6 +644,10 @@ class PromptAssemblerStage:
         if inp.model and inp.cloned_selector is not None:
             from opensquilla.engine.selector_override import apply_model_override
 
+            prior_route_model = str(
+                turn.metadata.get("routed_model") or getattr(turn, "model", "") or ""
+            )
+            prior_route_provider = str(turn.metadata.get("routed_provider") or "")
             # An explicit model overrides the routed choice, so the turn
             # actually runs inp.model; realign_routed_model keeps telemetry
             # and billing on the model that ran, not the one routing
@@ -592,7 +657,48 @@ class PromptAssemblerStage:
                 inp.model,
                 turn_metadata=turn.metadata,
                 realign_routed_model=True,
+                explicit_capacity_override=True,
             )
+            if prior_route_model != turn.metadata.get("executed_model") or (
+                prior_route_provider
+                and prior_route_provider != turn.metadata.get("executed_provider")
+            ):
+                # Projection results belong to the previous deployment. The
+                # final model's catalog and provider boundary resolve them again.
+                for key in (
+                    "routed_model_vision_support",
+                    "image_input_projection_required",
+                    "image_input_mode",
+                    "image_input_reason",
+                    "router_image_capability_exhausted",
+                ):
+                    turn.metadata.pop(key, None)
+        # 命名等辅助任务只消费首次已选定的物理部署；不能从展示用 model
+        # 重建凭据，也不能把 Ensemble 或后续 fallback 当作新的派发入口。
+        if inp.on_initial_provider_ready is not None and provider is not None:
+            from opensquilla.provider.selector import ProviderConfig
+            from opensquilla.provider.types import ChatConfig
+
+            try:
+                response_deployment = getattr(provider, "current_response_deployment", None)
+                if callable(response_deployment):
+                    _, deployment, _ = response_deployment(ChatConfig())
+                else:
+                    deployment = getattr(inp.cloned_selector, "current_config", None)
+                if isinstance(deployment, ProviderConfig):
+                    result = inp.on_initial_provider_ready(deployment)
+                    if inspect.isawaitable(result):
+                        close = getattr(result, "close", None)
+                        if callable(close):
+                            close()
+                        structlog.get_logger().warning(
+                            "turn_runner.initial_provider_ready_must_be_synchronous"
+                        )
+            except Exception as exc:  # auxiliary observers must not fail the turn
+                structlog.get_logger().warning(
+                    "turn_runner.initial_provider_ready_failed",
+                    error_type=type(exc).__name__,
+                )
         if inp.cloned_selector is not None:
             # Local import to avoid pulling _SelectorFallbackProvider name
             # into the stage's module-top namespace.
@@ -602,6 +708,8 @@ class PromptAssemblerStage:
                 provider,
                 inp.cloned_selector,
                 turn_metadata=turn.metadata,
+                image_routing_config=(getattr(turn, "config", None) if not inp.model else None),
+                image_routing_session_key=inp.session_key,
             )
 
         # 7. Resolve final prompt + cache breakpoints
@@ -610,6 +718,15 @@ class PromptAssemblerStage:
             cache_breakpoints,
             request_context_prompt,
         ) = self._prompt_config_resolver.resolve_prompt_config(turn)
+        # Proposal text is reference data even when prompt caching is off.
+        # Never combine it into the system block that owns collaboration intent.
+        if plan_reference_parts:
+            request_context_prompt = "\n\n".join(
+                [
+                    *([request_context_prompt] if request_context_prompt else []),
+                    *plan_reference_parts,
+                ]
+            )
 
         # 8. Resolve session_id and build prompt report
         session_id_for_log = await self._session_id_resolver.resolve_session_id_for_log(
@@ -626,7 +743,7 @@ class PromptAssemblerStage:
             tool_profile=turn.metadata.get("tool_profile"),
         )
 
-        # 9. Resolve model_id: pipeline-routed > explicit param > selector current
+        # 9. Resolve model_id from the physical deployment after all overrides.
         selector_model = ""
         if inp.cloned_selector is not None:
             try:
@@ -635,17 +752,10 @@ class PromptAssemblerStage:
                 )
             except Exception:  # noqa: BLE001 - defensive
                 selector_model = ""
-        # ``turn.model`` is the router's requested model.  When a
-        # cross-provider deployment cannot be resolved, apply_model_override
-        # deliberately keeps the selector on its primary deployment and
-        # records ``routed_provider_blocked``.  In that fail-closed branch the
-        # selector is authoritative for execution; letting the stale routed
-        # model win here would pair the primary provider with a foreign model
-        # id in AgentConfig and turn-call records.
-        if turn.metadata.get("routed_provider_blocked") and selector_model:
-            resolved_model = selector_model
-        else:
-            resolved_model = getattr(turn, "model", None) or inp.model or selector_model
+        # ``turn.model`` remains the pipeline recommendation. Explicit model
+        # overrides and blocked cross-provider routes may execute another
+        # deployment, whose identity must also own capabilities and budgets.
+        resolved_model = selector_model or inp.model or getattr(turn, "model", None) or ""
         # Turn-call records describe the configured deployment, not the
         # generic adapter family.  A DashScope/DeepSeek deployment runs through
         # OpenAIProvider and a MiniMax deployment may run through

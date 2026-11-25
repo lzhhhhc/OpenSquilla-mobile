@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opensquilla.gateway.rpc import RpcHandlerError
+from opensquilla.gateway.session_services import SessionServiceUnavailableError
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
@@ -21,6 +22,9 @@ from opensquilla.sandbox.run_context import (
 )
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
+
+if TYPE_CHECKING:
+    from opensquilla.tools.types import ToolContext
 
 _NOT_FOUND_REASONS = frozenset({"not_found", "removed", "untrusted"})
 
@@ -78,6 +82,12 @@ def apply_run_context_route_metadata(
         else []
     )
     route_envelope.metadata["sandbox_run_context"] = run_context_payload
+    # This fact comes only from resolving the durable session binding. Never
+    # serialize it with the RunContext or accept it from channel metadata.
+    route_envelope.runtime_services["execution_workspace_binding_kind"] = (
+        run_context.workspace_binding_kind
+    )
+    route_envelope.runtime_services["execution_workspace_binding_root"] = run_context.workspace
     object.__setattr__(route_envelope, "sandbox_run_context_fresh", True)
     if run_context.run_mode.value == "full" and principal_is_owner:
         route_envelope.metadata["elevated"] = "full"
@@ -100,6 +110,7 @@ async def authoritative_project_run_context(
     session: SessionNode,
     config: Any,
     default_workspace: str | None,
+    include_user_grants: bool = True,
 ) -> tuple[RunContext, ProjectWorkspaceGuard | None]:
     context = await get_run_context(
         session_manager,
@@ -107,6 +118,7 @@ async def authoritative_project_run_context(
         config=config,
         workspace=default_workspace,
         session_node=session,
+        include_user_grants=include_user_grants,
     )
     validated = await resolve_session_project_workspace(storage, session)
     if validated is None:
@@ -117,6 +129,36 @@ async def authoritative_project_run_context(
             workspace=validated.canonical_path,
         ),
         validated.guard,
+    )
+
+
+async def prepare_heartbeat_tool_context(
+    session_key: str,
+    tool_context: ToolContext,
+    *,
+    storage: SessionStorage | None,
+    session_manager: Any,
+    config: Any,
+) -> ToolContext:
+    """Refresh the execution root without importing the session owner's authority."""
+    if not isinstance(storage, SessionStorage):
+        raise SessionServiceUnavailableError("Heartbeat requires session storage")
+    session = await session_manager.get_session(session_key)
+    if session is None:
+        raise KeyError(f"Session not found: {session_key}")
+    context, _guard = await authoritative_project_run_context(
+        storage=storage, session_manager=session_manager, session=session,
+        config=config, default_workspace=tool_context.workspace_dir,
+    )
+    workspace = context.workspace or tool_context.workspace_dir
+    # A cron caller may carry its own restricted context. Keep its mode and
+    # grants; the resolved session context supplies only the validated root.
+    sandbox_context = tool_context.sandbox_run_context
+    if isinstance(sandbox_context, RunContext):
+        sandbox_context = replace(sandbox_context, workspace=workspace)
+    return replace(
+        tool_context, session_key=session_key, workspace_dir=workspace,
+        sandbox_run_context=sandbox_context,
     )
 
 

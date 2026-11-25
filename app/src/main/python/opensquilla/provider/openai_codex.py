@@ -20,10 +20,12 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import base_url_hostname
 from opensquilla.env import trust_env as _trust_env
 
 from .candidate_artifact import CandidateArtifactBuilder, CandidateArtifactLimitError
@@ -34,21 +36,34 @@ from .codex_auth import (
     refresh_codex_credentials,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import (
+    DEFAULT_MAX_TOOL_ARGUMENT_CHARS,
     DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOTAL_TOOL_ARGUMENT_CHARS,
     ReasoningAccumulator,
     ToolStreamAccumulator,
     ToolStreamProtocolError,
 )
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -56,8 +71,10 @@ from .types import (
     Message,
     ModelInfo,
     ProviderFinalRequestProjection,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
 )
 
@@ -105,11 +122,7 @@ def _codex_tool(tool: ToolDefinition) -> dict[str, Any]:
         "name": tool.name,
         "description": tool.description,
         "strict": False,
-        "parameters": {
-            "type": tool.input_schema.type,
-            "properties": tool.input_schema.properties,
-            "required": tool.input_schema.required,
-        },
+        "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 
@@ -147,12 +160,10 @@ class OpenAICodexProvider:
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         base = (base_url or _CODEX_BACKEND_BASE).rstrip("/")
-        host_only = base.lower()
-        if (
-            ("chatgpt.com" in host_only or "chat.openai.com" in host_only)
-            and "/backend-api" not in host_only
-        ):
-            base = f"{base}/backend-api"
+        if base_url_hostname(base) in {"chatgpt.com", "chat.openai.com"}:
+            parsed = urlsplit(base)
+            if not parsed.path and "?" not in base and "#" not in base:
+                base = f"{base}/backend-api"
         return base
 
     @property
@@ -248,7 +259,8 @@ class OpenAICodexProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="openai_codex",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -271,6 +283,10 @@ class OpenAICodexProvider:
     ) -> AsyncIterator[StreamEvent]:
         try:
             credentials = load_codex_credentials(self._auth_path)
+            if cfg.compatibility_recovery == "refresh_credentials":
+                credentials = await refresh_codex_credentials(
+                    credentials, path=self._auth_path, proxy=self._proxy,
+                )
         except CodexAuthError as exc:
             yield ErrorEvent(message=str(exc), code="401")
             return
@@ -304,7 +320,8 @@ class OpenAICodexProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_codex",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -330,6 +347,7 @@ class OpenAICodexProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter="openai_codex",
                 status_projection_mode="content_envelope",
                 envelope_shape=RESPONSES_REQUEST_ENVELOPE,
@@ -354,7 +372,7 @@ class OpenAICodexProvider:
                 trust_env=_trust_env(),
                 proxy=self._proxy,
             ) as client:
-                refreshed = False
+                refreshed = cfg.compatibility_recovery == "refresh_credentials"
                 while True:
                     async with client.stream(
                         "POST",
@@ -378,6 +396,17 @@ class OpenAICodexProvider:
                                 yield ErrorEvent(message=str(exc), code="401")
                                 return
                             continue
+                        if (
+                            response.status_code == 401 and coordinator_owns_retry
+                            and cfg.compatibility_recovery != "refresh_credentials"
+                            and credentials.refresh_token
+                        ):
+                            yield ErrorEvent(
+                                message="Codex authorization requires credential refresh.",
+                                code="401", http_status=401,
+                                compatibility_recovery="refresh_credentials",
+                            )
+                            return
                         if response.status_code != 200:
                             body = await response.aread()
                             yield ErrorEvent(
@@ -389,6 +418,13 @@ class OpenAICodexProvider:
                                     max_len=2000,
                                 ),
                                 code=str(response.status_code),
+                                http_status=safe_http_status(response.status_code),
+                                provider_code=structured_provider_error_code(
+                                    response.text
+                                ),
+                                retry_after_s=retry_after_from_headers(
+                                    response.status_code, getattr(response, "headers", None)
+                                ),
                             )
                             return
 
@@ -406,7 +442,8 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="timeout",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout",
+                recovery_origin=transport_recovery_origin(exc),
             )
         except httpx.RequestError as exc:
             yield ErrorEvent(
@@ -415,7 +452,8 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="request_error",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error",
+                recovery_origin=transport_recovery_origin(exc),
             )
         except CandidateArtifactLimitError as exc:
             log.warning(
@@ -472,6 +510,13 @@ class OpenAICodexProvider:
         response_completed = False
         deferred_tool_ends: list[StreamEvent] = []
         invalid_tool_call_keys: set[Any] = set()
+        invalid_argument_keys: set[Any] = set()
+        rejection_call_identities: dict[Any, tuple[str, str]] = {}
+        rejection_finished_keys: set[Any] = set()
+        tool_protocol_invalid = False
+        rejection_terminal_valid = False
+        usage_known = False
+        terminal_argument_chars = 0
         candidate_sequence = 0
         candidate_wire_keys: dict[bytes, Any] = {}
         candidate_key_identities: dict[Any, dict[str, bytes]] = {}
@@ -642,6 +687,8 @@ class OpenAICodexProvider:
                             )
                             continue
                         key, tool_use_id = identity
+                        if key in rejection_call_identities:
+                            tool_protocol_invalid = True
                         try:
                             tool_events = tools_acc.start(
                                 key,
@@ -649,6 +696,7 @@ class OpenAICodexProvider:
                                 tool_name=tool_name,
                             )
                         except ToolStreamProtocolError as exc:
+                            tool_protocol_invalid = True
                             invalid_tool_call_keys.add(exc.key)
                             log.warning(
                                 "provider.tool_stream_protocol_error",
@@ -660,10 +708,13 @@ class OpenAICodexProvider:
                             continue
                         for tool_event in tool_events:
                             yield tool_event
+                        rejection_call_identities[key] = (tool_use_id, tool_name)
 
             elif etype == "response.function_call_arguments.delta":
                 delta_key = event.get("item_id")
                 raw_fragment = event.get("delta")
+                if raw_fragment is not None and not isinstance(raw_fragment, str):
+                    tool_protocol_invalid = True
                 fragment = str(raw_fragment or "")
                 if inert_candidate_output:
                     assert candidate_artifact is not None
@@ -684,9 +735,12 @@ class OpenAICodexProvider:
                         candidate_artifact.append_arguments(key, raw_fragment)
                         candidate_argument_keys.add(key)
                 elif fragment:
+                    if delta_key in rejection_finished_keys:
+                        tool_protocol_invalid = True
                     try:
                         tool_events = tools_acc.append(delta_key, fragment)
                     except ToolStreamProtocolError as exc:
+                        tool_protocol_invalid = True
                         invalid_tool_call_keys.add(exc.key)
                         log.warning(
                             "provider.tool_stream_protocol_error",
@@ -744,6 +798,12 @@ class OpenAICodexProvider:
                             )
                             continue
                         key, tool_use_id = identity
+                        if (
+                            key in rejection_finished_keys
+                            or item.get("status") not in (None, "completed")
+                        ):
+                            tool_protocol_invalid = True
+                        rejection_finished_keys.add(key)
                         try:
                             tool_events = tools_acc.start(
                                 key,
@@ -751,6 +811,7 @@ class OpenAICodexProvider:
                                 tool_name=tool_name,
                             )
                         except ToolStreamProtocolError as exc:
+                            tool_protocol_invalid = True
                             invalid_tool_call_keys.add(exc.key)
                             log.warning(
                                 "provider.tool_stream_protocol_error",
@@ -762,11 +823,21 @@ class OpenAICodexProvider:
                             continue
                         for tool_event in tool_events:
                             yield tool_event
+                        rejection_call_identities[key] = (tool_use_id, tool_name)
                         # The done item carries the authoritative full arguments.
                         if not isinstance(raw_arguments_value, str):
                             invalid_tool_call_keys.add(key)
+                            tool_protocol_invalid = True
                             continue
                         raw_arguments = raw_arguments_value
+                        terminal_argument_chars += len(raw_arguments)
+                        if (
+                            len(raw_arguments) > DEFAULT_MAX_TOOL_ARGUMENT_CHARS
+                            or terminal_argument_chars > DEFAULT_MAX_TOTAL_TOOL_ARGUMENT_CHARS
+                        ):
+                            tool_protocol_invalid = True
+                            invalid_tool_call_keys.add(key)
+                            continue
                         try:
                             arguments = (
                                 json.loads(
@@ -794,6 +865,7 @@ class OpenAICodexProvider:
                                     tools_acc.finish_with_arguments(key, arguments)
                                 )
                             except ToolStreamProtocolError as exc:
+                                tool_protocol_invalid = True
                                 invalid_tool_call_keys.add(exc.key)
                                 log.warning(
                                     "provider.tool_stream_protocol_error",
@@ -804,6 +876,7 @@ class OpenAICodexProvider:
                                 )
                         else:
                             invalid_tool_call_keys.add(key)
+                            invalid_argument_keys.add(key)
 
             elif etype == "response.completed":
                 body = event.get("response")
@@ -825,6 +898,13 @@ class OpenAICodexProvider:
                     return
                 actual_model = str(body.get("model") or self._model)
                 usage = body.get("usage") or {}
+                usage_known = isinstance(body.get("usage"), dict) and any(
+                    type(usage.get(key)) is int and usage[key] >= 0
+                    for key in ("input_tokens", "output_tokens")
+                )
+                rejection_terminal_valid = (
+                    body.get("error") is None and body.get("incomplete_details") is None
+                )
                 input_tokens = int(usage.get("input_tokens") or 0)
                 output_tokens = int(usage.get("output_tokens") or 0)
                 input_details = usage.get("input_tokens_details") or {}
@@ -880,10 +960,50 @@ class OpenAICodexProvider:
             not inert_candidate_output
             and (tools_acc.pending_raw_arguments() or invalid_tool_call_keys)
         ):
-            yield ErrorEvent(
-                message="ChatGPT Codex response ended with an incomplete tool call",
-                code="incomplete_tool_call",
-            )
+            pending_tool_calls = tools_acc.pending_raw_arguments()
+            if (
+                invalid_argument_keys
+                and invalid_tool_call_keys <= invalid_argument_keys
+                and not tool_protocol_invalid
+                and rejection_terminal_valid
+                and all(key in invalid_argument_keys for key, _, _, _ in pending_tool_calls)
+                and set(rejection_call_identities) <= rejection_finished_keys
+                and all(
+                    call_id.strip() and name.strip()
+                    for call_id, name in rejection_call_identities.values()
+                )
+            ):
+                yield rejected_tool_arguments_error(
+                    ToolArgumentRejection(
+                        calls=tuple(
+                            RejectedToolArguments(
+                                tool_call_id=call_id,
+                                tool_name=name,
+                                reason=(
+                                    "invalid_json" if key in invalid_argument_keys
+                                    else "batch_not_executed"
+                                ),
+                            )
+                            for key, (call_id, name) in rejection_call_identities.items()
+                        ),
+                        terminal_reason="completed",
+                    ),
+                    usage=(
+                        DoneEvent(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                            cached_tokens=cached_tokens,
+                            model=actual_model,
+                            provider=self.provider_id,
+                        ) if usage_known else None
+                    ),
+                )
+            else:
+                yield ErrorEvent(
+                    message="ChatGPT Codex response ended with an incomplete tool call",
+                    code="incomplete_tool_call",
+                )
             return
 
         # ``output_item.done`` confirms an item but does not commit the

@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +46,7 @@ class LlmRuntimeConfig:
     api_key_from_env: bool = False
     api_key_env_name: str = ""
     base_url_from_env: bool = False
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,14 @@ def resolve_llm_credential(
     llm = getattr(config, "llm", None)
     if llm is None:
         return ResolvedLlmCredential()
+
+    from opensquilla.desktop_account import account_credential
+    managed = account_credential(str(getattr(llm, "provider", "")))
+    if managed is not None:
+        return ResolvedLlmCredential(api_key=managed.secret, source="account")
+
+    if getattr(llm, "credential_source", "manual") == "account":
+        return ResolvedLlmCredential(source="account_unavailable")
 
     runtime_secret_paths: set[str] = getattr(config, "_runtime_secret_paths", set())
     stored_api_key = str(getattr(llm, "api_key", "") or "")
@@ -194,6 +204,27 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
 
     llm = config.llm
     provider = str(llm.provider or "").strip().lower()
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+    if not provider and not any(str(getattr(llm, key, "") or "").strip()
+                                for key in ("model", "api_key", "api_key_env", "base_url")):
+        selected = account_credential("tokenrhythm")
+        if selected is not None:
+            # The desktop's explicit account selection completes a fresh empty
+            # primary. Only non-sensitive references enter the config model.
+            from opensquilla.onboarding.provider_specs import get_provider_setup_spec
+            spec_defaults = get_provider_setup_spec("tokenrhythm")
+            llm.provider = provider = "tokenrhythm"
+            llm.model = spec_defaults.default_direct_model
+            llm.base_url = OFFICIAL_BASE
+            llm.credential_source = "account"
+    managed = account_credential(provider)
+    if managed is not None:
+        # No mutation: the persisted/manual deployment remains available when
+        # the operator explicitly switches back to their own API key.
+        return LlmRuntimeConfig(
+            provider=provider, model=llm.model, api_key=managed.secret,
+            base_url=OFFICIAL_BASE, proxy="", provider_routing={},
+        )
     try:
         spec = get_provider_spec(provider)
     except UnknownProviderError as exc:
@@ -340,6 +371,11 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
             provider,
             getattr(llm, "provider_routing", {}),
         ),
+        extra_body=(
+            deepcopy(dict(getattr(llm, "extra_body", {}) or {}))
+            if provider == "custom"
+            else {}
+        ),
         api_key_from_env=credential.source == "env",
         api_key_env_name=credential.env_name,
         base_url_from_env=base_url_from_env,
@@ -362,6 +398,7 @@ _REPORTABLE_FAILURE_KINDS = frozenset(
     {
         ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.INSUFFICIENT_CREDITS,
+        ProviderFailureKind.USAGE_LIMIT,
         ProviderFailureKind.AUTH_INVALID,
     }
 )
@@ -583,7 +620,7 @@ class ProfileCredentialPools:
         pins = self._pins.get(provider_id, {})
         if kind is ProviderFailureKind.AUTH_INVALID:
             cooldown = float("inf")
-        elif kind is ProviderFailureKind.INSUFFICIENT_CREDITS:
+        elif kind in {ProviderFailureKind.INSUFFICIENT_CREDITS, ProviderFailureKind.USAGE_LIMIT}:
             cooldown = INSUFFICIENT_CREDITS_COOLDOWN_SECONDS
         else:
             cooldown = (

@@ -11,9 +11,8 @@ synchronous where possible — it either:
 
 The three policies:
 
-* ``auto_summarize`` — run a best-effort pre-compaction flush when
-  configured, compact once, then proceed only if post-compaction token
-  evidence proves the next call fits.
+* ``auto_summarize`` — checkpoint the transcript, compact once, then proceed
+  only if post-compaction token evidence proves the next call fits.
 * ``hard_truncate`` — drop oldest transcript entries from the in-memory
   history list until the estimated token count is under budget. The
   caller uses the shortened list.
@@ -26,16 +25,17 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import structlog
 
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
+from opensquilla.paths import media_root_from_config
+from opensquilla.provider.model_catalog import resolve_effective_context_window, shared_catalog
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
-    derive_provider_request_correlation,
 )
 from opensquilla.session.compaction import (
     CompactionConfig,
@@ -53,18 +53,11 @@ from opensquilla.session.compaction_lifecycle import (
     CompactionLifecycleResult,
     compaction_effect_payload,
     compaction_lifecycle_payload,
-    compaction_memory_status,
     compaction_result_payload,
     durable_receipt_allows_destructive_compaction,
-    flush_receipt_is_successful_flush,
-    flush_receipt_status_for_compaction,
-    mark_compaction_flush_status_with_retry,
     new_compaction_id,
-    pre_compaction_flush_enabled,
-    pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.context_view import build_compaction_context_records
-from opensquilla.session.keys import parse_agent_id
 from opensquilla.session.tokenizer import estimate_tokens
 
 log = structlog.get_logger(__name__)
@@ -78,8 +71,7 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     if name in signature.parameters:
         return True
     return any(
-        param.kind is inspect.Parameter.VAR_KEYWORD
-        for param in signature.parameters.values()
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
     )
 
 
@@ -107,14 +99,15 @@ class OverflowOutcome:
     kept_count: int = 0
     summary_len: int = 0
     summary_source: str = "unknown"
-    flush_receipt: Any = None
     lifecycle: CompactionLifecycleResult | None = None
     compacted_this_turn: bool = False
     # Possibly mutated history. HARD_TRUNCATE shortens this list in place.
     trimmed_history: list[Any] = field(default_factory=list)
 
 
-def _estimate_payload_tokens(message: str, transcript: list[Any]) -> int:
+def _estimate_payload_tokens(
+    message: str, transcript: list[Any], *, media_root: Path | None = None,
+) -> int:
     """Estimate the token cost of (history + new message).
 
     Uses the shared :func:`opensquilla.session.tokenizer.estimate_tokens` so
@@ -123,7 +116,9 @@ def _estimate_payload_tokens(message: str, transcript: list[Any]) -> int:
 
     total = estimate_tokens(message or "")
     for entry in transcript or []:
-        total += estimate_entry_model_replay_tokens(entry)
+        # The model-replay estimator applies the canonical provider-visible
+        # history projection, including attachment markers/media reserves.
+        total += estimate_entry_model_replay_tokens(entry, media_root=media_root)
     return total
 
 
@@ -157,235 +152,6 @@ def _build_refusal_envelope(
     }
 
 
-def _memory_timeout_seconds(config: GatewayConfig, name: str, default: float) -> float:
-    memory_cfg = getattr(config, "memory", None)
-    raw_timeout = getattr(memory_cfg, name, default)
-    try:
-        timeout = float(raw_timeout)
-    except (TypeError, ValueError):
-        return default
-    return max(timeout, 0.0)
-
-
-def _log_auto_summarize_flush_receipt(
-    *,
-    session_key: str,
-    receipt: Any,
-    background: bool,
-) -> None:
-    log_payload = {
-        "session_key": session_key,
-        "background": background,
-        "mode": getattr(receipt, "mode", "unknown"),
-        "result_status": getattr(receipt, "result_status", None),
-        "integrity_status": getattr(receipt, "integrity_status", None),
-        "indexed_chunk_count": getattr(receipt, "indexed_chunk_count", None),
-        "output_coverage_status": getattr(receipt, "output_coverage_status", None),
-        "invalid_candidate_count": getattr(receipt, "invalid_candidate_count", None),
-        "candidate_missing_ids": getattr(receipt, "candidate_missing_ids", None),
-        "obligation_status": getattr(receipt, "obligation_status", None),
-        "obligation_missing_ids": getattr(receipt, "obligation_missing_ids", None),
-    }
-    if flush_receipt_is_successful_flush(receipt):
-        log.info("context_overflow.auto_summarize_flush_done", **log_payload)
-        return
-    log.warning(
-        "context_overflow.auto_summarize_flush_degraded",
-        error=getattr(receipt, "error", None) or "degraded_flush_receipt",
-        **log_payload,
-    )
-
-
-def _schedule_auto_summarize_flush_status_update(
-    *,
-    session_manager: Any | None,
-    session_key: str,
-    compaction_id: str | None,
-    status: str,
-) -> None:
-    if session_manager is None or not compaction_id:
-        return
-    mark_status = getattr(session_manager, "mark_compaction_flush_receipt_status", None)
-    if not callable(mark_status):
-        return
-    asyncio.create_task(
-        mark_compaction_flush_status_with_retry(
-            mark_status,
-            session_key=session_key,
-            compaction_id=compaction_id,
-            status=status,
-            log=log,
-            failed_event="context_overflow.auto_summarize_flush_status_update_failed",
-            updated_event="context_overflow.auto_summarize_flush_status_updated",
-            skipped_event="context_overflow.auto_summarize_flush_status_update_skipped",
-        )
-    )
-
-
-def _consume_auto_summarize_flush_task(
-    session_key: str,
-    task: asyncio.Task,
-    *,
-    config: GatewayConfig | None = None,
-    session_manager: Any | None = None,
-    compaction_id: str | None = None,
-) -> None:
-    try:
-        receipt = task.result()
-    except asyncio.CancelledError:
-        log.debug(
-            "context_overflow.auto_summarize_flush_cancelled",
-            session_key=session_key,
-            background=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "context_overflow.auto_summarize_flush_failed",
-            session_key=session_key,
-            background=True,
-            error=str(exc),
-        )
-        _schedule_auto_summarize_flush_status_update(
-            session_manager=session_manager,
-            session_key=session_key,
-            compaction_id=compaction_id,
-            status="failed_retryable",
-        )
-    else:
-        _log_auto_summarize_flush_receipt(
-            session_key=session_key,
-            receipt=receipt,
-            background=True,
-        )
-        if config is not None:
-            _schedule_auto_summarize_flush_status_update(
-                session_manager=session_manager,
-                session_key=session_key,
-                compaction_id=compaction_id,
-                status=flush_receipt_status_for_compaction(receipt, config),
-            )
-
-
-async def _await_auto_summarize_flush_grace(
-    *,
-    config: GatewayConfig,
-    transcript: list[Any],
-    session_key: str,
-    flush_service: Any | None,
-    session_manager: Any | None = None,
-    wait_for_receipt: bool = False,
-    turn_id: str | None = None,
-    checkpoint_exists: bool | None = None,
-    provider_request_correlation: ProviderRequestCorrelation | None = None,
-) -> Any | None:
-    if not pre_compaction_flush_enabled(config) or not transcript:
-        return None
-
-    if flush_service is None:
-        log.warning(
-            "context_overflow.auto_summarize_flush_unavailable",
-            session_key=session_key,
-            error="flush_service_unavailable",
-        )
-        return None
-
-    background_timeout = _memory_timeout_seconds(
-        config,
-        "flush_background_timeout_seconds",
-        120.0,
-    )
-    flush_kwargs: dict[str, Any] = {
-        "agent_id": parse_agent_id(session_key),
-        "timeout": background_timeout,
-        "message_window": 0,
-        "segment_mode": "auto",
-        "raw_capture_policy": "required",
-        "turn_id": turn_id,
-        "checkpoint_exists": checkpoint_exists,
-    }
-    if (
-        provider_request_correlation is not None
-        and _accepts_keyword_arg(
-            flush_service.execute,
-            "provider_request_correlation",
-        )
-    ):
-        flush_kwargs["provider_request_correlation"] = (
-            provider_request_correlation
-        )
-    task = asyncio.create_task(
-        flush_service.execute(
-            transcript,
-            session_key,
-            **flush_kwargs,
-        )
-    )
-
-    if not wait_for_receipt:
-        task.add_done_callback(
-            lambda completed: _consume_auto_summarize_flush_task(
-                session_key,
-                completed,
-                config=config,
-                session_manager=session_manager,
-                compaction_id=turn_id,
-            )
-        )
-        log.info(
-            "context_overflow.auto_summarize_flush_background_started",
-            session_key=session_key,
-            background_timeout_seconds=background_timeout,
-        )
-        return None
-
-    grace_timeout = _memory_timeout_seconds(config, "flush_timeout_seconds", 15.0)
-    try:
-        receipt = await asyncio.wait_for(asyncio.shield(task), timeout=grace_timeout)
-    except TimeoutError:
-        task.add_done_callback(
-            lambda completed: _consume_auto_summarize_flush_task(
-                session_key,
-                completed,
-                config=config,
-                session_manager=session_manager,
-                compaction_id=turn_id,
-            )
-        )
-        log.warning(
-            "context_overflow.auto_summarize_flush_timed_out",
-            session_key=session_key,
-            timeout_seconds=grace_timeout,
-            background_timeout_seconds=background_timeout,
-        )
-        return None
-    except asyncio.CancelledError:
-        task.add_done_callback(
-            lambda completed: _consume_auto_summarize_flush_task(
-                session_key,
-                completed,
-                config=config,
-                session_manager=session_manager,
-                compaction_id=turn_id,
-            )
-        )
-        raise
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "context_overflow.auto_summarize_flush_failed",
-            session_key=session_key,
-            background=False,
-            error=str(exc),
-        )
-        return None
-
-    _log_auto_summarize_flush_receipt(
-        session_key=session_key,
-        receipt=receipt,
-        background=False,
-    )
-    return receipt
-
-
 async def _estimate_session_payload_tokens(
     message: str,
     transcript: list[Any],
@@ -393,8 +159,9 @@ async def _estimate_session_payload_tokens(
     session_manager: Any | None = None,
     session_key: str = "",
     fallback_summary: str = "",
+    media_root: Path | None = None,
 ) -> int:
-    total = _estimate_payload_tokens(message, transcript)
+    total = _estimate_payload_tokens(message, transcript, media_root=media_root)
     summaries: list[Any] = []
     get_summaries = getattr(session_manager, "get_summaries", None)
     if callable(get_summaries):
@@ -467,7 +234,9 @@ async def _record_checkpoint_before_compaction(
     ):
         kwargs["compaction_config"] = compaction_config
     receipt = await checkpoint_method(session_key, list(transcript), **kwargs)
-    return durable_receipt_allows_destructive_compaction(receipt)
+    if not durable_receipt_allows_destructive_compaction(receipt):
+        raise RuntimeError("Memory checkpoint did not confirm a durable transcript backup")
+    return True
 
 
 # Envelope shape note:
@@ -483,21 +252,20 @@ async def apply_context_overflow_policy(
     session_key: str,
     session_manager: Any | None = None,
     compaction_config: Any | None = None,
-    flush_service: Any | None = None,
     compaction_marker: Any | None = None,
     policy_override: ContextOverflowPolicy | None = None,
     budget_override: int | None = None,
     provider_request_correlation: ProviderRequestCorrelation | None = None,
     root_operation_id: str | None = None,
-    restricted_turn: bool = False,
 ) -> OverflowOutcome:
     """Apply the gateway's overflow policy to the upcoming turn.
 
     Parameters
     ----------
     config:
-        The gateway config. ``config.context_overflow_policy`` and
-        ``config.context_budget_tokens`` provide defaults.
+        The gateway config. Policy comes from ``context_overflow_policy``;
+        absent an explicit budget override, provider/model metadata and
+        ``llm.context_window_tokens`` supply the effective context window.
     message:
         The new user message.
     transcript:
@@ -527,8 +295,17 @@ async def apply_context_overflow_policy(
     """
 
     policy = policy_override or config.context_overflow_policy
-    budget = budget_override if budget_override is not None else config.context_budget_tokens
-    estimated = _estimate_payload_tokens(message, transcript)
+    if budget_override is not None:
+        budget = budget_override
+    else:
+        budget, _ = resolve_effective_context_window(
+            shared_catalog(),
+            config.llm.model,
+            provider=config.llm.provider,
+            global_override=config.llm.context_window_tokens,
+        )
+    media_root = media_root_from_config(config)
+    estimated = _estimate_payload_tokens(message, transcript, media_root=media_root)
 
     outcome = OverflowOutcome(
         policy=policy,
@@ -549,18 +326,6 @@ async def apply_context_overflow_policy(
         budget_tokens=budget,
     )
 
-    if restricted_turn:
-        # Restricted Artifact turns cannot send the canonical transcript to a
-        # gateway compactor or flush model. Fail closed before checkpoint,
-        # flush, or SessionManager.compact_with_result can run.
-        outcome.reason = "restricted_turn_compaction_disabled"
-        outcome.refusal = _build_refusal_envelope(
-            estimated,
-            budget,
-            outcome.reason,
-        )
-        return outcome
-
     if policy == ContextOverflowPolicy.REFUSE:
         outcome.reason = "context_overflow"
         outcome.refusal = _build_refusal_envelope(estimated, budget, outcome.reason)
@@ -569,7 +334,9 @@ async def apply_context_overflow_policy(
     if policy == ContextOverflowPolicy.HARD_TRUNCATE:
         # Drop oldest transcript entries until estimated tokens fit.
         trimmed = list(transcript or [])
-        while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
+        while trimmed and _estimate_payload_tokens(
+            message, trimmed, media_root=media_root,
+        ) > budget:
             trimmed.pop(0)
             outcome.truncated_entries += 1
         outcome.trimmed_history = trimmed
@@ -583,9 +350,7 @@ async def apply_context_overflow_policy(
 
     # ContextOverflowPolicy.AUTO_SUMMARIZE
     if session_manager is not None:
-        flush_status = "not_required"
         checkpoint_failed = False
-        checkpoint_saved = False
         compaction_id = root_operation_id or new_compaction_id()
         durable_commit_won = False
         committed_result = None
@@ -598,6 +363,7 @@ async def apply_context_overflow_policy(
                     compacted_transcript,
                     session_manager=session_manager,
                     session_key=session_key,
+                    media_root=media_root,
                 )
                 outcome.tokens_after = post_estimate
                 outcome.remaining_budget_tokens = max(budget - post_estimate, 0)
@@ -610,6 +376,7 @@ async def apply_context_overflow_policy(
                 return outcome
 
             effective_compaction_config = compaction_config or CompactionConfig()
+            effective_compaction_config.attachment_media_root = media_root
             arm_compaction_deadline(
                 effective_compaction_config,
                 operation_id=compaction_id,
@@ -621,9 +388,7 @@ async def apply_context_overflow_policy(
                 status="started",
                 tokens_before=estimated,
                 context_window_tokens=budget,
-                heartbeat_interval_seconds=(
-                    effective_compaction_config.heartbeat_interval_seconds
-                ),
+                heartbeat_interval_seconds=(effective_compaction_config.heartbeat_interval_seconds),
                 **compaction_effect_payload(status="started"),
                 **compaction_lifecycle_payload(
                     compaction_id,
@@ -631,7 +396,7 @@ async def apply_context_overflow_policy(
                 ),
             )
             try:
-                checkpoint_saved = await _record_checkpoint_before_compaction(
+                await _record_checkpoint_before_compaction(
                     session_manager,
                     session_key,
                     list(transcript or []),
@@ -642,88 +407,6 @@ async def apply_context_overflow_policy(
             except Exception:
                 checkpoint_failed = True
                 raise
-            requires_safe_receipt = pre_compaction_flush_requires_safe_receipt(config)
-            outcome.flush_receipt = await await_compaction_phase(
-                _await_auto_summarize_flush_grace(
-                    config=config,
-                    transcript=transcript,
-                    session_key=session_key,
-                    flush_service=flush_service,
-                    session_manager=session_manager,
-                    wait_for_receipt=requires_safe_receipt,
-                    turn_id=compaction_id,
-                    checkpoint_exists=checkpoint_saved,
-                    provider_request_correlation=derive_provider_request_correlation(
-                        provider_request_correlation,
-                        execution_id=uuid4().hex,
-                        call_kind="auxiliary.session_flush",
-                    ),
-                ),
-                effective_compaction_config,
-                phase="flushing",
-            )
-            if pre_compaction_flush_enabled(config):
-                flush_status = flush_receipt_status_for_compaction(
-                    outcome.flush_receipt,
-                    config,
-                )
-            memory_status = compaction_memory_status(
-                outcome.flush_receipt,
-                deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
-                required=pre_compaction_flush_enabled(config),
-            )
-            if (
-                pre_compaction_flush_enabled(config)
-                and requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
-                outcome.reason = "compaction_flush_failed"
-                outcome.tokens_after = estimated
-                outcome.remaining_budget_tokens = max(budget - estimated, 0)
-                outcome.refusal = _build_refusal_envelope(
-                    estimated,
-                    budget,
-                    outcome.reason,
-                    error_details={
-                        "memory_safety_status": memory_status.safety_status,
-                        "semantic_memory_status": memory_status.semantic_status,
-                    },
-                )
-                outcome.lifecycle = CompactionLifecycleResult(
-                    compacted=False,
-                    refused=True,
-                    reason=outcome.reason,
-                    tokens_before=estimated,
-                    tokens_after=estimated,
-                    remaining_budget_tokens=outcome.remaining_budget_tokens,
-                    flush_receipt=outcome.flush_receipt,
-                )
-                log.warning(
-                    "context_overflow.auto_summarize_refused",
-                    session_key=session_key,
-                    reason=outcome.reason,
-                )
-                notify_compaction(
-                    session_key,
-                    source="automatic",
-                    phase="gateway_auto_summarize",
-                    status="failed",
-                    reason=outcome.reason,
-                    tokens_before=estimated,
-                    tokens_after=estimated,
-                    remaining_budget_tokens=outcome.remaining_budget_tokens,
-                    context_window_tokens=budget,
-                    flush_receipt_status=flush_status,
-                    memory_safety_status=memory_status.safety_status,
-                    semantic_memory_status=memory_status.semantic_status,
-                    **compaction_effect_payload(status="failed", reason=outcome.reason),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-                return outcome
-
             compaction_result = None
             compact_with_result = getattr(session_manager, "compact_with_result", None)
             if callable(compact_with_result):
@@ -732,18 +415,11 @@ async def apply_context_overflow_policy(
                     compact_kwargs["compaction_id"] = compaction_id
                 if _accepts_keyword_arg(compact_with_result, "trigger_reason"):
                     compact_kwargs["trigger_reason"] = "gateway_auto_summarize"
-                if _accepts_keyword_arg(compact_with_result, "flush_receipt_status"):
-                    compact_kwargs["flush_receipt_status"] = flush_status
-                if (
-                    provider_request_correlation is not None
-                    and _accepts_keyword_arg(
-                        compact_with_result,
-                        "provider_request_correlation",
-                    )
+                if provider_request_correlation is not None and _accepts_keyword_arg(
+                    compact_with_result,
+                    "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
                 compaction_result = await await_compaction_phase(
                     compact_with_result(
                         session_key,
@@ -794,7 +470,6 @@ async def apply_context_overflow_policy(
                         phase="gateway_auto_summarize",
                         status="observed",
                         context_window_tokens=budget,
-                        flush_receipt_status=flush_status,
                         **compaction_effect_payload(status="observed"),
                         **observed_payload,
                     )
@@ -810,6 +485,7 @@ async def apply_context_overflow_policy(
                     session_manager=session_manager,
                     session_key=session_key,
                     fallback_summary=str(summary or ""),
+                    media_root=media_root,
                 ),
                 effective_compaction_config,
                 phase="verifying",
@@ -837,7 +513,6 @@ async def apply_context_overflow_policy(
                     kept_count=outcome.kept_count,
                     summary_len=outcome.summary_len,
                     summary_source=outcome.summary_source,
-                    flush_receipt=outcome.flush_receipt,
                 )
                 log.warning(
                     "context_overflow.auto_summarize_refused",
@@ -871,7 +546,6 @@ async def apply_context_overflow_policy(
                     reason=outcome.reason,
                     request_status="refused",
                     context_window_tokens=budget,
-                    flush_receipt_status=flush_status,
                     **compaction_effect_payload(
                         status="failed",
                         reason=outcome.reason,
@@ -899,7 +573,6 @@ async def apply_context_overflow_policy(
                 kept_count=outcome.kept_count,
                 summary_len=outcome.summary_len,
                 summary_source=outcome.summary_source,
-                flush_receipt=outcome.flush_receipt,
             )
             log.info(
                 "context_overflow.auto_summarize_ok",
@@ -933,7 +606,6 @@ async def apply_context_overflow_policy(
                 phase="gateway_auto_summarize",
                 status="completed",
                 context_window_tokens=budget,
-                flush_receipt_status=flush_status,
                 **compaction_effect_payload(status="completed"),
                 **completed_payload,
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_REPLAYED_EVENT),
@@ -961,7 +633,6 @@ async def apply_context_overflow_policy(
                     status="completed",
                     reason="cancelled_after_commit",
                     context_window_tokens=budget,
-                    flush_receipt_status=flush_status,
                     **compaction_effect_payload(status="completed"),
                     **reconciled_payload,
                     **compaction_lifecycle_payload(
@@ -1004,10 +675,12 @@ async def apply_context_overflow_policy(
                 )
                 raise
             trimmed = list(transcript or [])
-            while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
+            while trimmed and _estimate_payload_tokens(
+                message, trimmed, media_root=media_root,
+            ) > budget:
                 trimmed.pop(0)
                 outcome.truncated_entries += 1
-            post_estimate = _estimate_payload_tokens(message, trimmed)
+            post_estimate = _estimate_payload_tokens(message, trimmed, media_root=media_root)
             outcome.trimmed_history = trimmed
             outcome.tokens_after = post_estimate
             outcome.remaining_budget_tokens = max(budget - post_estimate, 0)
@@ -1022,7 +695,6 @@ async def apply_context_overflow_policy(
                     tokens_before=estimated,
                     tokens_after=post_estimate,
                     remaining_budget_tokens=outcome.remaining_budget_tokens,
-                    flush_receipt=outcome.flush_receipt,
                 )
             else:
                 outcome.reason = "compaction_failed"
@@ -1039,7 +711,6 @@ async def apply_context_overflow_policy(
                     kept_count=outcome.kept_count,
                     summary_len=outcome.summary_len,
                     summary_source=outcome.summary_source,
-                    flush_receipt=outcome.flush_receipt,
                 )
             log.warning(
                 "context_overflow.auto_summarize_failed",
@@ -1047,15 +718,15 @@ async def apply_context_overflow_policy(
                 error=str(exc),
                 emergency_ephemeral=outcome.reason == "emergency_ephemeral",
             )
-            terminal_status = "completed" if durable_commit_won else (
-                "emergency_ephemeral"
-                if outcome.reason == "emergency_ephemeral"
-                else "failed"
+            terminal_status = (
+                "completed"
+                if durable_commit_won
+                else (
+                    "emergency_ephemeral" if outcome.reason == "emergency_ephemeral" else "failed"
+                )
             )
             terminal_reason = (
-                "post_commit_verification_failed"
-                if durable_commit_won
-                else outcome.reason
+                "post_commit_verification_failed" if durable_commit_won else outcome.reason
             )
             notify_compaction(
                 session_key,
@@ -1069,7 +740,6 @@ async def apply_context_overflow_policy(
                 tokens_after=outcome.tokens_after,
                 remaining_budget_tokens=outcome.remaining_budget_tokens,
                 context_window_tokens=budget,
-                flush_receipt_status=flush_status,
                 **compaction_effect_payload(
                     status=terminal_status,
                     reason=terminal_reason,
@@ -1090,7 +760,9 @@ async def apply_context_overflow_policy(
         # the turn still fits. This path is exercised by unit tests; the
         # production gateway always wires a real session manager.
         trimmed = list(transcript or [])
-        while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
+        while trimmed and _estimate_payload_tokens(
+            message, trimmed, media_root=media_root,
+        ) > budget:
             trimmed.pop(0)
             outcome.truncated_entries += 1
         outcome.trimmed_history = trimmed

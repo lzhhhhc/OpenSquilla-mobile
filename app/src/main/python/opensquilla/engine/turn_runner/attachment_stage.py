@@ -1,7 +1,7 @@
 """Pre-router attachment materialization and post-router prompt rebind.
 
 The harness invokes ``AttachmentStage.run`` once after provider/tool setup and
-before prompt routing. Extracted text and typed media are then reused by
+before prompt routing. File descriptors, bounded previews, and typed media are reused by
 compaction and provider delivery. A pure post-router helper replaces only the
 prompt block, without reading or parsing an attachment again.
 The bounded worker may materialize already-ingested uploads into the configured
@@ -11,7 +11,7 @@ Validation failures
 media type, ref-without-media-root, invalid base64, oversize) raise
 ``ValueError`` from the port and propagate as-is to the outer terminal
 handler in ``_run_turn``. Per-attachment soft failures (missing ref
-bytes, PDF parse failure, text-family decode failure) are absorbed
+bytes or unavailable workspace material) are absorbed
 inside the build call into ``[attachment unavailable: …]`` placeholder
 text blocks; the stage records only their count.
 
@@ -30,11 +30,13 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
+from opensquilla.telemetry.file_parse_facts import FileParseReliabilityFacts
 from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 if TYPE_CHECKING:
@@ -85,6 +87,7 @@ class AttachmentMaterializationStats:
     parse_failure_count: int = 0
     provider_visible_text_chars: int = 0
     image_count: int = 0
+    marker_estimated_tokens: int | None = None
 
 
 def _materialization_stats(
@@ -123,6 +126,7 @@ def _materialization_stats(
             block_tokens = estimate_provider_media_tokens(
                 "image",
                 _base64_decoded_size(block.data),
+                encoded_data=block.data,
             )
         estimated_tokens += block_tokens
         block_tokens_by_index.append(block_tokens)
@@ -155,6 +159,15 @@ def _materialization_stats(
             )
         ):
             block_index += 1
+    marker_estimated_tokens = estimated_tokens
+    if image_count:
+        from opensquilla.provider.image_projection import ImageProjectionMode, project_messages
+
+        marker_estimated_tokens = _materialization_stats(
+            project_messages(extra_messages, mode=ImageProjectionMode.MARKER).messages,
+            attachments=attachments,
+            generated_normalization_attachment_count=0,
+        ).estimated_tokens
     return AttachmentMaterializationStats(
         attachment_count=len(attachments),
         estimated_tokens=estimated_tokens,
@@ -164,6 +177,7 @@ def _materialization_stats(
         parse_failure_count=min(parse_failure_count, len(attachments)),
         provider_visible_text_chars=provider_visible_text_chars,
         image_count=image_count,
+        marker_estimated_tokens=marker_estimated_tokens,
     )
 
 
@@ -232,6 +246,10 @@ class AttachmentStageInput:
     session_id: str | None = None
     generated_normalization_attachment_count: int = 0
     timeout_seconds: float | None = None
+    persist_image_material: bool | None = None
+    image_workspace_dir: str | Path | None = None
+    failure_cleanup: Callable[[], None] | None = None
+    working_files: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +268,7 @@ class AttachmentStageOutput:
     extra_messages: list[Any] | None
     turn_input: str
     stats: AttachmentMaterializationStats
+    file_parse_facts: tuple[FileParseReliabilityFacts, ...] = ()
 
 
 class AttachmentStage:
@@ -317,22 +336,49 @@ class AttachmentStage:
             deadline_at_monotonic=deadline_at_monotonic
         )
 
-        def _prepare() -> tuple[list[Any] | None, AttachmentMaterializationStats]:
+        def _prepare() -> tuple[
+            list[Any] | None,
+            AttachmentMaterializationStats,
+            tuple[FileParseReliabilityFacts, ...],
+        ]:
+            file_parse_facts: list[FileParseReliabilityFacts] = []
+            image_kwargs: dict[str, Any] = (
+                {
+                    "persist_image_material": inp.persist_image_material,
+                    "image_workspace_dir": inp.image_workspace_dir,
+                }
+                if inp.persist_image_material is not None else {}
+            )
+            if inp.working_files is not None:
+                image_kwargs["working_files"] = inp.working_files
             build_cancellable = getattr(self._builder, "build_cancellable", None)
             if callable(build_cancellable):
-                extra = build_cancellable(
-                    inp.effective_runtime_message,
-                    attachments,
-                    workspace_dir=inp.workspace_dir,
-                    session_id=inp.session_id,
-                    cancel_check=control.check,
-                )
+                if getattr(self._builder, "supports_file_parse_facts", False) is True:
+                    extra = build_cancellable(
+                        inp.effective_runtime_message,
+                        attachments,
+                        workspace_dir=inp.workspace_dir,
+                        session_id=inp.session_id,
+                        cancel_check=control.check,
+                        **image_kwargs,
+                        file_parse_fact_sink=file_parse_facts.append,
+                    )
+                else:
+                    extra = build_cancellable(
+                        inp.effective_runtime_message,
+                        attachments,
+                        workspace_dir=inp.workspace_dir,
+                        session_id=inp.session_id,
+                        cancel_check=control.check,
+                        **image_kwargs,
+                    )
             else:
                 extra = self._builder.build(
                     inp.effective_runtime_message,
                     attachments,
                     workspace_dir=inp.workspace_dir,
                     session_id=inp.session_id,
+                    **image_kwargs,
                 )
             control.check()
             stats = _materialization_stats(
@@ -342,7 +388,7 @@ class AttachmentStage:
                     0, inp.generated_normalization_attachment_count
                 ),
             )
-            return extra, stats
+            return extra, stats, tuple(file_parse_facts)
 
         try:
             await asyncio.wait_for(
@@ -351,14 +397,22 @@ class AttachmentStage:
             )
         except TimeoutError as exc:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc
+        except BaseException:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+            raise
 
         remaining_seconds = deadline_at_monotonic - time.monotonic()
         if remaining_seconds <= 0:
             self._admission.release()
             control.cancel()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             )
@@ -368,6 +422,8 @@ class AttachmentStage:
             future = loop.run_in_executor(self._executor, _prepare)
         except BaseException:
             self._admission.release()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise
         def _release_admission(done: asyncio.Future[Any]) -> None:
             self._admission.release()
@@ -375,19 +431,31 @@ class AttachmentStage:
                 done.exception()
 
         future.add_done_callback(_release_admission)
+        def _cleanup_failed_worker(_done: asyncio.Future[Any]) -> None:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+
         try:
-            extra_messages, stats = await asyncio.wait_for(
+            extra_messages, stats, file_parse_facts = await asyncio.wait_for(
                 asyncio.shield(future),
                 timeout=remaining_seconds,
             )
         except asyncio.CancelledError:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                future.add_done_callback(_cleanup_failed_worker)
             raise
         except TimeoutError as exc:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                future.add_done_callback(_cleanup_failed_worker)
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc
+        except BaseException:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+            raise
         turn_input = (
             inp.effective_runtime_message if extra_messages is None else ""
         )
@@ -396,5 +464,6 @@ class AttachmentStage:
                 extra_messages=extra_messages,
                 turn_input=turn_input,
                 stats=stats,
+                file_parse_facts=file_parse_facts,
             )
         )

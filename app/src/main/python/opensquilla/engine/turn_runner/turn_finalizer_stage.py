@@ -44,137 +44,13 @@ from opensquilla.contracts.turn_execution import (
     TurnPublicationLedger,
 )
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
-from opensquilla.skills.meta.types import MetaPaused
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.engine.types import DoneEvent, ErrorEvent
-    from opensquilla.skills.meta.types import MetaResult
     from opensquilla.tools.types import ToolContext
 
 log = structlog.get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Paused MetaResult renderer
-# ---------------------------------------------------------------------------
-
-
-def _field_qualifier_text(field: Any) -> str:
-    """Build the inline qualifier ("[1-14]", "[budget|mid|premium]" …)."""
-    type_ = field.type
-    if type_ == "int":
-        lo, hi = field.min, field.max
-        if lo is not None and hi is not None:
-            return f"({lo}-{hi})"
-        if lo is not None:
-            return f"(>={lo})"
-        if hi is not None:
-            return f"(<={hi})"
-    elif type_ == "enum" and field.choices:
-        return "[" + "|".join(str(c) for c in field.choices) + "]"
-    elif type_ == "string" and field.max_chars is not None:
-        return f"(<={field.max_chars} chars)"
-    return ""
-
-
-def _schema_language(schema: Any, intro: str = "") -> str:
-    text = "\n".join(
-        [intro or getattr(schema, "intro", "")]
-        + [getattr(field, "prompt", "") for field in getattr(schema, "fields", ())]
-        + list(getattr(schema, "cancel_keywords", ()) or ())
-    )
-    return "zh" if any("\u4e00" <= ch <= "\u9fff" for ch in text) else "en"
-
-
-def _field_flag_text(field: Any, *, language: str = "zh") -> str:
-    """Render required / default / optional marker per spec §9.3."""
-    if field.required:
-        return "[必填]" if language == "zh" else "[required]"
-    if field.default is not None:
-        return (
-            f"（默认 {field.default}）"
-            if language == "zh"
-            else f"(default {field.default})"
-        )
-    return "[可选]" if language == "zh" else "[optional]"
-
-
-def render_paused_outcome(result: MetaResult) -> str:
-    """Render a paused MetaResult into a plain-text form description.
-
-    Matches the spec §9.3 IM-fallback layout:
-      <intro>
-      请回复以下字段：
-        1) <name> — <prompt> <qualifier?> <flag>
-        ...
-      回复格式示例：
-        <name>: <type-appropriate placeholder>
-      或回复 <cancel-kw> 终止。
-
-    Surface-specific rich rendering (Web card / CLI prompt-toolkit)
-    rides on the synthetic ToolResultEvent's ``clarify_schema`` payload,
-    not on this text. This rendering is what IM bots and any
-    text-only fallback present to the user.
-    """
-    if not result.paused or result.paused_payload is None:
-        return result.final_text or ""
-    payload = result.paused_payload
-    if not isinstance(payload, MetaPaused):
-        return result.final_text or ""
-    schema = payload.schema
-    language = str(getattr(payload, "language", "") or "").lower()
-    if language not in {"en", "zh"}:
-        language = _schema_language(schema, payload.intro)
-    lines: list[str] = []
-    if payload.intro or schema.intro:
-        lines.append(payload.intro or schema.intro)
-        lines.append("")
-    lines.append("请回复以下字段：" if language == "zh" else "Please reply with these fields:")
-    for index, field in enumerate(schema.fields, start=1):
-        flag = _field_flag_text(field, language=language)
-        prompt = field.prompt or field.name
-        qualifier = _field_qualifier_text(field)
-        bits = [field.name, "—", prompt]
-        if qualifier:
-            bits.append(qualifier)
-        bits.append(flag)
-        lines.append(f"  {index}) {' '.join(bits)}")
-
-    sample_fields = [f for f in schema.fields if f.required] or list(schema.fields)
-    if sample_fields:
-        lines.append("")
-        lines.append("回复格式示例：" if language == "zh" else "Reply format example:")
-        for field in sample_fields[:3]:
-            placeholder = _field_sample_value(field)
-            lines.append(f"  {field.name}: {placeholder}")
-
-    if schema.cancel_keywords:
-        kws = " / ".join(schema.cancel_keywords)
-        lines.append("")
-        if language == "zh":
-            lines.append(f"或回复 {kws} 取消。")
-        else:
-            lines.append(f"Or reply {kws} to cancel.")
-    return "\n".join(lines)
-
-
-def _field_sample_value(field: Any) -> str:
-    """Produce a placeholder reply value for the format-example block."""
-    type_ = field.type
-    if type_ == "enum" and field.choices:
-        return str(field.choices[0])
-    if type_ == "int":
-        if field.min is not None:
-            return str(field.min)
-        if field.max is not None:
-            return str(field.max)
-        return "1"
-    if type_ == "bool":
-        return "true"
-    if field.default is not None:
-        return str(field.default)
-    return "<value>"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +83,11 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        assistant_replay: dict[str, Any] | None = None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
@@ -231,6 +111,8 @@ class TurnMemoryCapturePort(Protocol):
         input_provenance: dict[str, Any] | None,
         run_kind: str,
         no_memory_capture: bool,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None: ...
 
 
@@ -239,9 +121,13 @@ def _turn_usage_payload(
     *,
     resolved_model: str | None,
     persisted_text: str | None = None,
+    failed_turn_usage: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if done_event is None:
-        return None
+        # A failed request can have a durable receipt without a successful
+        # terminal answer. Preserve its measured components and explicit
+        # coverage gaps instead of fabricating a DoneEvent or a zero cost.
+        return dict(failed_turn_usage) if failed_turn_usage is not None else None
     model = done_event.model or resolved_model or ""
     payload = {
         "input_tokens": int(done_event.input_tokens or 0),
@@ -271,8 +157,7 @@ def _turn_usage_payload(
         # Additive: quality label of the estimate behind cost_usd
         # ("cache_aware" | "cache_blind" | "free" | None).
         "estimate_basis": getattr(done_event, "estimate_basis", None),
-        # Additive: V017 decision-record id so chat clients can attribute
-        # feedback (router.feedback.submit) to this exact routing decision.
+        # V017 decision-record id for correlating turn and routing diagnostics.
         # None when no decision was staged (router off / bypass / no writer).
         "decision_id": getattr(done_event, "decision_id", None),
         "route_plan": getattr(done_event, "route_plan", None),
@@ -462,6 +347,8 @@ class SessionTotalsPort(Protocol):
         session_key: str,
         done_event: DoneEvent,
         resolved_model: str,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> CostRollupResult | None: ...
 
 @runtime_checkable
@@ -470,8 +357,8 @@ class TurnErrorPersistPort(Protocol):
 
     The helper owns its own log-and-continue try/except; the
     adapter forwards verbatim. The helper guards
-    ``session_manager is None`` AND ``event is None`` internally -- the
-    stage body has no None checks.
+    ``event is None`` internally; transcript writes additionally require a
+    session manager.
     """
 
     async def persist_error(
@@ -480,6 +367,14 @@ class TurnErrorPersistPort(Protocol):
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        turn_id: str | None = None,
+        surface: str = "unknown",
+        provider: str | None = None,
+        model: str | None = None,
+        fallback_hops: int = 0,
+        turn_usage: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -573,6 +468,10 @@ class TurnFinalizerStageInput:
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
 
+    # Immutable session-incarnation owner captured during task admission.
+    # ``None`` preserves direct and legacy TurnRunner callers.
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Additive identity path.  ``None`` preserves direct/legacy stage callers;
     # an identity-aware TurnRunner supplies one id before streaming starts.
     assistant_message_id: str | None = None
@@ -582,6 +481,13 @@ class TurnFinalizerStageInput:
     # assistant snapshot. Keep the structured turn_errors row, but do not add
     # the ordinary second system "Error:" transcript message on reload.
     terminal_generation_reset: bool = False
+    error_provider: str | None = None
+    error_model: str | None = None
+    error_fallback_hops: int = 0
+    # Durable provider-call projection for a terminal failure without Done.
+    # The existing turn_usage metadata carries both known cost components
+    # and usage_unknown/missing_cost_entries for unconfirmed receipts.
+    failed_turn_usage: dict[str, Any] | None = None
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -705,7 +611,6 @@ class TurnFinalizerStage:
         # Late imports keep the module import-cycle-free.
         import json as _json
 
-        from opensquilla.engine.runtime import _is_deepseek_model_id
         from opensquilla.engine.silent_reply import (
             normalize_silent_reply,
             sanitize_silent_reply_segments,
@@ -765,6 +670,11 @@ class TurnFinalizerStage:
         final_text = with_unconfirmed_action_notice(final_text, turn_segments)
 
         done_event = inp.done_event
+        failed_turn_usage = (
+            inp.failed_turn_usage
+            if done_event is None and inp.error_message
+            else None
+        )
         runtime_notice_added = final_text != normalization.text
         if done_event is not None and (normalization.changed or runtime_notice_added):
             # A runtime-authored confirmation guard is visible even when the
@@ -791,7 +701,53 @@ class TurnFinalizerStage:
 
         # 2. Transcript append + 3. memory capture (paired -- memory
         # only fires if transcript persisted).
-        if final_text or turn_segments or inp.turn_artifacts:
+        has_visible_payload = bool(final_text or turn_segments or inp.turn_artifacts)
+        assistant_replay = getattr(done_event, "assistant_replay", None)
+        preserve_replay = assistant_replay is not None
+        if assistant_replay is not None and not has_visible_payload and (
+            normalization.suppressed or getattr(done_event, "delivery", None) == "suppressed"
+        ):
+            from opensquilla.engine.history import decode_assistant_replay
+            from opensquilla.provider.types import (
+                ContentBlockRedactedThinking,
+                ContentBlockText,
+                ContentBlockThinking,
+            )
+
+            # A pure control-token reply historically creates no assistant
+            # row. Native metadata alone does not turn that silent response
+            # into conversation history. Keep all other accepted chains,
+            # including tool outcomes and reasoning-only continuation calls.
+            preserve_replay = False
+            for message in decode_assistant_replay(assistant_replay):
+                replay_content = message.content
+                if message.role != "assistant" or (
+                    isinstance(replay_content, list)
+                    and any(
+                        not isinstance(
+                            block,
+                            ContentBlockText | ContentBlockThinking | ContentBlockRedactedThinking,
+                        )
+                        for block in replay_content
+                    )
+                ):
+                    preserve_replay = True
+                    break
+                replay_text = (
+                    replay_content if isinstance(replay_content, str) else "".join(
+                        block.text for block in replay_content
+                        if isinstance(block, ContentBlockText)
+                    )
+                )
+                if not normalize_silent_reply(
+                    replay_text,
+                    run_kind=inp.run_kind,
+                    input_mode=inp.input_mode,
+                    heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
+                ).suppressed:
+                    preserve_replay = True
+                    break
+        if has_visible_payload or preserve_replay:
             persisted_content = (
                 _json.dumps(
                     {"text": final_text, "artifacts": inp.turn_artifacts},
@@ -801,13 +757,7 @@ class TurnFinalizerStage:
                 else final_text
             )
             reasoning_content: str | None = None
-            if (
-                done_event is not None
-                and done_event.reasoning_content
-                and _is_deepseek_model_id(
-                    done_event.model or inp.resolved_model or ""
-                )
-            ):
+            if done_event is not None and done_event.reasoning_content:
                 reasoning_content = done_event.reasoning_content
             token_count = None
             if done_event is not None:
@@ -830,11 +780,25 @@ class TurnFinalizerStage:
                     done_event,
                     resolved_model=inp.resolved_model,
                     persisted_text=final_text,
+                    failed_turn_usage=failed_turn_usage,
                 ),
                 "token_count": token_count,
             }
+            if assistant_replay is not None:
+                append_kwargs["assistant_replay"] = assistant_replay
+            if inp.run_kind == "cron_turn":
+                provenance = {"kind": "cron", "source_session_key": inp.session_key}
+                if isinstance(inp.input_provenance, dict):
+                    job_id = inp.input_provenance.get("job_id")
+                    if isinstance(job_id, str) and job_id:
+                        provenance["source_tool"] = f"cron:{job_id}"
+                append_kwargs["provenance"] = provenance
             if assistant_message_id is not None:
                 append_kwargs["assistant_message_id"] = assistant_message_id
+            if inp.expected_session_id is not None:
+                append_kwargs["expected_session_id"] = inp.expected_session_id
+            if inp.expected_session_epoch is not None:
+                append_kwargs["expected_session_epoch"] = inp.expected_session_epoch
             append_result = await self._transcript_append.append_message(
                 inp.session_key,
                 **append_kwargs,
@@ -849,20 +813,27 @@ class TurnFinalizerStage:
                 transcript_appended = bool(append_result)
             if transcript_appended:
                 assistant_message_content = persisted_content
-                if inp.execution_context is not None:
+                if inp.execution_context is not None and has_visible_payload:
                     inp.execution_context.publish_visible(
                         text=persisted_content,
                         generation_epoch=inp.execution_context.generation_epoch,
                     )
-                elif inp.publication_ledger is not None:
+                elif inp.publication_ledger is not None and has_visible_payload:
                     next_sequence = inp.publication_ledger.last_sequence + 1
                     inp.publication_ledger.accept(
                         generation_epoch=inp.publication_ledger.generation_epoch,
                         sequence=next_sequence,
                         text=persisted_content,
                     )
-            if transcript_appended and not inp.no_memory_capture:
+            if transcript_appended and has_visible_payload and not inp.no_memory_capture:
                 try:
+                    capture_kwargs: dict[str, Any] = {}
+                    if (
+                        inp.expected_session_id is not None
+                        or inp.expected_session_epoch is not None
+                    ):
+                        capture_kwargs["expected_session_id"] = inp.expected_session_id
+                        capture_kwargs["expected_session_epoch"] = inp.expected_session_epoch
                     await self._turn_memory_capture.capture_turn(
                         agent_id=inp.agent_id,
                         session_key=inp.session_key,
@@ -873,6 +844,7 @@ class TurnFinalizerStage:
                         input_provenance=inp.input_provenance,
                         run_kind=inp.run_kind,
                         no_memory_capture=inp.no_memory_capture,
+                        **capture_kwargs,
                     )
                     memory_captured = True
                 except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
@@ -887,15 +859,32 @@ class TurnFinalizerStage:
             if inp.execution_context is not None:
                 inp.execution_context.release_reserved_unpublished("no_visible_output")
 
-        # 4. Error persist (only when error_message is truthy; the
-        # adapter folds the session-manager-None guard, and the helper
-        # also guards event-is-None internally).
+        # 4. Error diagnostics and, when available, transcript persistence.
         if inp.error_message:
-            await self._turn_error_persist.persist_error(
-                session_key=inp.session_key,
-                event=inp.pending_error_event,
-                append_transcript=not inp.terminal_generation_reset,
-            )
+            error_kwargs: dict[str, Any] = {
+                "session_key": inp.session_key,
+                "event": inp.pending_error_event,
+                "append_transcript": not inp.terminal_generation_reset,
+                "surface": inp.input_mode or "unknown",
+                "fallback_hops": inp.error_fallback_hops,
+            }
+            if failed_turn_usage is not None and not transcript_appended:
+                # Keep one usage owner in history. A visible assistant
+                # partial already owns this metadata; an error-only turn
+                # attaches it to the ordinary error transcript instead.
+                error_kwargs["turn_usage"] = dict(failed_turn_usage)
+                error_kwargs["append_transcript"] = True
+            if inp.execution_context is not None:
+                error_kwargs["turn_id"] = inp.execution_context.identity.turn_id
+            if inp.error_provider is not None:
+                error_kwargs["provider"] = inp.error_provider
+            if inp.error_model is not None:
+                error_kwargs["model"] = inp.error_model
+            if inp.expected_session_id is not None:
+                error_kwargs["expected_session_id"] = inp.expected_session_id
+            if inp.expected_session_epoch is not None:
+                error_kwargs["expected_session_epoch"] = inp.expected_session_epoch
+            await self._turn_error_persist.persist_error(**error_kwargs)
 
         # 5. Session totals rollup (only when DoneEvent present; the
         # adapter folds the session-manager-None and
@@ -903,10 +892,18 @@ class TurnFinalizerStage:
         cost_rollup: CostRollupResult | None = None
         if done_event is not None:
             try:
+                totals_kwargs: dict[str, Any] = {}
+                if (
+                    inp.expected_session_id is not None
+                    or inp.expected_session_epoch is not None
+                ):
+                    totals_kwargs["expected_session_id"] = inp.expected_session_id
+                    totals_kwargs["expected_session_epoch"] = inp.expected_session_epoch
                 cost_rollup = await self._session_totals.rollup(
                     session_key=inp.session_key,
                     done_event=done_event,
                     resolved_model=inp.resolved_model,
+                    **totals_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
                 log.warning(

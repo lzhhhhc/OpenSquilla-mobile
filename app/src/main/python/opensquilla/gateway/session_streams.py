@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
+from opensquilla.gateway.replay_budget import (
+    DEFAULT_REPLAY_CACHE_BYTES,
+    DEFAULT_SESSION_REPLAY_CACHE_BYTES,
+    ReplayCacheBudget,
+    retained_bytes,
+)
 from opensquilla.gateway.terminal_activity import (
     build_terminal_activity_snapshot,
     terminal_activity_snapshot,
@@ -20,7 +26,10 @@ _GENERATION_LOSSY_EVENTS = frozenset(
     {
         "session.event.text_delta",
         "session.event.thinking",
+        "session.event.thinking_start",
+        "session.event.thinking_end",
         "session.event.tool_use_delta",
+        "session.event.tool_input_preview",
         "session.event.tool_use_end",
     }
 )
@@ -73,14 +82,21 @@ class SessionStreamRegistry:
         *,
         max_events_per_session: int = 500,
         stream_generation: str | None = None,
+        replay_cache_bytes: int = DEFAULT_REPLAY_CACHE_BYTES,
+        session_replay_cache_bytes: int = DEFAULT_SESSION_REPLAY_CACHE_BYTES,
     ) -> None:
         self._max_events_per_session = max_events_per_session
         self._stream_generation = stream_generation or uuid.uuid4().hex
         self._seq_by_session: dict[str, int] = {}
         self._events_by_session: dict[str, deque[BufferedSessionEvent]] = {}
         self._live_events_by_session: dict[str, list[BufferedSessionEvent]] = {}
+        self._manual_compactions_by_session: dict[str, dict[str, list[BufferedSessionEvent]]] = {}
+        self._session_epochs: dict[str, int] = {}
         self._live_task_by_session: dict[str, str | None] = {}
         self._live_generation_epoch_by_session: dict[str, int | None] = {}
+        self._live_attempt_prefix_by_session: dict[
+            str, tuple[str, tuple[BufferedSessionEvent, ...]]
+        ] = {}
         # A done/error frame clears the active snapshot before TaskRuntime
         # persists its terminal row. Build the allowlisted v2 immediately and
         # retain only that sanitized, identity-bound value across the handoff.
@@ -90,6 +106,104 @@ class SessionStreamRegistry:
         self._completed_events_by_session: dict[str, deque[BufferedSessionEvent]] = {}
         self._reset_stream_seqs_by_session: dict[str, list[int]] = {}
         self._reset_events_by_session: dict[str, dict[int, BufferedSessionEvent]] = {}
+        self._replay_budget = ReplayCacheBudget(replay_cache_bytes, session_replay_cache_bytes)
+        self._replay_floor_by_session: dict[str, int] = {}
+        self._scoped_replay_floor_by_session: dict[str, int] = {}
+        self._replay_reset_boundary_by_session: dict[str, BufferedSessionEvent] = {}
+        self._unpersisted_tasks: dict[str, set[str]] = {}
+        self._persisted_task_by_session: dict[str, str] = {}
+
+    def mark_terminal_persisted(
+        self,
+        session_key: str,
+        task_id: str,
+        *,
+        reconstructible: bool = False,
+    ) -> None:
+        """Admit idle replay only after complete recovery evidence is committed.
+
+        A terminal task row alone may have a missing or truncated activity
+        snapshot. Its remaining replay is protected until a complete snapshot
+        is durable; a public done/committed event is not that proof.
+        """
+        if not reconstructible:
+            return
+        self._persisted_task_by_session[session_key] = task_id
+        pending = self._unpersisted_tasks.get(session_key)
+        if pending is not None:
+            pending.discard(task_id)
+            if not pending:
+                self._unpersisted_tasks.pop(session_key, None)
+        self._refresh_replay_budget(session_key)
+
+    def _replay_roots(self, session_key: str) -> tuple[object, ...]:
+        return (
+            self._events_by_session.get(session_key),
+            self._completed_events_by_session.get(session_key),
+            self._reset_events_by_session.get(session_key),
+            self._reset_stream_seqs_by_session.get(session_key),
+        )
+
+    def _refresh_replay_budget(self, session_key: str) -> None:
+        if (
+            session_key not in self._persisted_task_by_session
+            or self._unpersisted_tasks.get(session_key)
+            or session_key in self._live_events_by_session
+            or session_key in self._live_task_by_session
+            or self._manual_compactions_by_session.get(session_key)
+        ):
+            self._replay_budget.discard(session_key)
+            return
+        if session_key not in self._events_by_session:
+            return
+        size = retained_bytes(*self._replay_roots(session_key))
+        for key in self._replay_budget.update(session_key, size):
+            self._evict_replay_cache(key)
+
+    def _evict_replay_cache(self, session_key: str) -> None:
+        # evict() also destroys live state and monotonic sequence identities.
+        # Cache eviction must leave those alone and make every older cursor a gap.
+        self._replay_floor_by_session[session_key] = self.current_seq(session_key)
+        resets = self._reset_events_by_session.get(session_key, {})
+        if resets:
+            reset = resets[max(resets)]
+            self._replay_reset_boundary_by_session[session_key] = BufferedSessionEvent(
+                event_name=reset.event_name,
+                payload={
+                    field: value
+                    for field, value in reset.payload.items()
+                    if field in {
+                        "task_id", "taskId", "turn_id", "turnId",
+                        "assistant_message_id", "assistantMessageId", "new_generation_epoch",
+                        "newGenerationEpoch",
+                    }
+                },
+                stream_seq=reset.stream_seq,
+            )
+        self._events_by_session.pop(session_key, None)
+        self._completed_events_by_session.pop(session_key, None)
+        self._reset_events_by_session.pop(session_key, None)
+        self._reset_stream_seqs_by_session.pop(session_key, None)
+
+    def replay_cache_usage(self) -> dict[str, int]:
+        """Return separate cache/protected accounting; never label it process RSS."""
+        cached = set(self._replay_budget.entries)
+        protected_roots: list[object] = [
+            self._live_events_by_session,
+            self._live_attempt_prefix_by_session,
+            self._manual_compactions_by_session,
+            self._terminal_activity_snapshots_by_task,
+        ]
+        for key in self._events_by_session.keys() - cached:
+            protected_roots.extend(self._replay_roots(key))
+        return {
+            "reclaimable_bytes": self._replay_budget.total_bytes,
+            "reclaimable_sessions": len(cached),
+            "protected_bytes": retained_bytes(*protected_roots),
+            "global_limit_bytes": self._replay_budget.total_limit,
+            "session_limit_bytes": self._replay_budget.session_limit,
+            "evictions": self._replay_budget.evictions,
+        }
 
     @property
     def stream_generation(self) -> str:
@@ -106,6 +220,7 @@ class SessionStreamRegistry:
             "session.event.text_delta",
             "session.event.run_heartbeat",
             "session.event.tool_use_delta",
+            "session.event.tool_input_preview",
         }:
             return True
         return bool(
@@ -171,6 +286,40 @@ class SessionStreamRegistry:
         return True
 
     @classmethod
+    def _same_generation_identity(
+        cls,
+        event: BufferedSessionEvent,
+        reset: BufferedSessionEvent,
+    ) -> bool:
+        matched = False
+        identified = False
+        for fields in (
+            ("task_id", "taskId"),
+            ("turn_id", "turnId"),
+            ("assistant_message_id", "assistantMessageId"),
+        ):
+            event_value = cls._identity_value(event.payload, *fields)
+            reset_value = cls._identity_value(reset.payload, *fields)
+            identified = identified or bool(event_value or reset_value)
+            if event_value and reset_value:
+                if event_value != reset_value:
+                    return False
+                matched = True
+        return matched or not identified
+
+    def _replay_generation_epoch(
+        self,
+        event: BufferedSessionEvent,
+        resets: list[BufferedSessionEvent],
+    ) -> int | None:
+        # Epochs restart for each assistant turn. A preceding turn's reset
+        # cannot retire a successor's events, even when call ids are reused.
+        for reset in reversed(resets):
+            if reset.stream_seq < event.stream_seq and self._same_generation_identity(event, reset):
+                return self._reset_new_generation_epoch(reset.payload)
+        return None
+
+    @classmethod
     def _preserve_completed_before_reset(
         cls,
         event: BufferedSessionEvent,
@@ -182,6 +331,7 @@ class SessionStreamRegistry:
         self._live_events_by_session.pop(session_key, None)
         self._live_task_by_session.pop(session_key, None)
         self._live_generation_epoch_by_session.pop(session_key, None)
+        self._live_attempt_prefix_by_session.pop(session_key, None)
 
     def _clear_live_state_for_task(self, session_key: str, task_id: str) -> bool:
         if self._live_task_by_session.get(session_key) != task_id:
@@ -221,9 +371,7 @@ class SessionStreamRegistry:
             task_id=task_id,
             turn_id=turn_id,
             terminal_at=(
-                terminal_event.payload.get("emitted_at")
-                if terminal_event is not None
-                else None
+                terminal_event.payload.get("emitted_at") if terminal_event is not None else None
             ),
         )
         snapshot = terminal_activity_snapshot(
@@ -293,8 +441,16 @@ class SessionStreamRegistry:
         """Discard every process-local stream artifact owned by one session."""
 
         self._seq_by_session.pop(session_key, None)
+        self._replay_budget.discard(session_key)
+        self._replay_floor_by_session.pop(session_key, None)
+        self._scoped_replay_floor_by_session.pop(session_key, None)
+        self._replay_reset_boundary_by_session.pop(session_key, None)
+        self._unpersisted_tasks.pop(session_key, None)
+        self._persisted_task_by_session.pop(session_key, None)
         self._events_by_session.pop(session_key, None)
         self._clear_live_state(session_key)
+        self._manual_compactions_by_session.pop(session_key, None)
+        self._session_epochs.pop(session_key, None)
         self._completed_events_by_session.pop(session_key, None)
         self._reset_stream_seqs_by_session.pop(session_key, None)
         self._reset_events_by_session.pop(session_key, None)
@@ -309,15 +465,18 @@ class SessionStreamRegistry:
                 self._terminal_activity_snapshots_by_task.pop(task_id, None)
                 self._terminal_session_by_task.pop(task_id, None)
             self._terminal_task_order = deque(
-                task_id
-                for task_id in self._terminal_task_order
-                if task_id not in terminal_task_ids
+                task_id for task_id in self._terminal_task_order if task_id not in terminal_task_ids
             )
 
-    def _trim_session_events(self, events: deque[BufferedSessionEvent]) -> None:
+    def _trim_session_events(
+        self,
+        session_key: str,
+        events: deque[BufferedSessionEvent],
+    ) -> None:
         while len(events) > self._max_events_per_session:
             for index, event in enumerate(events):
                 if self._is_replay_lossy(event.event_name, event.payload):
+                    self._record_scoped_replay_eviction(session_key, event)
                     del events[index]
                     break
             else:
@@ -326,13 +485,30 @@ class SessionStreamRegistry:
                         self._is_generation_reset(event.event_name)
                         or self._is_completed_turn_event(event.event_name)
                     ):
+                        self._record_scoped_replay_eviction(session_key, event)
                         del events[index]
                         break
                 else:
-                    events.popleft()
+                    self._record_scoped_replay_eviction(session_key, events.popleft())
+
+    def _record_scoped_replay_eviction(
+        self, session_key: str, event: BufferedSessionEvent,
+    ) -> None:
+        if self._model_call_id(event.payload):
+            self._scoped_replay_floor_by_session[session_key] = max(
+                self._scoped_replay_floor_by_session.get(session_key, 0),
+                event.stream_seq,
+            )
 
     def current_seq(self, session_key: str) -> int:
         return self._seq_by_session.get(session_key, 0)
+
+    def advance_session_epoch(self, session_key: str, epoch: int) -> None:
+        """Retire maintenance snapshots when the durable session is reset."""
+        if epoch <= self._session_epochs.get(session_key, -1):
+            return
+        self._session_epochs[session_key] = epoch
+        self._manual_compactions_by_session.pop(session_key, None)
 
     def promote_legacy_cursor(self, session_key: str, since_stream_seq: int | None) -> bool:
         """Keep pre-generation clients receiving events after a Gateway restart.
@@ -359,7 +535,9 @@ class SessionStreamRegistry:
         session_key: str,
         event_name: str,
         payload: dict[str, Any] | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """Return the publishable payload, or None when a call reset is rejected."""
+
         stream_seq = self.current_seq(session_key) + 1
         self._seq_by_session[session_key] = stream_seq
 
@@ -369,7 +547,34 @@ class SessionStreamRegistry:
         enriched["stream_seq"] = stream_seq
         enriched["emitted_at"] = _epoch_time_ms()
 
-        event = BufferedSessionEvent(event_name=event_name, payload=enriched, stream_seq=stream_seq)
+        epoch = enriched.get("epoch")
+        if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0:
+            self.advance_session_epoch(session_key, epoch)
+        if (
+            event_name == "session.event.compaction"
+            and str(enriched.get("source") or "").lower() == "manual"
+            and session_key in self._session_epochs
+            and (
+                isinstance(epoch, bool)
+                or not isinstance(epoch, int)
+                or epoch < self._session_epochs[session_key]
+            )
+        ):
+            # Do not let a delayed old-epoch progress frame rebuild a retired
+            # maintenance snapshot. Clients also fence broadcast frames by epoch.
+            return enriched
+
+        event = BufferedSessionEvent(
+            event_name=event_name,
+            payload=enriched,
+            stream_seq=stream_seq,
+        )
+        if (
+            self._is_generation_reset(event_name)
+            and enriched.get("reset_scope") == "provider_call"
+            and not self._valid_call_reset(session_key, event)
+        ):
+            return None
         events = self._events_by_session.setdefault(session_key, deque())
         events.append(event)
         if self._is_generation_reset(event_name):
@@ -380,8 +585,13 @@ class SessionStreamRegistry:
             completed.append(event)
             while len(completed) > self._max_events_per_session:
                 completed.popleft()
-        self._trim_session_events(events)
+        self._trim_session_events(session_key, events)
         self._record_live_event(session_key, event)
+        task_id = self._task_id(enriched)
+        manual = event_name == "session.event.compaction" and enriched.get("source") == "manual"
+        if task_id and not manual and self._persisted_task_by_session.get(session_key) != task_id:
+            self._unpersisted_tasks.setdefault(session_key, set()).add(task_id)
+        self._refresh_replay_budget(session_key)
         return enriched
 
     @staticmethod
@@ -408,6 +618,11 @@ class SessionStreamRegistry:
         # legacy block, but the sentinel stays internal to snapshot compaction.
         return "__legacy_reasoning__"
 
+    @staticmethod
+    def _model_call_id(payload: dict[str, Any]) -> str:
+        raw = payload.get("model_call_id", payload.get("modelCallId"))
+        return raw.strip() if isinstance(raw, str) else ""
+
     @classmethod
     def _same_text_model_call(
         cls,
@@ -423,13 +638,15 @@ class SessionStreamRegistry:
         right_iteration = right.get("iteration")
         left_iteration = (
             left_iteration
-            if isinstance(left_iteration, int) and not isinstance(left_iteration, bool)
+            if isinstance(left_iteration, int)
+            and not isinstance(left_iteration, bool)
             and left_iteration > 0
             else None
         )
         right_iteration = (
             right_iteration
-            if isinstance(right_iteration, int) and not isinstance(right_iteration, bool)
+            if isinstance(right_iteration, int)
+            and not isinstance(right_iteration, bool)
             and right_iteration > 0
             else None
         )
@@ -473,12 +690,81 @@ class SessionStreamRegistry:
             stream_seq=existing.stream_seq,
         )
 
+    def _valid_call_reset(self, session_key: str, event: BufferedSessionEvent) -> bool:
+        old_epoch = event.payload.get("old_generation_epoch")
+        new_epoch = self._reset_new_generation_epoch(event.payload)
+        failed_call_id = event.payload.get("rollback_model_call_id")
+        if (
+            not isinstance(old_epoch, int)
+            or isinstance(old_epoch, bool)
+            or old_epoch < 0
+            or new_epoch is None
+            or new_epoch <= old_epoch
+            or not isinstance(failed_call_id, str)
+            or not failed_call_id.strip()
+        ):
+            return False
+        task_id = self._task_id(event.payload)
+        if task_id and task_id != self._live_task_by_session.get(session_key):
+            return True
+        checkpoint = self._live_attempt_prefix_by_session.get(session_key)
+        if checkpoint is not None and checkpoint[0] != failed_call_id.strip():
+            # Only the current provisional call can be rolled back. An earlier
+            # accepted call or an unknown call is never a valid target.
+            return False
+        current_epoch = self._live_generation_epoch_by_session.get(session_key)
+        return current_epoch is None or old_epoch == current_epoch
+
     def _record_generation_reset(
         self,
         session_key: str,
         event: BufferedSessionEvent,
     ) -> None:
         existing_events = self._live_events_by_session.get(session_key, [])
+        if event.payload.get("reset_scope") == "provider_call":
+            current_epoch = self._live_generation_epoch_by_session.get(session_key)
+            new_epoch = self._reset_new_generation_epoch(event.payload)
+            old_epoch = event.payload.get("old_generation_epoch")
+            if new_epoch is None or (
+                current_epoch is not None
+                and (new_epoch <= current_epoch or old_epoch != current_epoch)
+            ):
+                return
+            raw_failed_call_id = event.payload.get("rollback_model_call_id")
+            failed_call_id = (
+                raw_failed_call_id.strip() if isinstance(raw_failed_call_id, str) else ""
+            )
+            if not failed_call_id:
+                return
+            checkpoint = self._live_attempt_prefix_by_session.get(session_key)
+            if checkpoint is not None and checkpoint[0] == failed_call_id:
+                prefix = list(checkpoint[1])
+                prefix_seqs = {item.stream_seq for item in prefix}
+                # Completed effects may settle independently of the model stream.
+                # Their delivery evidence belongs to the turn, not the failed call.
+                prefix.extend(
+                    item
+                    for item in existing_events
+                    if item.stream_seq not in prefix_seqs
+                    and self._is_completed_turn_event(item.event_name)
+                )
+            else:
+                # A materialized baseline can already have retired this attempt.
+                # Never synthesize ordered text from the scalar reset snapshots.
+                prefix = [
+                    item
+                    for item in existing_events
+                    if self._model_call_id(item.payload) != failed_call_id
+                ]
+            prefix = [
+                item for item in prefix if item.event_name != "session.event.tool_input_preview"
+            ]
+            prefix.sort(key=lambda item: item.stream_seq)
+            self._live_events_by_session[session_key] = [*prefix, event]
+            self._live_generation_epoch_by_session[session_key] = new_epoch
+            self._live_attempt_prefix_by_session.pop(session_key, None)
+            return
+        self._live_attempt_prefix_by_session.pop(session_key, None)
         started_tool_ids = {
             self._tool_id(existing.payload)
             for existing in existing_events
@@ -535,8 +821,8 @@ class SessionStreamRegistry:
         ]
         preserved.sort(key=lambda item: item.stream_seq)
         self._live_events_by_session[session_key] = [*preserved, event]
-        self._live_generation_epoch_by_session[session_key] = (
-            self._reset_new_generation_epoch(event.payload)
+        self._live_generation_epoch_by_session[session_key] = self._reset_new_generation_epoch(
+            event.payload
         )
 
     def _event_is_stale_generation(
@@ -558,6 +844,30 @@ class SessionStreamRegistry:
         session_key: str,
         event: BufferedSessionEvent,
     ) -> None:
+        if (
+            event.event_name == "session.event.compaction"
+            and str(event.payload.get("source") or "").lower() == "manual"
+        ):
+            operation_id = self._identity_value(event.payload, "compaction_id", "compactionId")
+            if operation_id is None:
+                return
+            status = str(event.payload.get("status") or "").lower()
+            operations = self._manual_compactions_by_session.setdefault(session_key, {})
+            if status in {"started", "observed", "running"}:
+                progress = operations.setdefault(operation_id, [])
+                # Preserve admission's started event and only the latest pulse.
+                # Turn completion must not erase maintenance waiting on its lock.
+                if progress and progress[0].payload.get("status") == "started":
+                    progress[1:] = [event]
+                else:
+                    progress[:] = [event]
+                while len(operations) > max(1, self._max_events_per_session):
+                    operations.pop(next(iter(operations)))
+            else:
+                operations.pop(operation_id, None)
+                if not operations:
+                    self._manual_compactions_by_session.pop(session_key, None)
+            return
         task_id = self._task_id(event.payload)
         current_task_id = self._live_task_by_session.get(session_key)
 
@@ -566,7 +876,8 @@ class SessionStreamRegistry:
                 self._clear_live_state(session_key)
             return
 
-        if task_id and current_task_id and task_id != current_task_id:
+        # A new task also replaces taskless standalone maintenance in the live view.
+        if task_id and task_id != current_task_id:
             self._clear_live_state(session_key)
         if task_id:
             self._live_task_by_session[session_key] = task_id
@@ -598,6 +909,19 @@ class SessionStreamRegistry:
             return
 
         events = self._live_events_by_session.setdefault(session_key, [])
+        model_call_id = self._model_call_id(event.payload)
+        if model_call_id and event.event_name in {
+            "session.event.text_delta",
+            "session.event.thinking",
+            "session.event.thinking_start",
+            "session.event.thinking_end",
+        }:
+            checkpoint = self._live_attempt_prefix_by_session.get(session_key)
+            if checkpoint is None or checkpoint[0] != model_call_id:
+                self._live_attempt_prefix_by_session[session_key] = (
+                    model_call_id,
+                    tuple(events),
+                )
         reset_index = next(
             (
                 index
@@ -614,8 +938,8 @@ class SessionStreamRegistry:
                 if (
                     existing.event_name == event.event_name
                     and self._thinking_block_id(existing.payload) == block_id
-                    and self._generation_epoch(existing.payload)
-                    in {None, event_epoch}
+                    and self._same_text_model_call(existing.payload, event.payload)
+                    and self._generation_epoch(existing.payload) in {None, event_epoch}
                 ):
                     self._replace_compacted_event(events, index, event, field="text")
                     return
@@ -652,10 +976,7 @@ class SessionStreamRegistry:
                 if not self._same_text_model_call(events[-1].payload, event.payload):
                     events.append(event)
                     return
-                if (
-                    events[-1].payload.get("presentation")
-                    != event.payload.get("presentation")
-                ):
+                if events[-1].payload.get("presentation") != event.payload.get("presentation"):
                     events.append(event)
                     return
                 if (
@@ -673,6 +994,16 @@ class SessionStreamRegistry:
                     field="text",
                 )
                 return
+        elif event.event_name == "session.event.tool_input_preview":
+            preview_id = event.payload.get("preview_id")
+            for index in range(len(events) - 1, reset_index, -1):
+                existing = events[index]
+                if (
+                    existing.event_name == event.event_name
+                    and existing.payload.get("preview_id") == preview_id
+                ):
+                    events[index] = event
+                    return
         elif event.event_name == "session.event.run_heartbeat":
             for index in range(len(events) - 1, -1, -1):
                 if events[index].event_name == event.event_name:
@@ -714,7 +1045,17 @@ class SessionStreamRegistry:
                     payload=dict(event.payload),
                     stream_seq=event.stream_seq,
                 )
-                for event in self._live_events_by_session.get(session_key, ())
+                for event in [
+                    *self._live_events_by_session.get(session_key, ()),
+                    *(
+                        event
+                        for progress in self._manual_compactions_by_session.get(
+                            session_key,
+                            {},
+                        ).values()
+                        for event in progress
+                    ),
+                ]
             ],
             key=lambda item: item.stream_seq,
         )
@@ -732,6 +1073,7 @@ class SessionStreamRegistry:
         since_stream_generation: str | None = None,
     ) -> ReplayResult:
         current = self.current_seq(session_key)
+        self._replay_budget.touch(session_key)
         if (
             since_stream_generation is not None
             and since_stream_generation != self.stream_generation
@@ -778,6 +1120,15 @@ class SessionStreamRegistry:
                 events=[],
             )
 
+        if since_stream_seq < self._replay_floor_by_session.get(session_key, 0):
+            return ReplayResult(
+                stream_generation=self.stream_generation,
+                current_stream_seq=current,
+                replay_complete=False,
+                events=[],
+                gap_reason="buffer_window_missed",
+            )
+
         reset_seqs = [
             stream_seq
             for stream_seq in self._reset_stream_seqs_by_session.get(session_key, ())
@@ -801,12 +1152,51 @@ class SessionStreamRegistry:
             )
 
         first_seq = events[0].stream_seq
-        replay_complete = since_stream_seq >= first_seq - 1
+        replay_complete = (
+            since_stream_seq >= first_seq - 1
+            and since_stream_seq >= self._scoped_replay_floor_by_session.get(session_key, 0)
+        )
+        generation_resets = sorted(
+            [
+                *self._reset_events_by_session.get(session_key, {}).values(),
+                *(
+                    [self._replay_reset_boundary_by_session[session_key]]
+                    if session_key in self._replay_reset_boundary_by_session else []
+                ),
+            ],
+            key=lambda item: item.stream_seq,
+        )
+
+        call_resets = [
+            reset
+            for reset in self._reset_events_by_session.get(session_key, {}).values()
+            if reset.payload.get("reset_scope") == "provider_call"
+        ]
+        if call_resets:
+            events = [
+                event
+                for event in events
+                if not (
+                    self._is_generation_lossy(event.event_name)
+                    and any(
+                        self._same_generation_identity(event, reset)
+                        and self._model_call_id(event.payload)
+                        == reset.payload.get("rollback_model_call_id")
+                        for reset in call_resets
+                    )
+                )
+            ]
 
         if reset_seqs:
             event_by_seq = {event.stream_seq: event for event in events}
             missing_reset = any(stream_seq not in event_by_seq for stream_seq in reset_seqs)
-            first_reset_seq = reset_seqs[0]
+            answer_reset_seqs = [
+                seq
+                for seq in reset_seqs
+                if event_by_seq.get(seq) is not None
+                and event_by_seq[seq].payload.get("reset_scope") != "provider_call"
+            ]
+            first_reset_seq = answer_reset_seqs[0] if answer_reset_seqs else reset_seqs[0]
             first_reset = event_by_seq.get(first_reset_seq)
             if missing_reset or first_reset is None:
                 return ReplayResult(
@@ -815,6 +1205,30 @@ class SessionStreamRegistry:
                     replay_complete=False,
                     events=[event for event in events if event.stream_seq > since_stream_seq],
                     gap_reason="generation_reset_boundary_missed",
+                )
+
+            if not answer_reset_seqs:
+                # A call reset preserves the committed prefix, so it cannot
+                # turn a missed replay window into an authoritative baseline.
+                # The live snapshot retains that ordered prefix for gap repair.
+                replay_events = []
+                for event in events:
+                    if event.stream_seq <= since_stream_seq:
+                        continue
+                    epoch = self._replay_generation_epoch(event, generation_resets)
+                    if self._is_generation_reset(event.event_name):
+                        new_epoch = self._reset_new_generation_epoch(event.payload)
+                        if epoch is not None and (new_epoch is None or new_epoch <= epoch):
+                            continue
+                    elif self._event_is_stale_generation(event, epoch):
+                        continue
+                    replay_events.append(event)
+                return ReplayResult(
+                    stream_generation=self.stream_generation,
+                    current_stream_seq=current,
+                    replay_complete=replay_complete,
+                    events=replay_events,
+                    gap_reason=None if replay_complete else "buffer_window_missed",
                 )
 
             candidates: dict[int, BufferedSessionEvent] = {
@@ -827,22 +1241,22 @@ class SessionStreamRegistry:
             }
             for event in events:
                 if since_stream_seq < event.stream_seq < first_reset_seq:
-                    if (
-                        self._is_completed_turn_event(event.event_name)
-                        and self._preserve_completed_before_reset(event, first_reset)
-                    ):
+                    if self._is_completed_turn_event(
+                        event.event_name
+                    ) and self._preserve_completed_before_reset(event, first_reset):
                         candidates[event.stream_seq] = event
 
-            replay_events: list[BufferedSessionEvent] = list(candidates.values())
+            replay_events = list(candidates.values())
             replay_events.sort(key=lambda item: item.stream_seq)
             replay_events.append(first_reset)
-            current_generation_epoch = self._reset_new_generation_epoch(first_reset.payload)
             for event in events:
                 if event.stream_seq <= first_reset_seq:
                     continue
-                if self._is_generation_reset(event.event_name):
-                    current_generation_epoch = self._reset_new_generation_epoch(event.payload)
-                elif self._event_is_stale_generation(event, current_generation_epoch):
+                current_generation_epoch = self._replay_generation_epoch(event, generation_resets)
+                if (
+                    not self._is_generation_reset(event.event_name)
+                    and self._event_is_stale_generation(event, current_generation_epoch)
+                ):
                     continue
                 replay_events.append(event)
 
@@ -858,20 +1272,15 @@ class SessionStreamRegistry:
                 gap_reason=None,
             )
 
-        current_generation_epoch = None
-        latest_reset_seq = -1
-        for stream_seq, reset_event in self._reset_events_by_session.get(session_key, {}).items():
-            if stream_seq <= since_stream_seq and stream_seq > latest_reset_seq:
-                latest_reset_seq = stream_seq
-                current_generation_epoch = self._reset_new_generation_epoch(reset_event.payload)
-
         replay_events = []
         for event in events:
             if event.stream_seq <= since_stream_seq:
                 continue
-            if self._is_generation_reset(event.event_name):
-                current_generation_epoch = self._reset_new_generation_epoch(event.payload)
-            elif self._event_is_stale_generation(event, current_generation_epoch):
+            current_generation_epoch = self._replay_generation_epoch(event, generation_resets)
+            if (
+                not self._is_generation_reset(event.event_name)
+                and self._event_is_stale_generation(event, current_generation_epoch)
+            ):
                 continue
             replay_events.append(event)
         return ReplayResult(

@@ -1,26 +1,24 @@
 """Attachment policy shared by gateway and channel runtime boundaries.
 
-Any file type may be attached; the policy here decides how each type is
-*represented*, not whether it is admitted. ``attachment_category`` routes a
-MIME claim into one of six representation families — the five rendered
-families (image / pdf / text / office / email) keep their extraction and
-anti-forgery behavior, and everything else is ``opaque``: stored and
-materialized into the agent workspace for tool access, never decoded,
-decompressed, or inlined into a provider prompt.
+Any file type may be attached under the default policy. ``attachment_category``
+classifies MIME claims for validation and size limits. Images retain native
+media projection; ordinary files are materialized into the agent workspace
+for tool access without extracting their contents into the provider prompt.
+Generated long-paste inputs separately retain a bounded text preview.
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-# Modern Office Open XML (OOXML) document MIME types. These are zip containers,
-# so they are extracted to text server-side rather than sent to a provider raw.
+# Modern Office Open XML (OOXML) document MIME types. Upload acceptance checks
+# the type claim without decompressing these containers.
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 # Email message formats. .eml/.mbox are text (RFC 5322); .msg is an OLE
-# compound file. All are extracted to bounded text server-side.
+# compound file. Their original bytes remain available to document tools.
 EML_MIME = "message/rfc822"
 MBOX_MIME = "application/mbox"
 MSG_MIME = "application/vnd.ms-outlook"
@@ -28,9 +26,8 @@ MSG_MIME = "application/vnd.ms-outlook"
 # Canonical label for opaque payloads (unrecognized or generic binary types).
 OPAQUE_MIME = "application/octet-stream"
 
-# The RENDERED media types: attachments whose content is extracted or inlined
-# for the model (vision blocks, bounded text extraction). This set is NOT an
-# admission gate — types outside it are admitted as opaque workspace files.
+# Historically rendered media families. Preserve this set for the optional
+# strict admission policy; the default also admits opaque workspace files.
 ALLOWED_MEDIA_TYPES: frozenset[str] = frozenset(
     {
         "image/png",
@@ -95,29 +92,25 @@ ATTACHMENT_CATEGORIES: tuple[AttachmentCategory, ...] = (
     "opaque",
 )
 
-MAX_ATTACHMENTS = 10
+MAX_ATTACHMENTS = 16
 INLINE_ATTACHMENT_BYTES = 2 * 1000 * 1000
 TEXT_ATTACHMENT_BYTES = INLINE_ATTACHMENT_BYTES
 IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = IMAGE_ATTACHMENT_BYTES
-MAX_STAGED_PDF_BYTES = 30 * 1024 * 1024
-# Office documents are zip containers extracted to bounded text; the raw upload
-# is never forwarded to a provider, so a generous ceiling is safe.
-OFFICE_ATTACHMENT_BYTES = 30 * 1024 * 1024
-# Email is held to the text cap, NOT a larger ceiling. Only bounded body text +
-# headers + an attachment-name listing are extracted (embedded attachment bytes
-# are never read), so a large raw email buys nothing — and since email is plain
-# text whose headers are trivially forgeable, a larger cap would just let
-# arbitrary content claim an email mime to bypass the text limit.
+MAX_STAGED_PDF_BYTES = 50 * 1024 * 1024
+# Ordinary document bytes stay in controlled storage for tool access.
+OFFICE_ATTACHMENT_BYTES = 50 * 1024 * 1024
+# Preserve the email transport ceiling. MIME claims alone must not grant the
+# larger staged-text limit, which requires whole-payload UTF-8 validation.
 EMAIL_ATTACHMENT_BYTES = TEXT_ATTACHMENT_BYTES
 # Staged text may exceed the inline threshold only because ingestion proves the
 # WHOLE payload is NUL-free UTF-8 before honoring the larger cap; a binary
 # claiming a text mime is reclassified opaque instead of inheriting this limit.
-MAX_STAGED_TEXT_BYTES = 30 * 1024 * 1024
+MAX_STAGED_TEXT_BYTES = 50 * 1024 * 1024
 # Opaque payloads are never parsed or forwarded to a provider — bytes go to the
 # content-addressed store and the agent workspace only — so their staged
 # ceiling matches the other staged families.
-OPAQUE_ATTACHMENT_BYTES = 30 * 1024 * 1024
+OPAQUE_ATTACHMENT_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_ATTACHMENT_BYTES = 60 * 1024 * 1024
 SNIFF_PEEK_BYTES = 1024
 PDF_MAGIC = b"%PDF-"

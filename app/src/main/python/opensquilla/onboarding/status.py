@@ -49,6 +49,7 @@ from opensquilla.onboarding.section_status import (
 from opensquilla.onboarding.section_status import (
     needs_onboarding as _needs_onboarding,
 )
+from opensquilla.onboarding.video_generation_state import resolve_video_generation_state
 from opensquilla.provider.environment import environment_value
 from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
@@ -104,6 +105,7 @@ class OnboardingStatus:
     # Additive read-side metadata stays optional so integrations that construct
     # this public dataclass with the pre-feature positional shape keep working.
     image_generation_state: dict[str, object] = field(default_factory=dict)
+    video_generation_state: dict[str, object] = field(default_factory=dict)
 
 
 _SECTION_LABELS: dict[str, str] = {
@@ -446,6 +448,11 @@ def _llm_provider_credential_status(
             include_runtime_cache=False,
         )
         env_key = credential.env_name
+        if credential.source == "account":
+            return {
+                "provider": provider, "available": bool(credential.api_key),
+                "source": "account", "envKey": "",
+            }
         if credential.source == "explicit":
             return {
                 "provider": provider,
@@ -561,6 +568,12 @@ def _llm_credential_status(cfg: GatewayConfig) -> dict[str, object]:
             "envKey": resolved_env_key,
             "masked": "",
             "revealAllowed": False,
+        }
+
+    if credential.source == "account":
+        return {
+            "provider": provider, "available": bool(credential.api_key),
+            "source": "account", "envKey": "", "masked": "", "revealAllowed": False,
         }
 
     if credential.source == "explicit":
@@ -952,6 +965,9 @@ def _llm_source(cfg: GatewayConfig, status: SectionStatus) -> tuple[str, str]:
     CLI/WebUI renderers that already display it.
     """
     llm = cfg.llm
+    from opensquilla.desktop_account import account_credential
+    if account_credential(str(llm.provider)) is not None:
+        return "account", ""
     if not llm.provider or not llm.model:
         return "none", ""
     try:
@@ -1328,6 +1344,7 @@ def get_onboarding_status(
         image_generation_primary=image_primary,
         image_generation_env_key=image_env_key,
         image_generation_state=image_generation_state,
+        video_generation_state=resolve_video_generation_state(config),
         audio_configured=audio_status is SectionStatus.OK,
         audio_enabled=bool(getattr(config.audio, "enabled", False)),
         audio_source=audio_source,

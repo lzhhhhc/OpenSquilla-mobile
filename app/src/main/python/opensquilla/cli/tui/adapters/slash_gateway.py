@@ -26,10 +26,10 @@ from opensquilla.cli.gateway_client import (
 )
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
-    compact_skipped_line,
     compact_success_line,
     compact_summary_stats,
     compact_token_stats,
+    compact_unapplied_line,
     dispatch_theme_command,
     output_supports_host_ui,
     record_turn,
@@ -138,8 +138,6 @@ class GatewayClientLike(Protocol):
         include_canonical: bool | None = None,
         include_summaries: bool | None = None,
     ) -> dict[str, Any]: ...
-
-    async def forget_approvals(self, target: str | None = None) -> dict[str, Any]: ...
 
     async def approvals_snapshot(self) -> dict[str, Any]: ...
 
@@ -1035,7 +1033,11 @@ async def _dispatch_gateway_slash_command(
             )
             console.print(compact_success_line(token_stats))
         else:
-            console.print(compact_skipped_line())
+            console.print(compact_unapplied_line(
+                status=payload.get("status"),
+                reason=payload.get("reason") or payload.get("skip_reason"),
+                compaction_id=payload.get("compaction_id"),
+            ))
         return True
 
     if parts := _slash_parts(cmd, "/models"):
@@ -1167,35 +1169,6 @@ async def _dispatch_gateway_slash_command(
             )
         finally:
             await _clear_ready_attachment_chips(tui_output)
-        record_turn(state, prompt, result)
-        return True
-
-    if parts := _slash_parts(cmd, "/meta"):
-        raw_args = parts[1].strip() if len(parts) > 1 else ""
-        meta_args = raw_args.split(maxsplit=1)
-        name = meta_args[0] if meta_args else ""
-        request = meta_args[1].strip() if len(meta_args) > 1 else ""
-        if not name:
-            payload = await client.call("meta.list", {})
-            _print_meta_skills_table(payload)
-            return True
-        run_result = await client.call("meta.run", {"name": name, "sessionKey": state.session_key})
-        if not (isinstance(run_result, dict) and run_result.get("ok")):
-            error = ""
-            if isinstance(run_result, dict):
-                error = str(run_result.get("error") or "")
-            console.print(error_panel(error or f"Could not run meta-skill {name!r}."))
-            return True
-        prompt = f"/meta {name}"
-        if request:
-            prompt = f"{prompt} {request}"
-        result = await stream(
-            client,
-            state.session_key,
-            prompt,
-            elevated_state,
-            tui_output=tui_output,
-        )
         record_turn(state, prompt, result)
         return True
 
@@ -1363,26 +1336,6 @@ def _print_sessions_table(rows: list[dict[str, Any]]) -> None:
     console.print(table)
 
 
-def _print_meta_skills_table(payload: Any) -> None:
-    if not isinstance(payload, dict) or payload.get("disabled"):
-        console.print("[dim]meta-skills are disabled.[/dim]")
-        return
-    skills = payload.get("skills")
-    rows = (
-        [skill for skill in skills if isinstance(skill, dict)] if isinstance(skills, list) else []
-    )
-    if not rows:
-        console.print("[dim]No meta-skills available.[/dim]")
-        return
-    table = Table(title="Meta-skills", show_header=True, header_style=ACCENT_HEADER)
-    table.add_column("Name")
-    table.add_column("Description")
-    for row in rows:
-        table.add_row(
-            str(row.get("name") or ""),
-            str(row.get("description") or ""),
-        )
-    console.print(table)
 
 
 def _print_models_table(rows: list[dict[str, Any]]) -> None:
@@ -1468,29 +1421,6 @@ async def _async_file_prompt_and_attachments(
     )
 
 
-async def _forget_server_approvals(
-    client: GatewayClientLike | None, target: str | None = None
-) -> bool:
-    """Compatibility no-op for the removed intent approval cache."""
-    if client is not None:
-        try:
-            await client.forget_approvals(target)
-            return True
-        except Exception as exc:
-            console.print(
-                f"[red]Failed to clear server-side approvals:[/red] {type(exc).__name__}: {exc}"
-            )
-            console.print(
-                "[red]The gateway is likely running older code. "
-                "Restart it with[/red] [bold]pkill -f 'opensquilla gateway' "
-                "&& opensquilla gateway run[/bold][red] and retry.[/red]"
-            )
-            return False
-
-    _ = target
-    return True
-
-
 async def _handle_approvals_command(cmd: str, client: GatewayClientLike | None = None) -> None:
     """Diagnostic view / reset for the approval queue."""
     parts = cmd.split()
@@ -1510,7 +1440,6 @@ async def _handle_approvals_command(cmd: str, client: GatewayClientLike | None =
     if arg == "reset":
         try:
             await client.set_approval_mode("prompt")
-            await client.forget_approvals()
             console.print(f"[{ACCENT}]Approval mode reset to prompt.[/]")
         except Exception as exc:
             console.print(f"[red]Failed to reset approvals:[/red] {type(exc).__name__}: {exc}")
@@ -1528,14 +1457,13 @@ async def _handle_approvals_command(cmd: str, client: GatewayClientLike | None =
 
 async def _handle_forget_command(cmd: str, client: GatewayClientLike | None = None) -> None:
     """Compatibility no-op for removed approval cache."""
+    _ = client
     parts = cmd.split(maxsplit=1)
     if len(parts) < 2:
-        if await _forget_server_approvals(client):
-            console.print(f"[{ACCENT}]Approval cache is inactive.[/]")
+        console.print(f"[{ACCENT}]Approval cache is inactive.[/]")
         return
     target = parts[1].strip()
-    if await _forget_server_approvals(client, target):
-        console.print(f"[{ACCENT}]Approval cache is inactive for[/] {target}.")
+    console.print(f"[{ACCENT}]Approval cache is inactive for[/] {target}.")
 
 
 async def _handle_elevated_command(
@@ -1558,7 +1486,6 @@ async def _handle_elevated_command(
         return
 
     state["mode"] = known[arg]
-    cleared = await _forget_server_approvals(client)
     queue_mode_reset_warning = ""
     if arg == "off":
         if client is not None:
@@ -1573,31 +1500,23 @@ async def _handle_elevated_command(
             from opensquilla.gateway.approval_queue import get_approval_queue
 
             get_approval_queue().set_settings(mode="prompt")
-    cache_suffix = (
-        ""
-        if cleared
-        else " [bold red]WARNING: legacy approval cache status not confirmed "
-        "(see error above).[/bold red]"
-    )
-
     if arg == "off":
         console.print(
             f"[{ACCENT}]permissions: off[/] - exec runs inside the sandbox. "
-            f"Queue mode reset to prompt.{cache_suffix}{queue_mode_reset_warning}"
+            f"Queue mode reset to prompt.{queue_mode_reset_warning}"
         )
     elif arg == "on":
         console.print(
-            f"[yellow]permissions: on[/yellow] - compatibility alias for Safe mode; "
-            f"approvals still apply. "
-            f"{cache_suffix}"
+            "[yellow]permissions: on[/yellow] - compatibility alias for Safe mode; "
+            "approvals still apply."
         )
     elif arg == "bypass":
         console.print(
-            f"[red]permissions: bypass[/red] - compatibility alias for Safe mode "
-            f"with fewer prompts; host access is not granted.{cache_suffix}"
+            "[red]permissions: bypass[/red] - compatibility alias for Safe mode "
+            "with fewer prompts; host access is not granted."
         )
     else:
         console.print(
-            f"[red]permissions: full[/red] - exec on host, approvals skipped, "
-            f"sensitive paths bypassed. Trusted operators only.{cache_suffix}"
+            "[red]permissions: full[/red] - exec on host, approvals skipped, "
+            "sensitive paths bypassed. Trusted operators only."
         )

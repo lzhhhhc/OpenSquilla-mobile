@@ -32,6 +32,7 @@ def assemble_system_prompt(
     heartbeat_prompt: str | None = None,
     model_aliases: list[str] | None = None,
     reasoning_tag_hint: str | None = None,
+    webui_rendering: bool = False,
 ) -> str:
     """Render the cacheable base of the system prompt for an agent profile.
 
@@ -53,6 +54,7 @@ def assemble_system_prompt(
         heartbeat_prompt: Heartbeat poll recognition and ack protocol text.
         model_aliases: List of model alias strings for Model Aliases section.
         reasoning_tag_hint: Reasoning format constraint (e.g. <think>/<final>).
+        webui_rendering: The authenticated entry surface is the WebUI.
 
     Returns:
         Rendered system prompt string (cacheable base only).
@@ -74,15 +76,13 @@ def assemble_system_prompt(
         "memory": memory,
         "timezone": timezone,
         "prompt_mode": profile.prompt_mode,
-        "patch_evidence_protocol": profile.patch_evidence_protocol,
-        "finalize_evidence_gate": profile.finalize_evidence_gate,
-        "legacy_prompt_style": profile.legacy_prompt_style,
         "runtime_info": runtime_info,
         "docs_path": docs_path,
         "owner_line": owner_line,
         "heartbeat_prompt": heartbeat_prompt,
         "model_aliases": model_aliases or [],
         "reasoning_tag_hint": reasoning_tag_hint,
+        "webui_rendering": webui_rendering,
     }
 
     return template.render(**ctx).strip()

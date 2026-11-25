@@ -1,2 +1,0 @@
-import{R as e,z as t}from"./_plugin-vue_export-helper-DGbgGarA.js";function n(n,r,i){e(()=>{document.addEventListener(n,r,i)}),t(()=>{document.removeEventListener(n,r,i)})}export{n as t};
-//# sourceMappingURL=useDocumentEvent-LeQJ-6-L.js.map

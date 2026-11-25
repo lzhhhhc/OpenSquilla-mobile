@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from opensquilla import __version__
+from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.locking import profile_lock_key
 
 DESKTOP_GATEWAY_OWNERSHIP_FILENAME: Final = "desktop-gateway.json"
@@ -43,7 +44,9 @@ DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION: Final = 1
 DESKTOP_GATEWAY_INSTANCE_NONCE_ENV: Final = (
     "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE"
 )
+DESKTOP_GATEWAY_INSTANCE_ID_ENV: Final = "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID"
 DESKTOP_GATEWAY_AUTH_CONTEXT: Final = b"opensquilla-desktop-gateway-auth-v1"
+DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL: Final = "opensquilla-desktop-lifecycle-v1"
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _PROOF_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -77,6 +80,25 @@ def canonical_shutdown_payload(
 
     return _canonical_payload(
         {**public_record, "action": "shutdown", "challenge": challenge}
+    )
+
+
+def canonical_lifecycle_payload(
+    public_record: dict[str, Any],
+    challenge: str,
+    action: str,
+    fields: dict[str, Any],
+) -> bytes:
+    """Bind lifecycle requests and replies to the same exact owned process."""
+
+    return _canonical_payload(
+        {
+            **public_record,
+            **fields,
+            "lifecycle_protocol": DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+            "action": action,
+            "challenge": challenge,
+        }
     )
 
 
@@ -229,7 +251,7 @@ def _fsync_directory(path: Path) -> None:
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(_native_io_path(path), flags)
     except OSError:
         return
     try:
@@ -241,7 +263,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(path.parent), mode=0o700, exist_ok=True)
     temporary = path.parent / (
         f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     )
@@ -250,7 +272,7 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(_native_io_path(temporary), flags, 0o600)
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
             try:
@@ -262,9 +284,9 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(_native_io_path(temporary), _native_io_path(path))
         try:
-            path.chmod(0o600)
+            os.chmod(_native_io_path(path), 0o600)
         except OSError:
             pass
         _fsync_directory(path.parent)
@@ -272,14 +294,14 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
         if descriptor is not None:
             os.close(descriptor)
         try:
-            temporary.unlink(missing_ok=True)
+            os.unlink(_native_io_path(temporary))
         except OSError:
             pass
 
 
 def _read_record(path: Path) -> dict[str, Any] | None:
     try:
-        with path.open("rb") as stream:
+        with open(_native_io_path(path), "rb") as stream:
             raw = stream.read(_MAX_RECORD_BYTES + 1)
         if len(raw) > _MAX_RECORD_BYTES:
             return None
@@ -328,11 +350,11 @@ def _unlock_record(fd: int) -> None:
 def _ownership_record_lock(state_dir: Path) -> Iterator[None]:
     """Serialize record replacement/removal on one permanent lock inode."""
 
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(state_dir), mode=0o700, exist_ok=True)
     lock_path = state_dir / DESKTOP_GATEWAY_OWNERSHIP_LOCK_FILENAME
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(lock_path, flags, 0o600)
+    fd = os.open(_native_io_path(lock_path), flags, 0o600)
     acquired = False
     try:
         value = os.fstat(fd)
@@ -343,7 +365,7 @@ def _ownership_record_lock(state_dir: Path) -> Iterator[None]:
             os.write(fd, b"\0")
             os.fsync(fd)
         with contextlib.suppress(OSError):
-            os.chmod(lock_path, 0o600)
+            os.chmod(_native_io_path(lock_path), 0o600)
 
         deadline = time.monotonic() + _RECORD_LOCK_TIMEOUT_SECONDS
         while not _try_lock_record(fd):
@@ -371,6 +393,7 @@ class DesktopGatewayOwnership:
     pid: int = field(default_factory=os.getpid)
     start_identity: str = field(default_factory=process_start_identity)
     version: str = __version__
+    instance_id: str = ""
     _active: bool = field(default=False, init=False, repr=False)
     _written_record: dict[str, Any] | None = field(
         default=None, init=False, repr=False
@@ -418,11 +441,13 @@ class DesktopGatewayOwnership:
             profile_fingerprint=profile_fingerprint,
             port=int(port),
             instance_nonce=nonce,
+            instance_id=os.environ.get(DESKTOP_GATEWAY_INSTANCE_ID_ENV, "").strip(),
         )
         # The nonce is process-control authority, not provider/runtime config.
         # Remove both handoff values before service/channel subprocesses inherit
         # the Gateway environment; the active owner object retains what it needs.
         os.environ.pop(DESKTOP_GATEWAY_INSTANCE_NONCE_ENV, None)
+        os.environ.pop(DESKTOP_GATEWAY_INSTANCE_ID_ENV, None)
         os.environ.pop(DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV, None)
         return owner
 
@@ -450,8 +475,22 @@ class DesktopGatewayOwnership:
         if self._active:
             return
         record = self.record
-        with _ownership_record_lock(self.state_dir):
-            _atomic_write_private_json(self.path, record)
+        try:
+            with _ownership_record_lock(self.state_dir):
+                _atomic_write_private_json(self.path, record)
+        except BaseException:
+            # The replacement can succeed before the final directory fsync
+            # reports an error. Remove only our exact record so a failed
+            # startup cannot masquerade as a live Desktop Gateway, while a
+            # successor that won the lock remains untouched.
+            with contextlib.suppress(BaseException):
+                with _ownership_record_lock(self.state_dir):
+                    if _read_record(self.path) == record:
+                        with contextlib.suppress(OSError):
+                            os.unlink(_native_io_path(self.path))
+                        with contextlib.suppress(OSError):
+                            _fsync_directory(self.path.parent)
+            raise
         self._written_record = record
         self._active = True
         atexit.register(self.release)
@@ -470,7 +509,7 @@ class DesktopGatewayOwnership:
             if _read_record(self.path) != expected:
                 return
             try:
-                self.path.unlink(missing_ok=True)
+                os.unlink(_native_io_path(self.path))
             except OSError:
                 return
             _fsync_directory(self.path.parent)
@@ -494,6 +533,33 @@ class DesktopGatewayOwnership:
         ).hexdigest()
         return hmac.compare_digest(proof, expected)
 
+    def lifecycle_proof(
+        self, challenge: str, action: str, fields: dict[str, Any]
+    ) -> str:
+        return hmac.new(
+            self.instance_nonce.encode("ascii"),
+            canonical_lifecycle_payload(self.public_record, challenge, action, fields),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def verify_lifecycle_proof(
+        self, challenge: str, proof: str, action: str, fields: dict[str, Any]
+    ) -> bool:
+        if not valid_desktop_challenge(challenge) or not valid_desktop_proof(proof):
+            return False
+        return hmac.compare_digest(proof, self.lifecycle_proof(challenge, action, fields))
+
+    def lifecycle_response(
+        self, challenge: str, action: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            **fields,
+            "lifecycle_protocol": DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+            "action": action,
+            "challenge": challenge,
+            "proof": self.lifecycle_proof(challenge, action, fields),
+        }
+
 
 _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP: DesktopGatewayOwnership | None = None
 
@@ -502,6 +568,7 @@ def activate_desktop_gateway_ownership(
     *,
     profile_home: str | Path,
     port: int,
+    process_state_dir: str | Path | None = None,
 ) -> DesktopGatewayOwnership | None:
     """Create the process-owned record when the Desktop handshake is enabled."""
 
@@ -515,7 +582,29 @@ def activate_desktop_gateway_ownership(
     active = _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP
     if active is not None and active is not owner:
         raise RuntimeError("Desktop gateway ownership is already active")
-    owner.acquire()
+    from opensquilla.desktop_process_cleanup import configure_desktop_process_cleanup
+
+    configure_desktop_process_cleanup(
+        ownership_dir=owner.state_dir, instance_nonce=owner.instance_nonce,
+        state_dir=process_state_dir,
+    )
+    try:
+        owner.acquire()
+    except BaseException:
+        from opensquilla.desktop_process_cleanup import (
+            abort_desktop_process_cleanup,
+            release_desktop_process_cleanup,
+        )
+
+        try:
+            abort_desktop_process_cleanup(owner.state_dir, owner.instance_nonce)
+        except Exception:
+            # Preserve the ownership failure. A later independent cleanup can
+            # still close the launch fence if rollback itself is unavailable.
+            pass
+        finally:
+            release_desktop_process_cleanup(owner.instance_nonce)
+        raise
     _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP = owner
     return owner
 
@@ -527,7 +616,12 @@ def release_active_desktop_gateway_ownership() -> None:
     owner = _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP
     _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP = None
     if owner is not None:
-        owner.release()
+        from opensquilla.desktop_process_cleanup import release_desktop_process_cleanup
+
+        try:
+            owner.release()
+        finally:
+            release_desktop_process_cleanup(owner.instance_nonce)
 
 
 __all__ = [

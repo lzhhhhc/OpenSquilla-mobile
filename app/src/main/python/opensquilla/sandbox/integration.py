@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.sandbox.backend import Backend, NoopBackend, UnavailableBackend, select_backend
 from opensquilla.sandbox.capability_profile import capability_profile_for_command
 from opensquilla.sandbox.config import EffectiveMode, SandboxSettings
@@ -53,7 +54,7 @@ from opensquilla.sandbox.elevation import (
     ElevationGateResult,
     consume_approved_elevation,
     effective_approval_reviewer,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.escalation import (
     build_network_approval_params,
@@ -160,7 +161,7 @@ def sandbox_policy_scope(policy: StoredSandboxPolicy):
     try:
         yield
     finally:
-        _ACTIVE_SANDBOX_POLICY.reset(token)
+        reset_contextvar_token(_ACTIVE_SANDBOX_POLICY, token)
 
 
 # ─── Approval queue / context protocols ──────────────────────────────────
@@ -221,6 +222,7 @@ def configure_runtime(
     stale_cache: StaleOutputCache | None = None,
     workspace: Path | None = None,
     default_run_mode: RunMode | str | None = None,
+    defer_backend: bool = False,
 ) -> SandboxRuntime:
     """Build the process-wide :class:`SandboxRuntime`.
 
@@ -244,6 +246,11 @@ def configure_runtime(
     backend: Backend
     if not effective.sandbox_enabled:
         backend = NoopBackend()
+    elif defer_backend:
+        from opensquilla.sandbox.setup_runtime import mark_sandbox_startup_pending
+
+        backend = UnavailableBackend("Sandbox initialization has not completed.")
+        mark_sandbox_startup_pending()
     else:
         try:
             backend = select_backend(settings)
@@ -307,6 +314,26 @@ def get_runtime() -> SandboxRuntime | None:
     return _runtime
 
 
+async def initialize_runtime_backend() -> Backend:
+    """Initialize without blocking the event loop or publishing after teardown."""
+    runtime = _runtime
+    if runtime is None:
+        raise SandboxBackendError("Sandbox runtime is not configured.")
+    if not runtime.effective.sandbox_enabled:
+        raise SandboxBackendError("Sandbox execution is disabled.")
+    if not isinstance(runtime.backend, UnavailableBackend):
+        return runtime.backend
+
+    backend = await asyncio.to_thread(select_backend, runtime.settings, verify_runtime=False)
+    if _runtime is not runtime:
+        raise SandboxBackendError("Sandbox runtime was replaced during initialization.")
+    if isinstance(backend, (NoopBackend, UnavailableBackend)):
+        raise SandboxBackendError("No real sandbox backend became available.")
+    runtime.backend = backend
+    log.info("sandbox.runtime_backend_initialized: backend=%s", backend.name)
+    return backend
+
+
 def refresh_runtime_backend_after_setup() -> Backend | None:
     """Promote an auto-configured unavailable backend after platform setup.
 
@@ -347,6 +374,12 @@ def active_file_system_profile(
     from opensquilla.tools.types import current_tool_context
 
     tool_context = current_tool_context.get()
+    if tool_context is not None and tool_context.sandboxed_workspace_authoring is not None:
+        from opensquilla.tools.workspace_authoring import channel_workspace_file_system
+
+        # A scoped authoring proof supersedes the host-readable Safe default
+        # and cannot be widened by a mutable per-tool profile override.
+        return channel_workspace_file_system(tool_context)
     override = (
         tool_context.sandbox_file_system_profile
         if tool_context is not None
@@ -821,14 +854,12 @@ async def _ensure_windows_proxy_allowlist_setup(
     if not _windows_process_is_admin():
         return False
     try:
-        from opensquilla.sandbox.setup_state import (
-            SandboxSetupState,
-            ensure_sandbox_setup,
-        )
+        from opensquilla.sandbox.setup_runtime import ensure_sandbox_setup_auto
+        from opensquilla.sandbox.setup_state import SandboxSetupState
     except Exception:
         return False
     try:
-        result = await ensure_sandbox_setup(getattr(runtime, "settings", None))
+        result = await ensure_sandbox_setup_auto(getattr(runtime, "settings", None))
     except Exception:
         return False
     return getattr(result, "state", None) is SandboxSetupState.READY
@@ -2173,7 +2204,7 @@ async def escalate_backend_denial(
             target=" ".join(request.argv),
         ),
     )
-    return gate_elevated_action(
+    return await gate_elevated_action_async(
         action,
         approval_id=None,
         session_key=_resolve_session_id(rt, None),
@@ -2278,6 +2309,26 @@ def consume_backend_denial_retry(
     )
 
 
+
+async def consume_backend_denial_retry_async(
+    approval_id: str | None,
+    request: SandboxRequest,
+    policy: SandboxPolicy,
+    *,
+    runtime: SandboxRuntime | None = None,
+) -> ElevationGateResult | None:
+    """Validate and consume an exact backend retry without blocking the loop."""
+    if not approval_id:
+        return None
+    rt = runtime or get_runtime()
+    if rt is None:
+        return None
+    result = await rt.approval_queue.run_operation_async(
+        consume_backend_denial_retry, approval_id, request, policy, runtime=rt,
+    )
+    return cast(ElevationGateResult | None, result)
+
+
 def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
     try:
         from opensquilla.tools.run_mode import current_run_mode, full_host_access_active
@@ -2307,12 +2358,14 @@ __all__ = [
     "build_request",
     "configure_runtime",
     "consume_backend_denial_retry",
+    "consume_backend_denial_retry_async",
     "current_managed_network_proxy_url",
     "escalate_backend_denial",
     "escalate_unavailable_backend_in_managed_mode",
     "gate_action",
     "get_runtime",
     "guard_in_process_network_action",
+    "initialize_runtime_backend",
     "managed_network_httpx_kwargs",
     "ManagedNetworkSubprocess",
     "preflight_subprocess_managed_network",

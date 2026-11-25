@@ -6,6 +6,17 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, cast
 
+from opensquilla.gateway.adapters.goals_contract import (
+    register_goals_capabilities_contract,
+    register_goals_clear_contract,
+    register_goals_edit_contract,
+    register_goals_pause_contract,
+    register_goals_reattach_contract,
+    register_goals_resume_contract,
+    register_goals_set_contract,
+    register_goals_status_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -168,21 +179,20 @@ async def _translate_goal_errors(
         ) from exc
 
 
-@_d.method("goals.capabilities", scope="operator.read")
 async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> dict:
     # The key is accepted so callers can use a uniform session-scoped request;
     # capabilities themselves are process/config scoped and have no side effects.
     if params is not None:
-        _session_key(params)
+        values = _require_params(params)
+        if values:
+            _session_key(values)
     service = _goal_service(ctx)
     config = getattr(service, "config", None)
     return {
         "supported": True,
         "executionEnabled": bool(service.execution_enabled),
-        "maxTurns": int(getattr(config, "max_turns", 50)),
-        "runtimeBudgetSeconds": int(
-            getattr(config, "runtime_budget_seconds", 3600)
-        ),
+        "maxTurns": int(getattr(config, "max_turns", 256)),
+        "runtimeBudgetSeconds": int(getattr(config, "runtime_budget_seconds", 3600)),
         "methods": [
             "goals.set",
             "goals.status",
@@ -195,13 +205,28 @@ async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> di
     }
 
 
-@_d.method("goals.status", scope="operator.read")
+_handle_goals_capabilities_contract = register_goals_capabilities_contract(
+    _d,
+    _handle_goals_capabilities,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_goals_status(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     return await _translate_goal_errors(
         service.status(_session_key(params)),
         service=service,
     )
+
+
+_handle_goals_status_contract = register_goals_status_contract(
+    _d,
+    _handle_goals_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 def _uuid_v4_param(params: dict | None, *names: str) -> str:
@@ -232,10 +257,26 @@ def _objective_param(params: dict | None) -> str:
         ) from exc
 
 
-@_d.method("goals.set", scope="operator.write")
+def _reject_retired_goal_options(params: dict | None) -> None:
+    values = _require_params(params)
+    if any(field in values for field in ("tokenBudget", "executionPolicy")):
+        raise RpcHandlerError(
+            "UNSUPPORTED_GOAL_OPTIONS",
+            "Goal tokenBudget and executionPolicy options are no longer supported",
+            retryable=False,
+            accepted=False,
+        )
+
+
 async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.contracts.local_path_references import normalize_local_path_references
+
     service = _goal_service(ctx)
     objective = _objective_param(params)
+    local_path_references = normalize_local_path_references(
+        (params or {}).get("localPathReferences"), message=objective,
+    )
+    _reject_retired_goal_options(params)
     client_request_id = _uuid_v4_param(
         params,
         "clientRequestId",
@@ -256,9 +297,18 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
             client_request_id=client_request_id,
             client_message_id=client_message_id,
             source_kind=_source_kind(params),
+            **({"local_path_references": local_path_references} if local_path_references else {}),
         ),
         service=service,
     )
+
+
+_handle_goals_set_contract = register_goals_set_contract(
+    _d,
+    _handle_goals_set,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 def _mutation_params(params: dict | None) -> tuple[str, str, int, str]:
@@ -277,8 +327,8 @@ def _mutation_params(params: dict | None) -> tuple[str, str, int, str]:
     )
 
 
-@_d.method("goals.edit", scope="operator.write")
 async def _handle_goals_edit(params: dict | None, ctx: RpcContext) -> dict:
+    _reject_retired_goal_options(params)
     service = _goal_service(ctx)
     key, goal_id, revision, request_id = _mutation_params(params)
     objective = _objective_param(params)
@@ -298,7 +348,6 @@ async def _handle_goals_edit(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
-@_d.method("goals.pause", scope="operator.write")
 async def _handle_goals_pause(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     key, goal_id, revision, request_id = _mutation_params(params)
@@ -315,7 +364,6 @@ async def _handle_goals_pause(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
-@_d.method("goals.resume", scope="operator.write")
 async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     key, goal_id, revision, request_id = _mutation_params(params)
@@ -334,7 +382,26 @@ async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
-@_d.method("goals.reattach", scope="operator.write")
+_handle_goals_edit_contract = register_goals_edit_contract(
+    _d,
+    _handle_goals_edit,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_goals_pause_contract = register_goals_pause_contract(
+    _d,
+    _handle_goals_pause,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_goals_resume_contract = register_goals_resume_contract(
+    _d,
+    _handle_goals_resume,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_goals_reattach(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     session_id = _string_param(params, "sessionId", "session_id")
@@ -369,7 +436,14 @@ async def _handle_goals_reattach(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
-@_d.method("goals.clear", scope="operator.write")
+_handle_goals_reattach_contract = register_goals_reattach_contract(
+    _d,
+    _handle_goals_reattach,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_goals_clear(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     key, goal_id, revision, request_id = _mutation_params(params)
@@ -384,3 +458,11 @@ async def _handle_goals_clear(params: dict | None, ctx: RpcContext) -> dict:
         ),
         service=service,
     )
+
+
+_handle_goals_clear_contract = register_goals_clear_contract(
+    _d,
+    _handle_goals_clear,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)

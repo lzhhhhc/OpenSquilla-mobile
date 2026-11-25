@@ -12,16 +12,13 @@ from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
 from opensquilla.identity.bootstrap import (
     CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
-    ONE_SHOT_BOOTSTRAP_FILENAME,
-    ensure_agent_workspace,
+    RETIRED_WORKSPACE_FILENAMES,
 )
 from opensquilla.identity.parser import parse_identity
 from opensquilla.session.keys import normalize_agent_id
 
 _WORKSPACE_AGENT_FILE_NAMES = (
     *CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
-    ONE_SHOT_BOOTSTRAP_FILENAME,
-    "MEMORY.md",
     "memory.md",
 )
 _WORKSPACE_AGENT_FILE_NAME_SET = frozenset(_WORKSPACE_AGENT_FILE_NAMES)
@@ -80,34 +77,6 @@ class AgentRegistry:
         await self._persist()
         return self._entry_summary(entry)
 
-    async def update_agent(self, agent_id: str, **fields: Any) -> dict[str, Any]:
-        normalized = self._normalize_user_agent_id(agent_id)
-        index = self._require_index(normalized)
-        entry = self.config.agents[index]
-        updates: dict[str, Any] = {}
-        for field in (
-            "name",
-            "description",
-            "model",
-            "workspace",
-            "agent_dir",
-            "tools",
-            "enabled",
-            "system_prompt",
-        ):
-            if field in fields:
-                updates[field] = fields[field]
-        if "systemPrompt" in fields:
-            updates["system_prompt"] = fields["systemPrompt"]
-        if "agentDir" in fields:
-            updates["agent_dir"] = fields["agentDir"]
-        if not updates:
-            raise ValueError("No fields to update")
-        next_entry = entry.model_copy(update=updates)
-        self.config.agents[index] = next_entry
-        await self._persist()
-        return self._entry_summary(next_entry)
-
     async def delete_agent(self, agent_id: str) -> None:
         normalized = self._normalize_user_agent_id(agent_id)
         index = self._require_index(normalized)
@@ -137,11 +106,9 @@ class AgentRegistry:
     async def get_identity(self, agent_id: str) -> dict[str, Any]:
         """Return parsed public identity fields without mutating the workspace.
 
-        Unlike the general agent-file APIs, this read path deliberately does
-        not call :func:`ensure_agent_workspace`: identity decoration is used by
-        read-scoped RPCs and must not seed files as a side effect.  The shared
-        hardened reader still rejects escaping paths, symlinks, non-regular
-        files, and hardlinks.
+        Like the general agent-file read APIs, identity decoration must not
+        initialize missing directories or files. The shared hardened reader
+        still rejects escaping paths, symlinks, non-regular files, and hardlinks.
         """
 
         normalized = normalize_agent_id(agent_id)
@@ -163,6 +130,7 @@ class AgentRegistry:
         safe_name, path = self._resolve_workspace_agent_file(root, name)
         text = content if isinstance(content, str) else str(content)
         data = text.encode("utf-8")
+        root.mkdir(parents=True, exist_ok=True)
         fd = self._open_workspace_agent_file_for_write(path)
         try:
             self._validate_safe_file_stat(os.fstat(fd))
@@ -253,7 +221,7 @@ class AgentRegistry:
 
     def _workspace_root(self, agent_id: str) -> Path:
         normalized = normalize_agent_id(agent_id)
-        return ensure_agent_workspace(self.get_agent_workspace(normalized)).workspace_dir
+        return self.get_agent_workspace(normalized).expanduser()
 
     @staticmethod
     def _workspace_file_entry(root: Path, name: str) -> dict[str, Any]:
@@ -289,7 +257,11 @@ class AgentRegistry:
         if name != Path(name).name or "/" in name or "\\" in name:
             raise ValueError("workspace file name must not contain path separators")
         if name not in _WORKSPACE_AGENT_FILE_NAME_SET:
-            raise ValueError(f"Unsupported workspace agent file: {name}")
+            raise ValueError(
+                f"Retired workspace agent file: {name}; use ordinary file tools to access it"
+                if name in RETIRED_WORKSPACE_FILENAMES
+                else f"Unsupported workspace agent file: {name}"
+            )
         return name
 
     def _resolve_workspace_agent_file(self, root: Path, name: str) -> tuple[str, Path]:

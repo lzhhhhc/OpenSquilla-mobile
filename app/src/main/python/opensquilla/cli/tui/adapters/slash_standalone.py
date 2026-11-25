@@ -19,10 +19,10 @@ from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
-    compact_skipped_line,
     compact_success_line,
     compact_summary_stats,
     compact_token_stats,
+    compact_unapplied_line,
     dispatch_theme_command,
     output_supports_host_ui,
     record_turn,
@@ -43,14 +43,14 @@ from opensquilla.observability.network_policy import (
 )
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
-    derive_provider_request_correlation,
 )
 from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
+    effective_protected_recent_messages,
 )
 from opensquilla.session.compaction_lifecycle import (
-    flush_receipt_is_successful_flush,
+    durable_receipt_allows_destructive_compaction,
     new_compaction_id,
 )
 
@@ -139,11 +139,11 @@ class StandaloneCompactSession(Protocol):
     ) -> Awaitable[str]: ...
 
 
-class StandaloneFlushTranscript(Protocol):
+class StandaloneCheckpointTranscript(Protocol):
     def __call__(
         self,
-        transcript: object,
         session_key: str,
+        transcript: object,
         **kwargs: Any,
     ) -> Awaitable[Any]: ...
 
@@ -172,7 +172,7 @@ class StandaloneSlashServices:
     truncate_session: StandaloneTruncateSession | None = None
     compact_session: StandaloneCompactSession | None = None
     compact_with_result: CompactWithResult | None = None
-    flush_transcript: StandaloneFlushTranscript | None = None
+    checkpoint_transcript: StandaloneCheckpointTranscript | None = None
     get_session_routing: StandaloneGetSessionRouting | None = None
     set_session_routing: StandaloneSetSessionRouting | None = None
     config: object | None = None
@@ -334,84 +334,44 @@ async def _read_standalone_transcript(
     return None
 
 
-async def _flush_before_standalone_rewrite(
+async def _checkpoint_before_standalone_rewrite(
     slash_services: StandaloneSlashServices,
     session_key: str,
     *,
     operation: str,
-    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> bool:
-    """Fail closed before reset; compact can continue on flush degradation."""
-    compaction_operation = operation.strip().lower() == "compact"
+    """Preserve the removed transcript before a standalone reset."""
     transcript = await _read_standalone_transcript_handle(
-        slash_services.read_transcript,
-        session_key,
+        slash_services.read_transcript, session_key,
     )
     if transcript is None:
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: could not inspect durable transcript; "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        console.print(
-            f"[yellow]{operation} aborted: could not inspect the durable transcript.[/yellow]"
-        )
+        console.print(f"[yellow]{operation} aborted: could not inspect the transcript.[/yellow]")
         return False
     if not transcript:
         return True
-
-    flush_transcript = slash_services.flush_transcript
-    if flush_transcript is None:
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: flush service is unavailable; "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
+    checkpoint = slash_services.checkpoint_transcript
+    if checkpoint is None or slash_services.get_session is None:
         console.print(
-            f"[yellow]{operation} aborted: flush service is unavailable and "
-            "the durable transcript is non-empty.[/yellow]"
+            f"[yellow]{operation} aborted: transcript checkpoint is unavailable.[/yellow]"
         )
         return False
-
     try:
-        flush_kwargs: dict[str, Any] = {
-            "agent_id": "main",
-            "timeout": 30.0,
-            "message_window": 0,
-            "segment_mode": "auto",
-        }
-        if provider_request_correlation is not None:
-            flush_kwargs["provider_request_correlation"] = (
-                provider_request_correlation
-            )
-            flush_kwargs["turn_id"] = provider_request_correlation.turn_id
-        receipt = await flush_transcript(
-            transcript,
+        session = await _maybe_await(slash_services.get_session(session_key))
+        if session is None:
+            raise RuntimeError("session is unavailable")
+        receipt = await checkpoint(
             session_key,
-            **flush_kwargs,
+            transcript,
+            source="standalone_reset",
+            expected_session_id=session.session_id,
+            expected_session_epoch=getattr(session, "epoch", None),
         )
-    except Exception as exc:  # noqa: BLE001
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: flush failed ({exc}); "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        console.print(f"[yellow]{operation} aborted: flush failed ({exc}).[/yellow]")
-        return False
-
-    if not flush_receipt_is_successful_flush(receipt):
-        if compaction_operation:
-            error = getattr(receipt, "error", None) or "degraded receipt"
-            console.print(
-                f"[yellow]{operation}: flush failed ({error}); "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        error = getattr(receipt, "error", None) or "unknown error"
-        console.print(f"[yellow]{operation} aborted: flush failed ({error}).[/yellow]")
+        if not durable_receipt_allows_destructive_compaction(receipt):
+            raise RuntimeError("transcript checkpoint failed")
+    except Exception:
+        console.print(
+            f"[yellow]{operation} aborted: transcript checkpoint could not be saved.[/yellow]"
+        )
         return False
     return True
 
@@ -539,24 +499,8 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         call_kind="auxiliary.compaction",
         turn_id=compaction_id,
     )
-    safe_to_compact = await _flush_before_standalone_rewrite(
-        slash_services,
-        context.session_key,
-        operation="Compact",
-        provider_request_correlation=derive_provider_request_correlation(
-            compaction_correlation,
-            execution_id=uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        ),
-    )
-    if not safe_to_compact:
-        return
-
     console.print(f"[{ACCENT}]compacting context...[/]")
     config = slash_services.config
-    configured_context_cap = (
-        getattr(config, "context_budget_tokens", 100_000) if config is not None else 100_000
-    )
     session = None
     if slash_services.get_session is not None:
         try:
@@ -574,8 +518,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
             provider_override=None,
         )
     from opensquilla.gateway.compaction_target import (
-        build_gateway_consumer_admission,
-        limit_gateway_consumer_budget,
+        build_gateway_compaction_budget,
         resolve_gateway_compaction_target,
         resolve_gateway_consumer_budget,
     )
@@ -588,17 +531,10 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         gateway_context,
         session,
     )
-    consumer_budget = limit_gateway_consumer_budget(
-        consumer_budget,
-        max(1, int(configured_context_cap or 1)),
-    )
-    context_window = consumer_budget.context_window_tokens
-    consumer_admission, consumer_admission_fingerprint = (
-        build_gateway_consumer_admission(consumer_budget)
-    )
     target = resolve_gateway_compaction_target(
         gateway_context,
         session,
+        consumer_budget=consumer_budget,
     )
     compaction_provider = target.provider
     if compaction_provider is None and not target.blocked_reason:
@@ -611,8 +547,54 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         model_override=target.model or context.model,
         compaction_config=getattr(config, "compaction", None),
         compaction_plan=target.plan,
-        context_window_tokens=context_window,
     )
+    prepare_envelope = getattr(context.turn_runner, "prepare_manual_compaction_envelope", None)
+    consumer_agent = None
+    if callable(prepare_envelope) and consumer_budget.provider is not None:
+        from opensquilla.tools.types import ToolContext
+
+        envelope_options: dict[str, Any] = {}
+        try:
+            envelope_parameters = tuple(inspect.signature(prepare_envelope).parameters.values())
+        except (TypeError, ValueError):
+            envelope_parameters = ()
+        if any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "provider_request_max_chars_explicit_cap"
+            for parameter in envelope_parameters
+        ):
+            envelope_options["provider_request_max_chars_explicit_cap"] = (
+                consumer_budget.provider_request_max_chars_explicit_cap
+            )
+        consumer_agent = prepare_envelope(
+            session,
+            provider=consumer_budget.provider,
+            context_window_tokens=(
+                consumer_budget.physical_context_window_tokens
+                or consumer_budget.context_window_tokens
+            ),
+            max_output_tokens=consumer_budget.max_output_tokens,
+            context_window_known=consumer_budget.context_window_known,
+            provider_request_max_chars=consumer_budget.provider_request_max_chars,
+            workspace_dir=getattr(context.tool_ctx, "workspace_dir", None),
+            caller_tool_context=(
+                context.tool_ctx if isinstance(context.tool_ctx, ToolContext) else None
+            ),
+            **envelope_options,
+        )
+        compaction_config.request_context = consumer_agent.build_compaction_request_context()
+    resolved_budget = build_gateway_compaction_budget(
+        consumer_budget,
+        consumer_agent=consumer_agent,
+        trigger_ratio=float(getattr(config, "preflight_compact_ratio", 0.85)),
+        retained_tail_messages=effective_protected_recent_messages(compaction_config),
+        summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 0),
+    )
+    context_window = resolved_budget.history_capacity_tokens
+    consumer_admission = resolved_budget.consumer_admission
+    consumer_admission_fingerprint = resolved_budget.consumer_admission_fingerprint
+    compaction_config.budget = resolved_budget
+    unapplied_reason = None
     try:
         if compact_with_result is not None:
             compact_kwargs: dict[str, Any] = {}
@@ -649,7 +631,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 for parameter in parameters
             ):
                 compact_kwargs["context_window_chars"] = (
-                    consumer_budget.provider_request_max_chars
+                    resolved_budget.history_capacity_chars
                 )
             if any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -672,6 +654,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 **compact_kwargs,
             )
             summary = getattr(result, "summary", "") or ""
+            unapplied_reason = getattr(result, "skip_reason", None)
             token_stats = compact_token_stats(
                 getattr(result, "tokens_before", 0),
                 getattr(result, "tokens_after", 0),
@@ -697,7 +680,9 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     if summary:
         console.print(compact_success_line(token_stats))
     else:
-        console.print(compact_skipped_line())
+        console.print(compact_unapplied_line(
+            reason=unapplied_reason, compaction_id=compaction_id,
+        ))
 
 
 async def handle_standalone_slash_command(
@@ -822,10 +807,6 @@ async def handle_standalone_slash_command(
         console.print("[yellow]/models requires gateway mode.[/yellow]")
         return True
 
-    if _slash_parts(cmd, "/meta"):
-        console.print("[yellow]/meta requires gateway mode.[/yellow]")
-        return True
-
     if parts := _slash_parts(cmd, "/model"):
         if len(parts) == 1:
             console.print(f"[dim]model pin[/dim] [bold]{context.model or 'auto'}[/bold]")
@@ -853,16 +834,8 @@ async def handle_standalone_slash_command(
     if cmd in {"/clear", "/reset"}:
         truncate_session = context.slash_services.truncate_session
         if truncate_session is not None:
-            flush_correlation = await _standalone_maintenance_correlation(
-                context.slash_services,
-                context.session_key,
-                call_kind="auxiliary.session_flush",
-            )
-            safe_to_reset = await _flush_before_standalone_rewrite(
-                context.slash_services,
-                context.session_key,
-                operation="Reset",
-                provider_request_correlation=flush_correlation,
+            safe_to_reset = await _checkpoint_before_standalone_rewrite(
+                context.slash_services, context.session_key, operation="Reset",
             )
             if not safe_to_reset:
                 return True

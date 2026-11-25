@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
+from dataclasses import dataclass
+from typing import Literal
+
+from opensquilla.context_budget import hard_input_tokens
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
+from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.request_proof import effective_proof_token_budget, fit_generation_tokens
 
 NON_MATERIAL_INPUT_HEADROOM_TOKENS = 8_192
 MAX_THINKING_BUDGET_TOKENS = 50_000
@@ -14,13 +19,41 @@ CAPACITY_CONFIGURATION_HINT = (
     "For a custom or catalog-unknown model, set llm.context_window_tokens "
     "to the deployment's verified context limit."
 )
+CAPACITY_REDUCTION_HINT = (
+    "Reduce the attachment or session context, run /compact, or start a new session "
+    "before retrying."
+)
+CapacityAdmissionStatus = Literal[
+    "fits", "known_capacity_request_too_large", "capacity_unknown",
+]
 
 
 class LargeContextCapacityError(RuntimeError):
     """An attachment turn has no deployment with proven request capacity."""
 
+    def __init__(self, message: str, *, status: CapacityAdmissionStatus | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = {
+            "known_capacity_request_too_large": "attachment_capacity_too_large",
+            "capacity_unknown": "attachment_capacity_unknown",
+        }.get(status or "", "attachment_capacity_unavailable")
 
-def model_has_request_capacity(
+
+@dataclass(frozen=True, slots=True)
+class ModelRequestCapacityAssessment:
+    """Capacity proof for a physical deployment, before request serialization."""
+
+    status: CapacityAdmissionStatus
+    required_input_tokens: int
+    safe_input_tokens: int | None
+
+    @property
+    def fits(self) -> bool:
+        return self.status == "fits"
+
+
+def assess_model_request_capacity(
     *,
     provider: str,
     model: str,
@@ -33,7 +66,7 @@ def model_has_request_capacity(
     api_key: str = "",
     base_url: str = "",
     proxy: str = "",
-) -> bool:
+) -> ModelRequestCapacityAssessment:
     """Return whether definite catalog limits prove a conservative request fits.
 
     ``request_input_tokens`` is the preferred path: callers that can measure the
@@ -46,10 +79,18 @@ def model_has_request_capacity(
     model_id = str(model or "").strip()
     resolved_request_tokens = max(0, int(request_input_tokens))
     resolved_material_tokens = max(0, int(material_tokens))
+    required_input_tokens = (
+        resolved_request_tokens
+        if resolved_request_tokens > 0
+        else resolved_material_tokens + NON_MATERIAL_INPUT_HEADROOM_TOKENS
+        if resolved_material_tokens > 0
+        else 0
+    )
+    unknown = ModelRequestCapacityAssessment("capacity_unknown", required_input_tokens, None)
     if not provider_id or not model_id or (
         resolved_request_tokens <= 0 and resolved_material_tokens <= 0
     ):
-        return False
+        return unknown
     catalog = shared_catalog()
     try:
         window, window_source = resolve_effective_context_window(
@@ -83,33 +124,92 @@ def model_has_request_capacity(
                     int(deployment_limits.max_output_tokens),
                 )
     except Exception:  # noqa: BLE001 - invalid/missing capability fails closed
-        return False
+        return unknown
     if window_source not in {"catalog", "config", "override"}:
-        return False
-    budget = ContextBudgetGovernor.from_values(
-        context_window_tokens=window,
-        max_output_tokens=max_output,
-        thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
-        context_overflow_threshold=0.85,
-    ).snapshot()
-    safe_input_tokens = budget.provider_request_max_chars // CHARS_PER_TOKEN
-    if provider_request_proof_max_chars > 0:
-        safe_input_tokens = min(
-            safe_input_tokens,
-            int(provider_request_proof_max_chars) // CHARS_PER_TOKEN,
+        return unknown
+    # Catalog output is a ceiling, not an input reservation. OpenAI-compatible
+    # caps already include reasoning; router thinking levels are not additional
+    # output. Only native Anthropic may raise the wire cap for an explicit budget.
+    thinking = max(0, int(thinking_budget_tokens))
+    requested_generation = max_output
+    minimum_generation = 1
+    try:
+        backend: str = get_provider_spec(provider_id).backend
+    except ValueError:
+        backend = ""
+    if backend == "anthropic" and thinking:
+        from opensquilla.provider.anthropic import _uses_adaptive_thinking
+
+        if not _uses_adaptive_thinking(model_id):
+            if thinking >= max_output:
+                requested_generation = thinking + 4_096
+    # Other adapters have not adopted dynamic caps; their actual fixed reserve
+    # remains binding here rather than assuming a reduction they will not send.
+    generation = (
+        fit_generation_tokens(
+            window,
+            requested_generation,
+            required_input_tokens,
+            minimum_generation_tokens=minimum_generation,
         )
-    required_input_tokens = (
-        resolved_request_tokens
-        if resolved_request_tokens > 0
-        else resolved_material_tokens + NON_MATERIAL_INPUT_HEADROOM_TOKENS
+        if backend == "openai_compat"
+        else requested_generation
     )
-    return required_input_tokens <= safe_input_tokens
+    safe_input_tokens, _headroom = effective_proof_token_budget(
+        hard_input_tokens(window, generation or minimum_generation),
+    )
+    # This prefilter receives token estimates, not the serialized request.
+    # Its character cap is enforced separately by the final adapter proof;
+    # converting that cap to tokens would conflate two independent limits.
+    return ModelRequestCapacityAssessment(
+        (
+            "fits" if generation > 0 and required_input_tokens <= safe_input_tokens
+            else "known_capacity_request_too_large"
+        ),
+        required_input_tokens,
+        safe_input_tokens,
+    )
+
+
+def model_has_request_capacity(
+    *,
+    provider: str,
+    model: str,
+    material_tokens: int,
+    thinking_budget_tokens: int,
+    request_input_tokens: int = 0,
+    context_window_override_tokens: int = 0,
+    max_output_override_tokens: int = 0,
+    provider_request_proof_max_chars: int = 0,
+    api_key: str = "",
+    base_url: str = "",
+    proxy: str = "",
+) -> bool:
+    """Keep the boolean admission contract for ordinary routing and fallbacks."""
+
+    return assess_model_request_capacity(
+        provider=provider,
+        model=model,
+        material_tokens=material_tokens,
+        thinking_budget_tokens=thinking_budget_tokens,
+        request_input_tokens=request_input_tokens,
+        context_window_override_tokens=context_window_override_tokens,
+        max_output_override_tokens=max_output_override_tokens,
+        provider_request_proof_max_chars=provider_request_proof_max_chars,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+    ).fits
 
 
 __all__ = [
     "CAPACITY_CONFIGURATION_HINT",
+    "CAPACITY_REDUCTION_HINT",
+    "CapacityAdmissionStatus",
     "LargeContextCapacityError",
     "MAX_THINKING_BUDGET_TOKENS",
+    "ModelRequestCapacityAssessment",
     "NON_MATERIAL_INPUT_HEADROOM_TOKENS",
+    "assess_model_request_capacity",
     "model_has_request_capacity",
 ]

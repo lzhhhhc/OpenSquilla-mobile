@@ -7,6 +7,7 @@ import inspect
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 from typing import Any, cast
@@ -24,6 +25,7 @@ from opensquilla.search.runtime_config import (
     ResolvedSearchRuntime,
     get_resolved_search_runtime,
 )
+from opensquilla.search.turn_state import current_search_turn_state
 from opensquilla.search.types import (
     SearchDiagnostics,
     SearchExecutionPlan,
@@ -38,7 +40,6 @@ ProviderFactory = Callable[[str], SearchProvider]
 Fetcher = Callable[[str, int], Awaitable[Any]]
 
 _FETCH_MIN_USEFUL_CHARS = 240
-_ROOT_DOMAIN_RESULT_LIMIT = 3
 _SEARCH_CACHE_TTL_SECONDS = 900
 _EXTERNAL_CONTENT_RE = re.compile(
     r"<external-content\b[^>]*>(?P<content>.*?)</external-content>",
@@ -83,7 +84,12 @@ async def run_canonical_web_search(
         if use_cache is None
         else use_cache
     )
-    cache_key = _cache_key(options, execution_plan)
+    cache_key = _cache_key(options, execution_plan) + (
+        tuple(
+            name in resolved_runtime.providers and resolved_runtime.providers[name].available
+            for name in provider_names
+        ),
+    )
     if cache_enabled:
         diagnostics.cache_status = "miss"
         cached_payload = _get_cached_payload(cache_key)
@@ -99,14 +105,21 @@ async def run_canonical_web_search(
 
     for attempt_index, provider_name in enumerate(provider_names):
         try:
-            provider = factory(provider_name)
-            search_options, recency_supported, recency_degraded = (
-                _effective_options_for_provider(
-                    options,
-                    resolved_runtime.provider_config(provider_name),
+            resolved_runtime.require_available(provider_name)
+            turn_state = current_search_turn_state.get()
+            async with (
+                turn_state.provider_attempt(provider_name)
+                if turn_state is not None
+                else nullcontext()
+            ):
+                provider = factory(provider_name)
+                search_options, recency_supported, recency_degraded = (
+                    _effective_options_for_provider(
+                        options,
+                        resolved_runtime.provider_config(provider_name),
+                    )
                 )
-            )
-            raw_results = await _search_provider(provider, search_options)
+                raw_results = await _search_provider(provider, search_options)
         except Exception as exc:  # noqa: BLE001 - orchestrator converts provider failures to payloads
             search_error = _coerce_search_error(provider_name, exc)
             diagnostics.provider_attempts.append(
@@ -124,7 +137,11 @@ async def run_canonical_web_search(
                 options,
                 diagnostics,
                 error_kind=search_error.kind,
-                error=_public_error_message(provider_name, search_error.kind),
+                error=_public_error_message(
+                    provider_name,
+                    search_error.kind,
+                    missing_key=_is_missing_key_error(search_error),
+                ),
                 provider_retryable=search_error.retryable,
                 error_class=type(exc).__name__,
             )
@@ -153,7 +170,6 @@ async def run_canonical_web_search(
     hits = [_search_result_to_hit(result, selected_provider, options) for result in raw_results]
     hits = _filter_hits_by_domain_options(hits, options)
     hits, diagnostics.duplicate_count = dedupe_hits_by_canonical_url(hits)
-    hits, diagnostics.domain_limited_count = _limit_root_domain_spam(hits, options)
     for rank, hit in enumerate(hits, start=1):
         hit.rank = rank
 
@@ -267,7 +283,7 @@ async def _default_fetcher(url: str, max_chars: int) -> dict[str, Any]:
     web_fetch = importlib.import_module("opensquilla.tools.builtin.web_fetch")
     return cast(
         dict[str, Any],
-        await web_fetch.run_web_fetch_payload(url, max_chars=max_chars),
+        await web_fetch.run_web_fetch_payload(url, max_chars=max_chars, _search_excerpt=True),
     )
 
 
@@ -307,10 +323,6 @@ def _set_cached_payload(cache_key: tuple[Any, ...], payload: dict[str, Any]) -> 
         time.monotonic() + _SEARCH_CACHE_TTL_SECONDS,
         deepcopy(payload),
     )
-
-
-def _provider_order(options: SearchOptions) -> tuple[str, ...]:
-    return get_resolved_search_runtime().provider_order(options)
 
 
 def _coerce_search_error(provider_name: str, exc: Exception) -> SearchProviderError:
@@ -404,54 +416,6 @@ def _filter_hits_by_domain_options(
     ]
 
 
-def _limit_root_domain_spam(
-    hits: list[SearchHit],
-    options: SearchOptions,
-) -> tuple[list[SearchHit], int]:
-    if options.include_domains:
-        return hits, 0
-
-    root_counts: dict[str, int] = {}
-    limited: list[SearchHit] = []
-    limited_count = 0
-    for hit in hits:
-        root_domain = _root_domain(hit.domain)
-        count = root_counts.get(root_domain, 0)
-        if root_domain and count >= _ROOT_DOMAIN_RESULT_LIMIT:
-            limited_count += 1
-            continue
-        root_counts[root_domain] = count + 1
-        limited.append(hit)
-    return limited, limited_count
-
-
-# Generic second-level labels used under two-letter ccTLDs (e.g. co.uk,
-# com.au, gov.uk). When a host ends in one of these under a 2-letter TLD, the
-# registrable domain is the last THREE labels, not two — otherwise distinct
-# organizations (bbc.co.uk vs theguardian.co.uk) collapse into one root.
-_SECOND_LEVEL_SUFFIXES = frozenset(
-    {
-        "co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go",
-        "mil", "sch", "ltd", "plc", "nhs", "police", "me",
-    }
-)
-
-
-def _root_domain(domain: str) -> str:
-    normalized = domain.lower().strip(".")
-    if not normalized:
-        return ""
-    labels = [label for label in normalized.split(".") if label]
-    if len(labels) <= 2:
-        return normalized
-    tld = labels[-1]
-    second = labels[-2]
-    # Public-suffix-aware: bbc.co.uk / gov.uk stay distinct roots.
-    if len(tld) == 2 and second in _SECOND_LEVEL_SUFFIXES and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return ".".join(labels[-2:])
-
-
 def _domain_allowed(
     domain: str,
     *,
@@ -497,7 +461,13 @@ async def _fetch_compact_excerpts(
             continue
 
         text = _extract_external_content_text(str(payload.get("text") or ""))
-        if not text.strip():
+        status = payload.get("status")
+        if (
+            not isinstance(status, int)
+            or not 200 <= status < 300
+            or payload.get("error")
+            or not text.strip()
+        ):
             hit.fetch_status = _fetch_failure_status(payload)
             hit.extractor = str(payload.get("extractor") or "")
             diagnostics.fetch_failed_count += 1
@@ -585,13 +555,19 @@ def _failure_payload(
         "error_class": error_class,
         "error": error,
         "provider_retryable": provider_retryable,
-        "retry_allowed": False,
+        "retry_allowed": provider_retryable
+        and error_kind in {"timeout", "network", "rate_limit", "http"},
     }
 
 
-def _public_error_message(provider: str, kind: str) -> str:
+def _public_error_message(provider: str, kind: str, *, missing_key: bool = False) -> str:
     provider_name = provider or "search provider"
     if kind == "auth":
+        if missing_key:
+            return (
+                f"{provider_name} search is unavailable: API key is not configured. "
+                "Do not retry this provider until credentials are configured."
+            )
         return f"{provider_name} search authentication failed. Check provider credentials."
     if kind == "network":
         return f"{provider_name} search network request failed."
@@ -600,6 +576,13 @@ def _public_error_message(provider: str, kind: str) -> str:
     if kind == "rate_limit":
         return f"{provider_name} search rate limit was reached."
     if kind == "blocked":
+        if provider == "duckduckgo":
+            return (
+                "duckduckgo search was blocked by an upstream challenge. "
+                "Do not retry DuckDuckGo or rephrase the query in this turn. "
+                "Use another configured search provider, fetch a known URL, "
+                "or continue with available evidence."
+            )
         return f"{provider_name} search was blocked by an upstream challenge."
     if kind == "http":
         return f"{provider_name} search request failed."

@@ -14,7 +14,7 @@ from rich.table import Table
 from opensquilla.cli.chat.session_state import messages_to_markdown
 from opensquilla.cli.gateway_client import session_history_all
 from opensquilla.cli.gateway_rpc import default_gateway_url, run_gateway_sync
-from opensquilla.cli.output import print_json
+from opensquilla.cli.output import exit_invalid_request, print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
 
 app = typer.Typer(help="Manage chat sessions.")
@@ -85,12 +85,28 @@ def _filter_sessions(
         if status and str(row.get("status") or "").lower() != status.lower():
             continue
         if channel:
+            # `list_sessions` projects the channel under the canonical source
+            # fields built by chat.source.chat_source_metadata — `channel_kind`,
+            # `source_kind` and `surface`. On cron and webchat rows the plain
+            # `channel` key is null, so matching only the legacy names filtered
+            # every one of those rows out and `--channel cron` returned nothing.
+            # Falsy values are skipped so a null field cannot contribute "" to
+            # the comparison set.
             channel_values = {
-                str(row.get("channel") or ""),
-                str(row.get("last_channel") or ""),
-                str(row.get("lastChannel") or ""),
-                str(row.get("source_channel") or ""),
-                str(row.get("sourceChannel") or ""),
+                str(row.get(key))
+                for key in (
+                    "channel",
+                    "last_channel",
+                    "lastChannel",
+                    "source_channel",
+                    "sourceChannel",
+                    "channel_kind",
+                    "channelKind",
+                    "source_kind",
+                    "sourceKind",
+                    "surface",
+                )
+                if row.get(key)
             }
             if channel not in channel_values:
                 continue
@@ -135,6 +151,12 @@ def sessions_list(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """List recent sessions."""
+    if limit < 1:
+        exit_invalid_request(
+            "--limit must be >= 1",
+            json_output=json_output,
+            details={"parameter": "limit", "minimum": 1},
+        )
     since_dt = _parse_since(since)
 
     async def _run(client):

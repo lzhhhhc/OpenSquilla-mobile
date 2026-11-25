@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import copy
 import functools
-import hashlib
 import inspect
-import json
-import os
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -19,6 +16,7 @@ from opensquilla.provider.types import ToolDefinition, ToolInputSchema
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools import visibility as visibility_policy
 from opensquilla.tools.policy_runtime import ToolSurfaceCapabilities
+from opensquilla.tools.schema_validation import tool_spec_schema_parts
 from opensquilla.tools.types import (
     CallerKind,
     InteractionMode,
@@ -32,17 +30,49 @@ from opensquilla.tools.types import (
 
 log = structlog.get_logger(__name__)
 
-# Once-per-session guard for the tool_description_overrides.applied runtime
-# event, keyed by (session_key, source, sha256 of the full key->text table):
-# to_tool_definitions runs multiple times per turn (debug logging, gateway
-# boot, session flush) and an unguarded emit would spam the event stream,
-# while a same-keys-different-wording table must still emit fresh. Keying by
-# session keeps attribution per-session in multi-session gateway processes
-# instead of suppressing every session after the first. Known skew: the event
-# fires at definition-build time, before filter_by_profile, so its tools/
-# params lists describe the override application, not the final model-visible
-# surface — a profile can still hide an overridden tool afterwards.
-_description_override_event_keys: set[tuple[str | None, str, str]] = set()
+DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "apply_patch",
+        "browser",
+        "cron",
+        "edit_file",
+        "exec_command",
+        "execute_code",
+        "git_diff",
+        "git_status",
+        "glob_search",
+        "grep_search",
+        "image",
+        "image_generate",
+        "video_generate",
+        "video_status",
+        "list_dir",
+        "open_workspace_preview",
+        "edit_widget",
+        "show_widget",
+        "pdf",
+        # ``process`` is the management half of ``exec_command``.  Keep it
+        # model-visible by default so a command that yields an execution
+        # handle can be observed or controlled in the same turn.
+        "process",
+        "publish_artifact",
+        "read_file",
+        "read_spreadsheet",
+        "write_file",
+        "sessions_send",
+        "sessions_spawn",
+        "sessions_yield",
+        "tool_search",
+        "web_discover",
+        "web_fetch",
+        "web_search",
+    }
+)
+
+
+# Kept registered for old RPC/in-process callers, but never projected into a
+# model tool catalog (including progressive disclosure through tool_search).
+_MODEL_HIDDEN_TOOL_NAMES: frozenset[str] = frozenset({"background_process"})
 
 ToolProfile = visibility_policy.ToolProfile
 _CHANNEL_DEFAULT_ALLOW = visibility_policy._CHANNEL_DEFAULT_ALLOW
@@ -57,6 +87,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, RegisteredTool] = {}
+        self._mcp_namespaces: dict[str, str] = {}
 
     def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
         if spec.name in self._tools:
@@ -73,6 +104,21 @@ class ToolRegistry:
         """Remove a tool by name. Returns True if it existed."""
         return self._tools.pop(name, None) is not None
 
+    def register_mcp_namespace(self, namespace: str, description: str) -> None:
+        """Record one connected MCP namespace for model-facing discovery."""
+
+        if namespace in self._mcp_namespaces:
+            raise ValueError(f"MCP namespace is already registered: {namespace}")
+        self._mcp_namespaces[namespace] = description.strip() or namespace
+
+    def unregister_mcp_namespace(self, namespace: str) -> bool:
+        """Remove disconnected MCP namespace metadata."""
+
+        return self._mcp_namespaces.pop(namespace, None) is not None
+
+    def mcp_namespaces(self) -> dict[str, str]:
+        return dict(sorted(self._mcp_namespaces.items()))
+
     def all_tools(self) -> list[RegisteredTool]:
         return list(self._tools.values())
 
@@ -82,10 +128,15 @@ class ToolRegistry:
         *,
         sort: bool = False,
     ) -> list[RegisteredTool]:
-        return visibility_policy.visible_registered_tools(self._tools.values(), ctx, sort=sort)
-
-    def _is_visible(self, rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
-        return visibility_policy.is_tool_visible(rt, ctx)
+        visible = visibility_policy.visible_registered_tools(
+            self._tools.values(),
+            ctx,
+            sort=sort,
+        )
+        router_cfg = getattr(ctx, "router_control_config", None) if ctx is not None else None
+        if router_cfg is not None and not bool(getattr(router_cfg, "enabled", False)):
+            visible = [tool for tool in visible if tool.spec.name != "router_control"]
+        return visible
 
     def _default_context(self) -> ToolContext:
         return visibility_policy.default_tool_context()
@@ -112,53 +163,34 @@ class ToolRegistry:
         )
 
     @staticmethod
-    def _schema_for(rt: RegisteredTool) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                name: value
-                for name, value in rt.spec.parameters.items()
-                if name not in rt.spec.runtime_only_arguments
-            },
-            "required": ToolRegistry._required_for(rt),
-        }
-
-    @staticmethod
     def _required_for(rt: RegisteredTool) -> list[str]:
-        return [
-            name
-            for name in rt.spec.required
-            if name not in rt.spec.runtime_only_arguments
-        ]
+        _, required, _ = tool_spec_schema_parts(rt.spec)
+        return [name for name in required if name not in rt.spec.runtime_only_arguments]
+
+    def _input_schema_for(self, rt: RegisteredTool, ctx: ToolContext) -> ToolInputSchema:
+        canonical = rt.spec.input_schema
+        if isinstance(canonical, Mapping):
+            schema = copy.deepcopy(dict(canonical))
+        elif rt.spec.parameters.get("type") == "object" and isinstance(
+            rt.spec.parameters.get("properties"), Mapping
+        ):
+            schema = copy.deepcopy(rt.spec.parameters)
+        else:
+            schema = {}
+        schema["type"] = "object"
+        schema["properties"] = self._parameters_for(rt, ctx)
+        schema["required"] = self._required_for(rt)
+        return ToolInputSchema.model_validate(schema)
 
     def _parameters_for(self, rt: RegisteredTool, ctx: ToolContext) -> dict[str, Any]:
-        raw_parameters = rt.spec.parameters
-        if (
-            raw_parameters.get("type") == "object"
-            and isinstance(raw_parameters.get("properties"), Mapping)
+        raw_parameters = rt.spec.input_schema or rt.spec.parameters
+        if raw_parameters.get("type") == "object" and isinstance(
+            raw_parameters.get("properties"), Mapping
         ):
             raw_parameters = raw_parameters["properties"]
         parameters = copy.deepcopy(raw_parameters)
         for name in rt.spec.runtime_only_arguments:
             parameters.pop(name, None)
-        overrides = getattr(ctx, "tool_description_overrides", None)
-        if overrides:
-            # Dotted keys ("tool.param") replace that parameter's description
-            # verbatim; whole-description keys are handled in _description_for.
-            # Exact tool-name match wins over the dotted split: plugin tool
-            # names may themselves be dotted, and a whole-description key for
-            # registered tool "a.b" must not also rewrite parameter "b" of
-            # tool "a" (same precedence as the event accounting).
-            for key, text in overrides.items():
-                if key in self._tools:
-                    continue
-                tool_name, sep, param = key.partition(".")
-                if (
-                    sep
-                    and tool_name == rt.spec.name
-                    and isinstance(parameters.get(param), dict)
-                ):
-                    parameters[param] = {**parameters[param], "description": text}
         if rt.spec.name != "router_control":
             return parameters
         router_cfg = getattr(ctx, "router_control_config", None)
@@ -277,14 +309,6 @@ class ToolRegistry:
             rewritten = rewritten or description != original
         if rewritten:
             description = cls._normalize_description(description)
-        overrides = getattr(ctx, "tool_description_overrides", None)
-        if overrides:
-            # Override text is verbatim-final and supersedes the conditional
-            # rewrites above; the functional scratch-dir suffix below is still
-            # appended so scratch routing keeps working.
-            override = overrides.get(rt.spec.name)
-            if isinstance(override, str) and override.strip():
-                description = override
         scratch_dir = getattr(ctx, "scratch_dir", None)
         if scratch_dir and rt.spec.name in {
             "exec_command",
@@ -299,82 +323,6 @@ class ToolRegistry:
             )
         return description
 
-    @staticmethod
-    def _record_description_override_event(
-        ctx: ToolContext,
-        visible_tools: list[RegisteredTool],
-    ) -> None:
-        overrides = getattr(ctx, "tool_description_overrides", None)
-        if not overrides:
-            return
-        source = getattr(ctx, "tool_description_overrides_source", None) or "config"
-        # Fingerprint keys AND values: repointing the source at a same-keyed
-        # table with different wording must produce a fresh event, and the
-        # fingerprint in the payload lets attribution tie a turn to the exact
-        # wording that was live.
-        overrides_sha256 = hashlib.sha256(
-            json.dumps(dict(sorted(overrides.items())), ensure_ascii=False).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        guard_key = (getattr(ctx, "session_key", None), source, overrides_sha256)
-        if guard_key in _description_override_event_keys:
-            return
-        parameters_by_tool: dict[str, Mapping[str, Any]] = {}
-        for rt in visible_tools:
-            raw = rt.spec.parameters
-            if raw.get("type") == "object" and isinstance(raw.get("properties"), Mapping):
-                raw = raw["properties"]
-            parameters_by_tool[rt.spec.name] = raw
-        applied_tools: list[str] = []
-        applied_params: list[str] = []
-        for key in overrides:
-            # Exact tool-name match first: plugin tool names may themselves be
-            # dotted, and _description_for applies whole-description overrides
-            # by exact name lookup.
-            if key in parameters_by_tool:
-                applied_tools.append(key)
-                continue
-            tool_name, sep, param = key.partition(".")
-            if sep and param in parameters_by_tool.get(tool_name, {}):
-                applied_params.append(key)
-        if not applied_tools and not applied_params:
-            return
-        event = {
-            "feature": "tool_description_overrides",
-            "name": "tool_description_overrides.applied",
-            "action": "rewrite_tool_descriptions",
-            "reason": "env_gate",
-            "source": source,
-            "overrides_sha256": overrides_sha256,
-            "tools": sorted(applied_tools),
-            "params": sorted(applied_params),
-            "requested": sorted(overrides),
-            "session_key": getattr(ctx, "session_key", None),
-            "agent_id": getattr(ctx, "agent_id", None),
-        }
-        on_runtime_event = getattr(ctx, "on_runtime_event", None)
-        if on_runtime_event is not None:
-            try:
-                on_runtime_event(event)
-            except Exception:  # noqa: BLE001 - attribution must not break tool export
-                # Guard NOT set: the next definition build retries emission.
-                return
-            _description_override_event_keys.add(guard_key)
-            return
-        # Definition builds run before the agent wires ctx.on_runtime_event, so
-        # fall back to the env-resolved sink to keep the event recorded.
-        from opensquilla.engine.runtime_events import append_runtime_event
-
-        try:
-            append_runtime_event(
-                os.environ.get("OPENSQUILLA_RUNTIME_EVENTS_PATH") or None,
-                event,
-            )
-        except Exception:  # noqa: BLE001 - attribution must not break tool export
-            return
-        _description_override_event_keys.add(guard_key)
-
     def to_tool_definitions(self, ctx: ToolContext | None = None) -> list[ToolDefinition]:
         """Export tools as MCP-compatible ToolDefinition list.
 
@@ -387,7 +335,6 @@ class ToolRegistry:
         active_ctx = ctx if ctx is not None else self._default_context()
         visible_tools = self._iter_visible_tools(active_ctx, sort=True)
         visible_tool_names = frozenset(rt.spec.name for rt in visible_tools)
-        self._record_description_override_event(active_ctx, visible_tools)
         definitions: list[ToolDefinition] = []
         for rt in visible_tools:
             definition = ToolDefinition(
@@ -397,11 +344,7 @@ class ToolRegistry:
                     active_ctx,
                     visible_tool_names,
                 ),
-                input_schema=ToolInputSchema(
-                    type="object",
-                    properties=self._parameters_for(rt, active_ctx),
-                    required=self._required_for(rt),
-                ),
+                input_schema=self._input_schema_for(rt, active_ctx),
                 execution_timeout_seconds=rt.spec.execution_timeout_seconds,
                 execution_timeout_argument=rt.spec.execution_timeout_argument,
                 execution_timeout_padding=rt.spec.execution_timeout_padding,
@@ -419,6 +362,142 @@ class ToolRegistry:
             definitions.append(definition)
         return definitions
 
+    def to_model_tool_definitions(
+        self,
+        authorized: list[ToolDefinition],
+        ctx: ToolContext | None = None,
+    ) -> list[ToolDefinition]:
+        """Project an authorized catalog into the model-visible surface.
+
+        The stable built-in baseline is followed by every authorized MCP tool.
+        Tools disclosed by ``tool_search`` are appended by the running Agent on
+        the next provider step, so providers only need ordinary top-level tool
+        calling support.
+        """
+
+        authorized = [self._model_definition_for(definition) for definition in authorized]
+        authorized_by_name = {definition.name: definition for definition in authorized}
+        # Embedded/custom registries may intentionally omit the discovery
+        # gateway. Hiding their complete surface would leave the model no path
+        # to discover a tool, so they keep the legacy full surface. A registry
+        # that contains tool_search but denies it for this turn must *not* fail
+        # open and expose every other authorized tool.
+        if "tool_search" not in authorized_by_name and self.get("tool_search") is None:
+            if ctx is not None:
+                from opensquilla.tools.search import ToolSearchIndex
+
+                ctx.authorized_tool_names = frozenset(authorized_by_name)
+                ctx.tool_search_index = ToolSearchIndex.from_definitions(
+                    [
+                        definition
+                        for definition in authorized
+                        if definition.name not in _MODEL_HIDDEN_TOOL_NAMES
+                    ]
+                )
+                ctx.tool_search_namespaces = {}
+            return [
+                definition
+                for definition in authorized
+                if definition.name not in _MODEL_HIDDEN_TOOL_NAMES
+            ]
+        selected = set(DEFAULT_MODEL_TOOL_NAMES)
+        selected.difference_update(_MODEL_HIDDEN_TOOL_NAMES)
+        if ctx is not None:
+            selected.update(ctx.disclosed_tool_names)
+            selected.update(ctx.surfaced_tools or set())
+            ctx.authorized_tool_names = frozenset(authorized_by_name)
+            from opensquilla.tools.search import ToolSearchIndex, tool_namespace
+
+            ctx.tool_search_index = ToolSearchIndex.from_definitions(
+                [
+                    definition
+                    for definition in authorized
+                    if definition.name not in _MODEL_HIDDEN_TOOL_NAMES
+                ]
+            )
+            authorized_namespaces = {
+                tool_namespace(name)
+                for name in authorized_by_name
+                if tool_namespace(name) != "builtin"
+            }
+            if ctx.is_owner:
+                # A connected server with zero tools is still a connected MCP
+                # endpoint and must remain discoverable to its owner.
+                authorized_namespaces.update(self._mcp_namespaces)
+            ctx.tool_search_namespaces = {
+                namespace: description
+                for namespace, description in self.mcp_namespaces().items()
+                if namespace in authorized_namespaces
+            }
+
+        # Connected MCP tools use the same already-filtered authorization
+        # catalog as built-ins. Keep them after the direct built-in surface so
+        # ordering is deterministic and later tool_search hits can be appended.
+        selected.update(name for name in authorized_by_name if name.startswith("mcp__"))
+        definitions = [
+            definition.model_copy(deep=True)
+            for name, definition in sorted(authorized_by_name.items())
+            if name in selected
+            and name not in _MODEL_HIDDEN_TOOL_NAMES
+            and not name.startswith("mcp__")
+        ]
+        definitions.extend(
+            definition.model_copy(deep=True)
+            for name, definition in sorted(authorized_by_name.items())
+            if name in selected
+            and name not in _MODEL_HIDDEN_TOOL_NAMES
+            and name.startswith("mcp__")
+        )
+        tool_search_definition = next(
+            (definition for definition in definitions if definition.name == "tool_search"),
+            None,
+        )
+        if tool_search_definition is not None:
+            namespaces = ctx.tool_search_namespaces if ctx is not None else {}
+            if namespaces:
+                summary = "; ".join(
+                    f"{namespace}: {description}" for namespace, description in namespaces.items()
+                )
+            else:
+                summary = "No MCP servers are connected."
+            tool_search_definition.description = (
+                f"{tool_search_definition.description} Connected MCP namespaces: {summary}"
+            )
+            namespace_schema = tool_search_definition.input_schema.properties.get("namespace")
+            if isinstance(namespace_schema, dict):
+                namespace_schema["enum"] = ["builtin", *namespaces]
+        return definitions
+
+    @staticmethod
+    def _model_definition_for(definition: ToolDefinition) -> ToolDefinition:
+        if definition.name != "web_search":
+            return definition
+
+        model_definition = definition.model_copy(deep=True)
+        provider_schema = model_definition.input_schema.properties.get("provider")
+        if not isinstance(provider_schema, dict):
+            return model_definition
+        provider_ids = provider_schema.get("enum")
+        if not isinstance(provider_ids, list):
+            return model_definition
+
+        from opensquilla.search.runtime_config import get_resolved_search_runtime
+
+        runtime = get_resolved_search_runtime()
+        provider_schema["enum"] = [
+            provider_id
+            for provider_id in provider_ids
+            if isinstance(provider_id, str)
+            and (
+                provider_id == "auto"
+                or (
+                    (provider_config := runtime.providers.get(provider_id)) is not None
+                    and provider_config.available
+                )
+            )
+        ]
+        return model_definition
+
     async def list_tools(
         self,
         profile: str | None = None,
@@ -431,8 +510,7 @@ class ToolRegistry:
         is_owner: bool = True,
     ) -> list[dict[str, Any]]:
         has_runtime_context = any(
-            value is not None
-            for value in (session_key, agent_id, caller_kind, interaction_mode)
+            value is not None for value in (session_key, agent_id, caller_kind, interaction_mode)
         )
         if has_runtime_context:
             ctx = self._effective_context(
@@ -460,7 +538,13 @@ class ToolRegistry:
                     "properties": self._parameters_for(rt, ctx),
                     "required": self._required_for(rt),
                 },
-                "source": "plugin" if "." in rt.spec.name else "builtin",
+                "source": (
+                    "mcp"
+                    if rt.spec.name.startswith("mcp__")
+                    else "plugin"
+                    if "." in rt.spec.name
+                    else "builtin"
+                ),
                 "enabled": True,
                 "presentation": resolve_tool_presentation(rt.spec).to_payload(),
             }
@@ -507,35 +591,6 @@ _default_registry = ToolRegistry()
 
 def get_default_registry() -> ToolRegistry:
     return _default_registry
-
-
-def _tool_rpc_params(params: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    from opensquilla.tools.rpc_payload import tool_rpc_params
-
-    return tool_rpc_params(params)
-
-
-def _tool_surface_capabilities_for_runtime(
-    *,
-    tool_surface_capabilities: ToolSurfaceCapabilities | None = None,
-    session_manager: object | None = None,
-    task_runtime: object | None = None,
-    scheduler: object | None = None,
-    gateway_config: object | None = None,
-    channel_manager: object | None = None,
-    originating_envelope: object | None = None,
-) -> ToolSurfaceCapabilities:
-    from opensquilla.tools.rpc_payload import tool_surface_capabilities_for_runtime
-
-    return tool_surface_capabilities_for_runtime(
-        tool_surface_capabilities=tool_surface_capabilities,
-        session_manager=session_manager,
-        task_runtime=task_runtime,
-        scheduler=scheduler,
-        gateway_config=gateway_config,
-        channel_manager=channel_manager,
-        originating_envelope=originating_envelope,
-    )
 
 
 async def tools_catalog_payload(
@@ -602,7 +657,7 @@ def tool(
     params: dict[str, Any] | None = None,
     required: list[str] | None = None,
     owner_only: bool = False,
-    exposed_by_default: bool = True,
+    default_access: Literal["allow", "deny"] | bool = "allow",
     execution_timeout_seconds: float | None = None,
     execution_timeout_argument: str | None = None,
     execution_timeout_padding: float = 0.0,
@@ -617,6 +672,7 @@ def tool(
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
     allow_string_item_schema_projection: bool = False,
     presentation_category: ToolPresentationCategory | None = None,
+    exposed_by_default: bool | None = None,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -634,6 +690,7 @@ def tool(
             required=required or [],
             runtime_only_arguments=frozenset(runtime_only_arguments),
             owner_only=owner_only,
+            default_access=default_access,
             exposed_by_default=exposed_by_default,
             execution_timeout_seconds=execution_timeout_seconds,
             execution_timeout_argument=execution_timeout_argument,
@@ -670,11 +727,7 @@ def tool(
             except TypeError:
                 arguments = dict(kwargs)
             ctx = current_tool_context.get()
-            workspace = (
-                Path(ctx.workspace_dir)
-                if ctx is not None and ctx.workspace_dir
-                else None
-            )
+            workspace = Path(ctx.workspace_dir) if ctx is not None and ctx.workspace_dir else None
             run_mode = getattr(ctx, "run_mode", None)
             guard = await prepare_tool_operation_guard(
                 spec.sandbox,

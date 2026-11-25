@@ -44,6 +44,7 @@ from opensquilla.skills.hub.lockfile import (
 )
 from opensquilla.skills.hub.source import SourceResolution
 from opensquilla.skills.hub.transaction import inspect_pending_skill_transaction
+from opensquilla.skills.hub.tree_io import MAX_TREE_ENTRIES, validate_entry_count
 from opensquilla.skills.manifest import SkillCompileProfile, compile_skill_manifest
 from opensquilla.skills.types import SkillLayer, SkillSpec
 
@@ -64,7 +65,7 @@ _RESERVED_INTERNAL_NAMES = frozenset(
         "__macosx",
     }
 )
-_MAX_TREE_ENTRIES = 2_048
+_MAX_TREE_ENTRIES = MAX_TREE_ENTRIES
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _DEGRADED_CAPABILITIES_KEY = "degraded_capabilities"
 _SCOPED_TOOL_PERMISSIONS_CAPABILITY = "scoped_tool_permissions"
@@ -815,9 +816,15 @@ class SkillDoctor:
             )
 
         if winner_is_record:
+            from opensquilla.skills.catalog_policy import is_user_invocable_ordinary
+
             selection = (
                 SkillSelectionState.HIDDEN
                 if bool(getattr(spec, "disable_model_invocation", False))
+                and spec is not None
+                and not is_user_invocable_ordinary(
+                    spec,
+                )
                 else SkillSelectionState.ACTIVE
             )
         elif candidate is not None or winner is not None:
@@ -1116,9 +1123,9 @@ def _compatibility_observation(
         requires = spec.metadata.requires if spec.metadata and spec.metadata.requires else None
         if requires and requires.config:
             compatibility = SkillCompatibilityState.DEGRADED
-        is_community = entry is not None and entry.source in {"clawhub", "github"}
+        is_community = entry is not None and entry.source in {"clawhub", "skillhub", "github"}
         unsupported_execution = bool(
-            spec.entrypoint or spec.composition_raw or spec.kind not in {"", "skill"}
+            spec.kind not in {"", "skill"}
         )
         if is_community and unsupported_execution:
             compatibility = SkillCompatibilityState.UNSUPPORTED
@@ -1340,7 +1347,9 @@ def _scan_static_tree(skill_dir: Path) -> list[SkillDiagnostic]:
                     )
                 )
                 continue
-            if entry_count > _MAX_TREE_ENTRIES:
+            try:
+                validate_entry_count(entry_count, _MAX_TREE_ENTRIES)
+            except ValueError:
                 diagnostics.append(
                     _diagnostic(
                         "RESOURCE_ENTRY_LIMIT_EXCEEDED",

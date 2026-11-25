@@ -4,8 +4,22 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
+from opensquilla.application.conversation_ancillary import (
+    UsageCostResult,
+    UsageQuery,
+    UsageQueryResult,
+    UsageReportingPort,
+    UsageStatusResult,
+)
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -13,16 +27,22 @@ from opensquilla.gateway.rpc import (
     get_dispatcher,
 )
 from opensquilla.gateway.session_services import get_session_storage
-from opensquilla.gateway.usage_query import UsageQueryValidationError, query_usage_ledger
+from opensquilla.gateway.usage_query import (
+    UsageQuerySnapshotBusyError,
+    UsageQueryValidationError,
+    query_usage_ledger,
+)
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
 from opensquilla.session.cost_rollup import rollup_cost_source
+from opensquilla.session.storage import StorageBusyError
 from opensquilla.session.tokenizer import estimate_tokens
 
 _d = get_dispatcher()
 _CONTEXT_WARNING_RATIO = 0.85
+_CONTEXT_ESTIMATE_MAX_ENTRIES = 128
 
 
 def _now_ms() -> int:
@@ -118,21 +138,99 @@ async def _context_status(
     compaction_count = _positive_int(_field(source, "compaction_count")) or 0
     context_tokens = persisted_context_tokens
     token_source = "session_context_tokens" if context_tokens is not None else "unavailable"
+    estimate_complete: bool | None = None
+    estimate_entry_count: int | None = None
+    estimate_unknown_entries: int | None = None
     should_estimate_transcript = (
         allow_transcript_estimate
         and ctx.session_manager is not None
         and (context_tokens is None or compaction_count > 0)
     )
     if should_estimate_transcript:
-        get_transcript = getattr(ctx.session_manager, "get_transcript", None)
-        if callable(get_transcript):
+        # Prefer a scalar metadata aggregate.  Calling get_transcript() here
+        # used to materialize every body (including multi-MiB/legacy rows) on
+        # the usage RPC's control path, and compaction made that path run more
+        # often.  A busy/failed metadata read is explicitly unavailable; it
+        # must never trigger a second full-body retry.
+        get_token_metadata = getattr(
+            ctx.session_manager, "get_transcript_token_metadata", None
+        )
+        metadata_attempted = callable(get_token_metadata)
+        if callable(get_token_metadata):
             try:
-                transcript = await get_transcript(session_key)
-            except (KeyError, AttributeError, NotImplementedError):
-                transcript = None
-            if transcript is not None:
-                context_tokens = sum(_transcript_entry_tokens(entry) for entry in transcript)
-                token_source = "transcript_estimate"
+                metadata = await get_token_metadata(session_key)
+            except (
+                KeyError,
+                AttributeError,
+                NotImplementedError,
+                StorageBusyError,
+                TimeoutError,
+            ):
+                metadata = None
+            if isinstance(metadata, Mapping):
+                estimate_entry_count = _positive_int(metadata.get("entry_count")) or 0
+                estimate_unknown_entries = (
+                    _positive_int(metadata.get("unknown_entries")) or 0
+                )
+                known_tokens = _positive_int(metadata.get("known_tokens")) or 0
+                if known_tokens or estimate_unknown_entries == 0:
+                    context_tokens = known_tokens
+                    estimate_complete = estimate_unknown_entries == 0
+                    token_source = (
+                        "transcript_metadata"
+                        if estimate_complete
+                        else "transcript_metadata_partial"
+                    )
+                else:
+                    # A compacted row may still carry an old persisted
+                    # context_tokens value.  If the active transcript has no
+                    # usable token metadata, retaining that value would
+                    # present stale context pressure as current.  Fail closed
+                    # to the existing null/unavailable wire state.
+                    context_tokens = None
+                    token_source = "unavailable"
+            else:
+                # Storage busy/timeout or an unavailable metadata adapter is
+                # an explicit control-plane unknown; never reuse a stale
+                # persisted estimate and never retry with full transcript
+                # materialization.
+                context_tokens = None
+                token_source = "unavailable"
+        if not metadata_attempted:
+            # Compatibility seam for old test doubles/adapters.  The shipped
+            # SessionManager implements the metadata method above, so the
+            # production path never enters this fallback.  Keep the legacy
+            # call only when an adapter does not expose the new method yet.
+            get_transcript = getattr(ctx.session_manager, "get_transcript", None)
+            if callable(get_transcript):
+                try:
+                    transcript = await get_transcript(
+                        session_key,
+                        limit=_CONTEXT_ESTIMATE_MAX_ENTRIES,
+                        content_mode="bounded",
+                    )
+                except TypeError:
+                    # Older adapters do not accept bounded-read keywords.  We
+                    # retain their historical behavior for compatibility;
+                    # this branch is intentionally unreachable for the
+                    # bundled SessionManager.
+                    transcript = await get_transcript(session_key)
+                except (
+                    KeyError,
+                    AttributeError,
+                    NotImplementedError,
+                    StorageBusyError,
+                    TimeoutError,
+                ):
+                    transcript = None
+                if transcript is not None:
+                    context_tokens = sum(
+                        _transcript_entry_tokens(entry) for entry in transcript
+                    )
+                    token_source = "transcript_estimate"
+                    estimate_entry_count = len(transcript)
+                    estimate_complete = len(transcript) < _CONTEXT_ESTIMATE_MAX_ENTRIES
+                    estimate_unknown_entries = 0
     if context_tokens is None:
         return None
 
@@ -158,6 +256,12 @@ async def _context_status(
         "compaction_count": compaction_count,
         "token_source": token_source,
         "window_source": window_source,
+        "contextEstimateComplete": estimate_complete,
+        "contextEstimateEntryCount": estimate_entry_count,
+        "contextEstimateUnknownEntries": estimate_unknown_entries,
+        "context_estimate_complete": estimate_complete,
+        "context_estimate_entry_count": estimate_entry_count,
+        "context_estimate_unknown_entries": estimate_unknown_entries,
     }
 
 
@@ -609,16 +713,26 @@ def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int | float]:
     }
 
 
-@_d.method("usage.status", scope="operator.read")
-async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+def _usage_query_value(value: UsageQuery | dict | None) -> UsageQuery:
+    if isinstance(value, UsageQuery):
+        return value
+    raw = value if isinstance(value, Mapping) else {}
+    raw_session_key = raw.get("sessionKey") or raw.get("session_key") or raw.get("key")
+    session_key = (
+        raw_session_key.strip()
+        if isinstance(raw_session_key, str) and raw_session_key.strip()
+        else None
+    )
+    return UsageQuery(session_key=session_key, filters=raw)
+
+
+async def _usage_status(
+    value: UsageQuery | dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    query = _usage_query_value(value)
     now_ms = _now_ms()
-    requested_session_key = None
-    if isinstance(params, Mapping):
-        raw_requested_session_key = (
-            params.get("sessionKey") or params.get("session_key") or params.get("key")
-        )
-        if isinstance(raw_requested_session_key, str) and raw_requested_session_key.strip():
-            requested_session_key = raw_requested_session_key.strip()
+    requested_session_key = query.session_key
     tracker_rows = _tracker_rows(
         ctx,
         now_ms=now_ms,
@@ -724,8 +838,10 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
         }
 
 
-@_d.method("usage.query", scope="operator.read")
-async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _query_usage(
+    value: UsageQuery | dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
     """Aggregate timestamped usage events for one explicit calendar range.
 
     This is intentionally additive.  ``usage.status`` and ``usage.cost`` keep
@@ -739,13 +855,19 @@ async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str,
     if storage is None or not hasattr(storage, "query_usage_events"):
         raise RpcUnavailableError("Durable usage accounting is not available")
     try:
-        return await query_usage_ledger(storage, params)
+        query = _usage_query_value(value)
+        return await query_usage_ledger(storage, dict(query.filters or {}))
     except UsageQueryValidationError as exc:
         raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
+    except UsageQuerySnapshotBusyError as exc:
+        raise RpcUnavailableError(str(exc)) from exc
 
 
-@_d.method("usage.cost", scope="operator.read")
-async def _handle_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _usage_cost(
+    value: UsageQuery | dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del value
     now_ms = _now_ms()
     tracker_rows = _tracker_rows(ctx, now_ms=now_ms)
 
@@ -794,3 +916,59 @@ async def _handle_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, 
             "breakdown": tracker_rows,
             "totalCostUsd": round(float(_usage_totals(tracker_rows)["cost"]), 6),
         }
+
+
+_read_usage_status = _usage_status
+_read_usage_cost = _usage_cost
+
+
+class _GatewayUsageReportingPort(UsageReportingPort):
+    """Terminate the usage Port at the existing ledger/tracker implementation."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    async def status(self, query: UsageQuery) -> UsageStatusResult:
+        return cast(UsageStatusResult, await _usage_status(query, self._context))
+
+    async def query(self, query: UsageQuery) -> UsageQueryResult:
+        return cast(UsageQueryResult, await _query_usage(query, self._context))
+
+    async def cost_breakdown(self, query: UsageQuery) -> UsageCostResult:
+        return cast(UsageCostResult, await _usage_cost(query, self._context))
+
+
+def _usage_reporting_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:
+    return GatewayConversationAncillaryAdapter(usage=_GatewayUsageReportingPort(ctx))
+
+
+async def _handle_usage_status_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _usage_reporting_adapter(ctx).usage_status(params)
+
+
+async def _handle_usage_query_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _usage_reporting_adapter(ctx).usage_query(params)
+
+
+async def _handle_usage_cost_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _usage_reporting_adapter(ctx).usage_cost(params)
+
+
+for _usage_method, _usage_implementation in (
+    ("usage.status", _handle_usage_status_contract),
+    ("usage.query", _handle_usage_query_contract),
+    ("usage.cost", _handle_usage_cost_contract),
+):
+    register_conversation_ancillary_contract(
+        _d,
+        _usage_method,
+        _usage_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )

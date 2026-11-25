@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.paths import native_io_path
 from opensquilla.recovery.atomic import native_move_no_replace, reparse_tag_redirects
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.engine import profile_replacement_transaction_unfinished
@@ -331,7 +332,7 @@ def _entry_type(value: os.stat_result) -> str:
 
 def _manifest(path: Path) -> tuple[_ManifestEntry, ...]:
     try:
-        root_stat = path.lstat()
+        root_stat = native_io_path(path).lstat()
     except (FileNotFoundError, NotADirectoryError):
         return ()
     except OSError as exc:
@@ -362,22 +363,26 @@ def _manifest(path: Path) -> tuple[_ManifestEntry, ...]:
         if entry_type != "directory":
             return
         try:
-            entries = sorted(os.scandir(candidate), key=lambda item: item.name)
+            # Quarantine can push a previously short directory past MAX_PATH.
+            # Keep native spellings at the I/O boundary, not in logical paths.
+            with os.scandir(native_io_path(candidate)) as directory:
+                entries = sorted(directory, key=lambda item: item.name)
         except OSError as exc:
             raise CleanupBlockedError(
                 f"cleanup directory cannot be enumerated: {candidate}",
                 stable_code="cleanup_path_unreadable",
             ) from exc
         for entry in entries:
+            child = candidate / entry.name
             try:
                 child_stat = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise CleanupBlockedError(
-                    f"cleanup entry cannot be inspected: {entry.path}",
+                    f"cleanup entry cannot be inspected: {child}",
                     stable_code="cleanup_path_unreadable",
                 ) from exc
             child_relative = entry.name if relative == "." else f"{relative}/{entry.name}"
-            visit(Path(entry.path), child_relative, child_stat)
+            visit(child, child_relative, child_stat)
 
     visit(path, ".", root_stat)
     return tuple(result)
@@ -1038,8 +1043,11 @@ def cleanup_inspect(
 
 
 def _remove_no_follow(path: Path) -> None:
+    # Quarantine adds a transaction suffix to the root. Descendants that fit
+    # MAX_PATH before the move can therefore require an extended Windows path.
+    io_path = native_io_path(path)
     try:
-        value = path.lstat()
+        value = io_path.lstat()
     except (FileNotFoundError, NotADirectoryError):
         return
     entry_type = _entry_type(value)
@@ -1047,17 +1055,17 @@ def _remove_no_follow(path: Path) -> None:
         raise OSError(f"refusing to delete special file: {path}")
     if entry_type == "link":
         if stat.S_ISDIR(value.st_mode):
-            os.rmdir(path)
+            os.rmdir(io_path)
         else:
-            path.unlink()
+            io_path.unlink()
         return
     if entry_type == "file":
-        path.unlink()
+        io_path.unlink()
         return
     # CPython uses its descriptor-based, symlink-attack-resistant rmtree on
     # capable platforms and has explicit Windows junction protection. The root
     # itself was lstat-verified as a real directory immediately above.
-    shutil.rmtree(path)
+    shutil.rmtree(io_path)
 
 
 def _current_item(planned: _PlannedItem) -> CleanupItem:

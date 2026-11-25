@@ -28,16 +28,30 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
-from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .protocol import (
+    ProviderConnectionConfig,
+    ProviderMetadata,
+    ProviderModelListingResponseError,
+)
+from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -50,8 +64,10 @@ from .types import (
     Message,
     ModelInfo,
     ProviderFinalRequestProjection,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolUseStartEvent,
 )
@@ -66,11 +82,7 @@ def _responses_tool(tool: ToolDefinition) -> dict[str, Any]:
         "type": "function",
         "name": tool.name,
         "description": tool.description,
-        "parameters": {
-            "type": tool.input_schema.type,
-            "properties": tool.input_schema.properties,
-            "required": tool.input_schema.required,
-        },
+        "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 
@@ -306,7 +318,8 @@ class OpenAIResponsesProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="openai_responses",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -372,7 +385,8 @@ class OpenAIResponsesProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_responses",
-            proof_budget=config.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, config),
+            token_budget=provider_request_token_budget(payload, config),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=config.active_user_message_index,
@@ -398,6 +412,7 @@ class OpenAIResponsesProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, config),
                 projection_adapter="openai_responses",
                 status_projection_mode="content_envelope",
                 envelope_shape=RESPONSES_REQUEST_ENVELOPE,
@@ -441,22 +456,28 @@ class OpenAIResponsesProvider:
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
             return
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
             return
 
         if response.status_code != 200:
@@ -483,6 +504,8 @@ class OpenAIResponsesProvider:
             yield ErrorEvent(
                 message=message,
                 code=str(response.status_code),
+                http_status=safe_http_status(response.status_code),
+                provider_code=structured_provider_error_code(response.text),
                 retry_after_s=retry_after_from_headers(
                     response.status_code,
                     getattr(response, "headers", None),
@@ -561,6 +584,10 @@ class OpenAIResponsesProvider:
         recognized_tools_acc = ToolStreamAccumulator()
         validated_message_text: dict[int, list[str]] = {}
         invalid_tool_call_count = 0
+        rejected_argument_indexes: set[int] = set()
+        rejection_call_identities: dict[int, tuple[str, str]] = {}
+        rejection_identity_keys: set[str] = set()
+        rejection_protocol_invalid = False
         invalid_output_shape = False
         for item_index, item in enumerate(output_items):
             if not isinstance(item, dict):
@@ -651,8 +678,14 @@ class OpenAIResponsesProvider:
                 continue
             if not response_completed:
                 continue
+            if item.get("status") not in (None, "completed"):
+                rejection_protocol_invalid = True
             raw_call_id = item.get("call_id")
             raw_item_id = item.get("id")
+            if raw_call_id is None and raw_item_id is None:
+                # A locally generated identity cannot establish the provider's
+                # complete rejected batch, even if normal compatibility allows it.
+                rejection_protocol_invalid = True
             if (
                 raw_call_id is not None
                 and (not isinstance(raw_call_id, str) or not raw_call_id.strip())
@@ -668,6 +701,9 @@ class OpenAIResponsesProvider:
                 continue
             call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
             key = raw_item_id or call_id
+            if key in rejection_identity_keys:
+                rejection_protocol_invalid = True
+            rejection_identity_keys.add(key)
             try:
                 recognized_tool_starts[item_index] = [
                     event
@@ -684,11 +720,22 @@ class OpenAIResponsesProvider:
                 # exposing a synthetic lifecycle.
                 invalid_tool_call_count += 1
                 continue
+            rejection_call_identities[item_index] = (call_id, tool_name)
             raw_arguments = item.get("arguments")
             if raw_arguments is None:
+                rejection_protocol_invalid = True
                 raw_arguments = ""
             if not isinstance(raw_arguments, str):
                 invalid_tool_call_count += 1
+                rejection_protocol_invalid = True
+                continue
+            try:
+                # Enforce raw argument and batch bounds before a rejection
+                # proof; malformed JSON must not bypass the stream limits.
+                recognized_tools_acc.append(key, raw_arguments)
+            except ToolStreamProtocolError:
+                invalid_tool_call_count += 1
+                rejection_protocol_invalid = True
                 continue
             try:
                 arguments = (
@@ -708,14 +755,17 @@ class OpenAIResponsesProvider:
                 ValueError,
             ):
                 invalid_tool_call_count += 1
+                rejected_argument_indexes.add(item_index)
                 continue
             if not isinstance(arguments, dict):
                 invalid_tool_call_count += 1
+                rejected_argument_indexes.add(item_index)
                 continue
             try:
                 json.dumps(arguments, allow_nan=False)
             except (RecursionError, TypeError, ValueError):
                 invalid_tool_call_count += 1
+                rejected_argument_indexes.add(item_index)
                 continue
             parsed_tool_arguments[item_index] = (
                 call_id,
@@ -751,7 +801,47 @@ class OpenAIResponsesProvider:
                     yield TextDeltaEvent(text=text)
                 for start_event in recognized_tool_starts.get(item_index, []):
                     yield start_event
-            yield ErrorEvent(message=message, code="incomplete_tool_call")
+            if (
+                rejected_argument_indexes
+                and len(rejected_argument_indexes) == invalid_tool_call_count
+                and not rejection_protocol_invalid
+                and data.get("incomplete_details") is None
+            ):
+                input_tokens, output_tokens, reasoning_tokens, cached_tokens = _usage_fields(
+                    data.get("usage")
+                )
+                yield rejected_tool_arguments_error(
+                    ToolArgumentRejection(
+                        calls=tuple(
+                            RejectedToolArguments(
+                                tool_call_id=call_id,
+                                tool_name=name,
+                                reason=(
+                                    "invalid_json" if index in rejected_argument_indexes
+                                    else "batch_not_executed"
+                                ),
+                            )
+                            for index, (call_id, name) in rejection_call_identities.items()
+                        ),
+                        terminal_reason="completed",
+                    ),
+                    usage=(
+                        DoneEvent(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                            cached_tokens=cached_tokens,
+                            model=data.get("model") or self._model,
+                            provider=self.provider_id,
+                        )
+                        if isinstance(data.get("usage"), dict) and any(
+                            type(data["usage"].get(key)) is int and data["usage"][key] >= 0
+                            for key in ("input_tokens", "output_tokens")
+                        ) else None
+                    ),
+                )
+            else:
+                yield ErrorEvent(message=message, code="incomplete_tool_call")
             return
 
         tools_acc = ToolStreamAccumulator()
@@ -959,7 +1049,18 @@ class OpenAIResponsesProvider:
             data = response.json()
         except json.JSONDecodeError:
             if raise_on_error:
-                raise
+                raise ProviderModelListingResponseError(
+                    "Provider model catalog response could not be parsed",
+                    status_code=response.status_code,
+                ) from None
+            return []
+
+        if not isinstance(data, dict) or not isinstance(data.get("data", []), list):
+            if raise_on_error:
+                raise ProviderModelListingResponseError(
+                    "Provider model catalog response had an unexpected shape",
+                    status_code=response.status_code,
+                )
             return []
 
         models: list[ModelInfo] = []
@@ -1003,7 +1104,8 @@ class OpenAIResponsesProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_responses_compact",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=cfg.active_user_message_index,
@@ -1017,6 +1119,7 @@ class OpenAIResponsesProvider:
         payload = budget_decision.payload or payload
         prove_provider_payload_from_env(
             payload,
+            token_budget=provider_request_token_budget(payload, cfg),
             projection_adapter="openai_responses_compact",
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,

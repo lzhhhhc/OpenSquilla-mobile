@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, get_args, get_origin
 
 import typer
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from rich.markup import escape
 from rich.table import Table
 
@@ -66,16 +66,42 @@ def config_set(
     config_path: Path | None = typer.Option(None, "--config", help="Persist to config path."),
 ) -> None:
     """Set a configuration value (env-var backed, prints export command)."""
+    from opensquilla.cli.port_validation import (
+        GATEWAY_PORT_MESSAGE,
+        has_gateway_port_error,
+        validate_gateway_port,
+    )
     from opensquilla.gateway.config import GatewayConfig
+
+    parsed_value = _parse_config_value(value)
+    if key == "port":
+        try:
+            validate_gateway_port(parsed_value)
+        except ValidationError:
+            console.print(f"[red]Invalid value for port:[/red] {GATEWAY_PORT_MESSAGE}")
+            raise typer.Exit(2) from None
 
     if config_path is not None:
         from opensquilla.onboarding.config_store import load_config, persist_config
 
-        cfg = load_config(config_path)
+        try:
+            cfg = load_config(config_path, persist_migrations=False)
+        except ValidationError as exc:
+            if not has_gateway_port_error(exc):
+                raise
+            console.print(f"[red]Invalid value for port:[/red] {GATEWAY_PORT_MESSAGE}")
+            raise typer.Exit(2) from None
         data = cfg.to_toml_dict()
-        if not _set_key(data, key, _parse_config_value(value)):
+        if not _set_key(data, key, parsed_value):
             console.print(f"[red]Key not found: {escape(key)}[/red]")
             raise typer.Exit(1)
+        if (
+            "tiers" not in cfg.squilla_router.model_fields_set
+            and key not in {"squilla_router", "squilla_router.tiers"}
+            and not key.startswith("squilla_router.tiers.")
+        ):
+            # A full dump must not promote implicit defaults into a saved ladder.
+            data["squilla_router"].pop("tiers", None)
         try:
             updated = GatewayConfig.model_validate(data)
             updated._mark_env_absorbed_secrets(data)
@@ -85,8 +111,22 @@ def config_set(
         from opensquilla.gateway.model_routing import (
             reconcile_model_routing_write,
         )
+        from opensquilla.onboarding.image_generation_state import (
+            preserve_image_routing_provenance,
+        )
 
+        preserve_image_routing_provenance(cfg, updated, {key})
+        if key in {"image_generation.primary", "image_generation.binding"}:
+            # A default-equal image route is still an explicit operator choice.
+            updated.mark_force_persist(key)
         reconcile_model_routing_write(updated, {key}, previous=cfg)
+        # Canonical mode reconciliation can enable Router after model validation.
+        # Resolve the same provider defaults a reload would apply before checking
+        # execution dependencies; explicit custom ladders remain untouched.
+        updated.initialize_router_profile_defaults()
+        from opensquilla.onboarding.router_policy import validate_router_reactivation
+
+        validate_router_reactivation(cfg, updated, explicit_paths={key})
         persist = persist_config(updated, path=config_path, restart_required=True)
         console.print(f"[{ACCENT_MARKUP}]Config:[/] {persist.path}")
         if persist.backup_path:

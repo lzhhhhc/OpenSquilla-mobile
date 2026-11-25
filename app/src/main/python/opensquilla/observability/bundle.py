@@ -6,7 +6,8 @@ migration path rewrites the user's config file; the doctor collector runs
 against a throwaway temp copy of the config for the same reason). Best-effort
 per artifact:
 a missing file or unreadable DB becomes a manifest ``collection_errors``
-entry, never a failed bundle. Every text artifact passes ``scrub_text``.
+entry. JSON artifacts are scrubbed as objects and validated before writing;
+free text passes ``scrub_text``. An invalid manifest fails the bundle.
 
 Excluded always: desktop-credential.json, .env files, raw decision mirrors.
 Excluded at the default tier: turn-calls-*.jsonl (raw prompt/response capture)
@@ -36,7 +37,8 @@ from urllib.parse import quote
 import structlog
 
 from opensquilla import __version__
-from opensquilla.observability.redact import scrub_text
+from opensquilla.observability.log_privacy import scrub_log_artifact
+from opensquilla.observability.redact import scrub_json, scrub_text
 from opensquilla.observability.turn_call_log import LOG_DIR_ENV
 from opensquilla.paths import default_opensquilla_home
 
@@ -66,11 +68,77 @@ def _is_excluded(entry_name: str) -> bool:
     )
 
 
-def _write_text(archive: zipfile.ZipFile, entry_name: str, text: str) -> None:
-    """Scrub and write one text artifact; refuse hard-excluded names."""
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def _parse_json(text: str) -> Any:
+    """Reject invalid JSON without including potentially private source text."""
+    try:
+        return json.loads(text, parse_constant=_reject_json_constant)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON at line {exc.lineno}, column {exc.colno}") from None
+    except (ValueError, RecursionError):
+        raise ValueError("Invalid JSON: non-finite number or excessive nesting") from None
+
+
+def _json_text(value: Any, *, indent: int | None = None) -> str:
+    try:
+        return json.dumps(scrub_json(value), indent=indent, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError(
+            "Cannot encode JSON: check for non-finite numbers, unsupported keys or circular data"
+        ) from None
+
+
+def _jsonl_lines(text: str) -> list[str]:
+    """Split LF records without treating Unicode string content as delimiters.
+
+    A final LF terminates the last record; other empty records remain invalid.
+    CR in a CRLF terminator is accepted by the JSON parser as trailing whitespace.
+    """
+    return text.removesuffix("\n").split("\n") if text else []
+
+
+def _write_entry(archive: zipfile.ZipFile, entry_name: str, text: str) -> None:
+    """Final boundary: validate declared JSON before any bytes enter the ZIP."""
     if _is_excluded(entry_name):
         raise ValueError(f"refusing to bundle excluded artifact: {entry_name}")
-    archive.writestr(entry_name, scrub_text(text))
+    if entry_name.endswith(".json"):
+        _parse_json(text)
+    elif entry_name.endswith(".jsonl"):
+        for number, line in enumerate(_jsonl_lines(text), start=1):
+            try:
+                _parse_json(line)
+            except ValueError as exc:
+                raise ValueError(f"Invalid JSONL at line {number}: {exc}") from None
+    archive.writestr(entry_name, text)
+
+
+def _write_json(archive: zipfile.ZipFile, entry_name: str, value: Any) -> None:
+    _write_entry(archive, entry_name, _json_text(value, indent=2))
+
+
+def _write_text(archive: zipfile.ZipFile, entry_name: str, text: str) -> None:
+    """Scrub text or parse JSON logs before redacting their structured values."""
+    if entry_name.startswith(("logs/", "desktop/", "decisions/", "traces/")) or (
+        entry_name == "errors.jsonl"
+    ):
+        text = scrub_log_artifact(text)
+    if entry_name.endswith(".json"):
+        _write_json(archive, entry_name, _parse_json(text))
+        return
+    if entry_name.endswith(".jsonl"):
+        lines: list[str] = []
+        for number, line in enumerate(_jsonl_lines(text), start=1):
+            try:
+                lines.append(_json_text(_parse_json(line)))
+            except ValueError as exc:
+                raise ValueError(f"Invalid JSONL at line {number}: {exc}") from None
+        text = "\n".join(lines) + ("\n" if lines else "")
+    else:
+        text = scrub_text(text)
+    _write_entry(archive, entry_name, text)
 
 
 def _tail_bytes(path: Path, cap: int = _TAIL_CAP) -> tuple[bytes, bool]:
@@ -79,8 +147,8 @@ def _tail_bytes(path: Path, cap: int = _TAIL_CAP) -> tuple[bytes, bool]:
     When capped, the seek boundary usually bisects a line, and ``scrub_text``
     can only recognize a secret in a whole ``key=value`` line — a decapitated
     value fragment would sail through unmasked. Drop everything through the
-    first newline so the tail always starts on a line boundary, then prefix
-    the truncation marker.
+    first newline so the tail always starts on a line boundary. The caller
+    adds a format-appropriate truncation marker.
     """
     size = path.stat().st_size
     with path.open("rb") as fh:
@@ -90,7 +158,7 @@ def _tail_bytes(path: Path, cap: int = _TAIL_CAP) -> tuple[bytes, bool]:
         data = fh.read(cap)
     # Drop the partial first line (all of it, when no newline exists at all).
     _partial, _sep, data = data.partition(b"\n")
-    return f"[truncated: showing last {cap} bytes]\n".encode() + data, True
+    return data, True
 
 
 def _add_tail(
@@ -104,6 +172,11 @@ def _add_tail(
     data, truncated = _tail_bytes(path, cap)
     if truncated:
         truncations.append({"entry": entry_name, "source": str(path), "cap_bytes": cap})
+        marker = (
+            _json_text({"content_omitted": True, "truncated": True, "cap_bytes": cap})
+            if entry_name.endswith(".jsonl") else f"[truncated: showing last {cap} bytes]"
+        )
+        data = (marker + "\n").encode() + data
     _write_text(archive, entry_name, data.decode("utf-8", errors="replace"))
 
 
@@ -161,16 +234,13 @@ def _load_raw_config() -> tuple[dict[str, Any], Path, str]:
     return data, config_path, source
 
 
-def _collect_config() -> tuple[str, str, str]:
-    """Read the config TOML directly (never GatewayConfig.load) and redact it."""
-    from opensquilla.diagnostics_sources import redact_config_payload
-
+def _collect_config() -> tuple[Any, str, str]:
+    """Read TOML without migrations; the JSON writer applies bundle redaction."""
     data, config_path, source = _load_raw_config()
-    text = json.dumps(redact_config_payload(data), indent=2, default=str)
-    return text, str(config_path), source
+    return data, str(config_path), source
 
 
-def _collect_doctor() -> str:
+def _collect_doctor() -> dict[str, Any]:
     """Offline doctor report; the bundle never dials the gateway itself.
 
     Doctor's config loader migrates outdated payloads *in place* (rewrite +
@@ -197,10 +267,10 @@ def _collect_doctor() -> str:
     finally:
         if tmp_dir is not None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-    return json.dumps(report, indent=2, default=str)
+    return report
 
 
-def _collect_diagnostics_flags() -> str:
+def _collect_diagnostics_flags() -> dict[str, Any]:
     """Offline reconstruction of the ``logs.status`` RPC payload.
 
     Note: the snapshot reports the *ambient* process environment (env vars,
@@ -210,10 +280,10 @@ def _collect_diagnostics_flags() -> str:
     """
     from opensquilla.diagnostics_sources import logs_status_snapshot
 
-    return json.dumps(logs_status_snapshot(), indent=2, default=str)
+    return logs_status_snapshot()
 
 
-def _collect_toolchain_inventory(home_dir: Path) -> str:
+def _collect_toolchain_inventory(home_dir: Path) -> list[dict[str, object]]:
     """Collect sanitized managed-component status without local paths."""
 
     candidates = (
@@ -240,7 +310,7 @@ def _collect_toolchain_inventory(home_dir: Path) -> str:
             if isinstance(value, str) and value:
                 item[key] = value[:128]
         inventory.append(item)
-    return json.dumps(inventory, indent=2, default=str)
+    return inventory
 
 
 def _configured_state_dir() -> Path | None:
@@ -343,8 +413,8 @@ def _add_day_files(
 
 
 def _add_extra_blob(archive: zipfile.ZipFile, key: str, value: Any) -> None:
-    """Write one pre-serialized live-enrichment blob under ``live/``."""
-    _write_text(archive, f"live/{key}.json", json.dumps(value, indent=2, default=str))
+    """Write one structured live-enrichment blob under ``live/``."""
+    _write_json(archive, f"live/{key}.json", value)
 
 
 def _build_manifest(
@@ -395,7 +465,7 @@ def collect_bundle(
     log_dir: Path | None = None,
     extra: dict[str, Any] | None = None,
 ) -> BundleResult:
-    """Write a redacted diagnostics zip to *dest*; raises only if the zip can't be created."""
+    """Write a redacted ZIP; artifact failures are recorded, manifest failures raise."""
     home = Path(home_dir) if home_dir is not None else default_opensquilla_home()
     logs_dir = _resolve_log_dir(log_dir, home)
     collection_errors: list[dict[str, str]] = []
@@ -413,19 +483,19 @@ def collect_bundle(
                 collection_errors.append({"artifact": artifact, "error": str(exc)})
 
         def _config() -> None:
-            text, path_str, source = _collect_config()
+            data, path_str, source = _collect_config()
             config_meta["path"], config_meta["source"] = path_str, source
-            _write_text(archive, "config.redacted.json", text)
+            _write_json(archive, "config.redacted.json", data)
 
         _attempt("config.redacted.json", _config)
-        _attempt("doctor.json", lambda: _write_text(archive, "doctor.json", _collect_doctor()))
+        _attempt("doctor.json", lambda: _write_json(archive, "doctor.json", _collect_doctor()))
         _attempt(
             "diagnostics.json",
-            lambda: _write_text(archive, "diagnostics.json", _collect_diagnostics_flags()),
+            lambda: _write_json(archive, "diagnostics.json", _collect_diagnostics_flags()),
         )
         _attempt(
             "toolchains.json",
-            lambda: _write_text(
+            lambda: _write_json(
                 archive,
                 "toolchains.json",
                 _collect_toolchain_inventory(home),
@@ -451,6 +521,6 @@ def collect_bundle(
             truncations=truncations,
             entries=[*archive.namelist(), "manifest.json"],
         )
-        manifest_text = scrub_text(json.dumps(manifest, indent=2))
-        archive.writestr("manifest.json", manifest_text)
+        manifest_text = _json_text(manifest, indent=2)
+        _write_entry(archive, "manifest.json", manifest_text)
     return BundleResult(path=dest, manifest=json.loads(manifest_text))

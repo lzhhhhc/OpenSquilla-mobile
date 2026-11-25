@@ -3,15 +3,22 @@
 > server required — the FastAPI gateway boots inside the app via Chaquopy and
 > serves the Vue web UI in a local WebView on 127.0.0.1:18790.
 
-**Latest update: 2026-08-28** — background keep-alive (foreground service),
-launch fix (stale gateway.pid auto-clear), loading screen; see
+**Latest update: 2026-11-25** — rebased onto upstream OpenSquilla **v0.5.8**
+(405 upstream commits since the previous v0.5.4 snapshot): new vendored Python
+package + built Web UI, refreshed Chaquopy dependency set, and a documented
+port-patch list. See [Upstream sync](#upstream-sync-v058).
+The APK published below is still the **v0.5.4 build** — rebuild it before
+shipping, since `app/src/main/python/` is now 0.5.8.
+
+Previous (2026-08-28): background keep-alive (foreground service), launch fix
+(stale gateway.pid auto-clear), loading screen; see
 [Releases](https://github.com/lzhhhhc/OpenSquilla-mobile/releases) for the
 changelog.
 
 [![Download APK](https://img.shields.io/badge/download-OpenSquilla--mobile--debug.apk-%233DDC84)](https://github.com/lzhhhhc/OpenSquilla-mobile/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
 
-- **Download APK (recommended, GitHub Release):** [OpenSquilla-mobile-debug.apk](https://github.com/lzhhhhc/OpenSquilla-mobile/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
-- **APK also tracked in repo:** [releases/OpenSquilla-mobile-debug.apk](releases/OpenSquilla-mobile-debug.apk)
+- **Download APK (recommended, GitHub Release):** [OpenSquilla-mobile-debug.apk](https://github.com/lzhhhhc/OpenSquilla-mobile/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk) — built from the v0.5.4 snapshot
+- **APK also tracked in repo:** [releases/OpenSquilla-mobile-debug.apk](releases/OpenSquilla-mobile-debug.apk) — built from the v0.5.4 snapshot
 - Min Android: 8.0 (API 26), ABI: arm64-v8a
 - Configuration example: [config.example.toml](config.example.toml)
 - License: Apache-2.0, see [LICENSE](LICENSE) — this packaging is a derivative of [opensquilla/opensquilla](https://github.com/opensquilla/opensquilla) (Apache-2.0)
@@ -163,6 +170,80 @@ Notes:
   **App launch management → manual → "Allow background activity"** (and
   "Auto-launch" with a notification if present). This cannot be requested
   from code; it is a one-time user setting.
+
+## Upstream sync (v0.5.8)
+
+This tree tracks [opensquilla/opensquilla](https://github.com/opensquilla/opensquilla).
+The vendored package at `app/src/main/python/opensquilla/` was replaced with
+the official `opensquilla-0.5.8-py3-none-any.whl` (release asset, includes the
+built Web UI under `gateway/static/dist/`). To redo the same sync for a future
+upstream tag:
+
+1. `pip download opensquilla==<ver>` (or grab the release wheel) and unzip it.
+2. `rm -rf app/src/main/python/opensquilla && cp -a <wheel>/opensquilla app/src/main/python/`
+3. Delete all `__pycache__` directories.
+4. Re-apply the Android port patches (they are small, by design):
+
+   - `gateway/config.py` — `require_router_runtime: bool = False` (Android
+     ships no ONNX runtime; keeps the heuristic router and doctor green).
+   - `gateway/boot.py` → `validate_squilla_router_runtime()` — when
+     `require_router_runtime` is false, skip asset hash validation
+     (`build_services.squilla_router_assets_skipped_no_ml_runtime`) instead of
+     failing boot on stubbed weights. The doctor's deep check still reports.
+   - `opensquilla_android.py` — the entrypoint shim (env defaults, stale
+     `gateway.pid`/`gateway.pid.lock` cleanup, router seed, telemetry off).
+
+5. Stub the heavy ML weights with Git-LFS-style pointer files (matches the
+   v0.5.4 snapshot convention — pointers, not real binaries, so the repo stays
+   clone-friendly; real weights come from the upstream wheel at build time if
+   ever needed):
+
+   ```text
+   squilla_router/models/v4.2_phase3_inference/
+     bge_onnx/model.onnx        (22.8 MB)
+     features/svd.pkl           (7.6 MB)
+     features/tfidf.pkl         (0.3 MB)
+     features/bge_pca.joblib    (0.1 MB)
+     lgbm_main.bin              (37.8 MB)
+     lgbm_aux.bin               (3.3 MB)
+     mlp/model.onnx             (2.3 MB)
+   ```
+   Keep real files for `tokenizer.json` / `vocab.txt` and all JSON metadata.
+
+6. Keep `squilla_router/lightgbm_model/` — it is an **importable package**, not
+   just assets: `gateway/boot.py` imports
+   `opensquilla.squilla_router.lightgbm_model` (its `validate_artifacts`) during
+   startup, so deleting the directory breaks boot with a `ModuleNotFoundError`.
+   Stub only the weight files inside it:
+
+   ```text
+   squilla_router/lightgbm_model/assets/
+     intent/model.int8.onnx                              (58.4 MB)
+     tier/model.txt.gz                                   (12.0 MB)
+     preprocess/feature/artifacts/svd100.joblib          (3.9 MB)
+     preprocess/feature/artifacts/tfidf_char_wb_2_4.joblib (0.3 MB)
+     preprocess/feature/artifacts/pca64.joblib           (0.1 MB)
+   ```
+
+   With both stub sets applied the vendored package is ~172 MB on disk
+   (`gateway/static/dist` alone is ~117 MB of built Web UI, fonts included).
+
+7. Dependency floors live in `app/build.gradle` (mirrors upstream
+   `pyproject.toml`). Native wheels come from the Chaquopy prebuilt index;
+   `pydantic_core` must be a real Android arm64-v8a wheel vendored in
+   `wheels/` (currently 2.41.5 ↔ pydantic 2.12.5 — upstream floor is 2.13.5,
+   pin both together when a new core wheel is built).
+
+8. Not shipped (all lazy imports upstream, gateway degrades gracefully):
+   `aiohttp`/`multidict`/`yarl` (discord.py, qq-botpy), `pdfplumber` +
+   `pypdfium2` (PDF tables), `sqlite-vec` (vector memory),
+   `duckduckgo-search`, `watchfiles`/`httptools`/`uvloop` (uvicorn extras),
+   `tokenizers`/`onnxruntime`/`lightgbm` (ML router).
+
+9. Smoke test before pushing:
+   `PYTHONPATH=app/src/main/python python -c "import opensquilla_android"` plus
+   a desktop venv boot check of `opensquilla_android.serve()` against
+   `http://127.0.0.1:18790/api/sessions`.
 
 ## License
 Apache-2.0, see [LICENSE](LICENSE). This mobile packaging is a derivative work of [opensquilla/opensquilla](https://github.com/opensquilla/opensquilla) which is licensed under Apache-2.0; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party notices.

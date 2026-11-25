@@ -1,6 +1,8 @@
 ---
 name: xlsx
-description: "Read, edit, or create Microsoft Excel `.xlsx` workbooks. Trigger this skill whenever the user mentions a spreadsheet, .xlsx file, workbook, sheet, formula, pivot table, or asks to extract tabular data, modify a sheet, or build a workbook from rows. Three execution paths: structured inspection, in-place cell edits, and create-from-scratch via openpyxl. Values starting with `=` are written as formulas; everything else is a literal value with type preserved (int / float / str / datetime)."
+visibility: public
+invocation: direct
+description: "Read, inspect, edit, or create Microsoft Excel `.xlsx` workbooks, including structured data extraction, formula-aware cell edits, and workbook generation from rows."
 description_zh: "读取、编辑或创建Microsoft Excel .xlsx 工作簿。当用户提到电子表格、.xlsx文件、工作簿、工作表、公式、数据透视表，或要求提取表格数据、修改工作表或从行数据构建工作簿时触发。支持三种执行路径：结构化检查、就地单元格编辑，以及用openpyxl从零创建。以 = 开头的值写为公式，其余为保留类型的字面值（int/float/str/datetime）。"
 homepage: https://openpyxl.readthedocs.io/
 provenance:
@@ -46,9 +48,30 @@ If the user provides a workbook to update, default to path B and treat the
 input as the formatting baseline. Choose path C only when the user says
 "start fresh".
 
+## Execution and delivery
+
+Use `execute_code` with the Python examples below when it is available. Keep
+all input and output files in the active workspace, then call
+`publish_artifact(path="out.xlsx")` to deliver the finished workbook.
+In a restricted channel, use `openpyxl` directly; the shell commands below
+are optional shortcuts for sessions that expose `exec_command`. Do not use
+Python subprocesses to bypass an unavailable shell tool or request host
+execution when the sandbox fails. If execution or a required library is
+unavailable, report that limitation and keep the session read-only.
+
 ---
 
 ## Path A: Inspect
+
+With `execute_code`:
+
+```python
+from openpyxl import load_workbook
+wb = load_workbook("book.xlsx", data_only=False)
+for ws in wb.worksheets:
+    print(ws.title, list(ws.values))
+wb.close()
+```
 
 ```bash
 python {baseDir}/scripts/inspect_xlsx.py /path/to/book.xlsx
@@ -87,6 +110,16 @@ instead.
 ---
 
 ## Path B: Edit in place
+
+With `execute_code`:
+
+```python
+from openpyxl import load_workbook
+wb = load_workbook("book.xlsx")
+wb["Q3"]["B2"] = "=SUM(B3:B10)"
+wb.save("edited.xlsx")
+wb.close()
+```
 
 ```bash
 python {baseDir}/scripts/edit_xlsx.py book.xlsx ops.json --out edited.xlsx

@@ -777,6 +777,9 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "llmSource": status.llm_source,
         "llmEnvKey": status.llm_env_key,
         "llmCredentialStatus": dict(status.llm_credential_status),
+        # The standalone CLI has no desktop account bridge. Keep the nullable
+        # RPC projection so clients can consume the same status shape.
+        "tokenRhythmManual": None,
         "llmProfileStatus": [dict(row) for row in status.llm_profile_status],
         "searchConfigured": status.search_configured,
         "searchProvider": status.search_provider,
@@ -789,6 +792,7 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "imageGenerationPrimary": status.image_generation_primary,
         "imageGenerationEnvKey": status.image_generation_env_key,
         "imageGenerationState": dict(status.image_generation_state),
+        "videoGenerationState": dict(status.video_generation_state),
         "audioConfigured": status.audio_configured,
         "audioEnabled": status.audio_enabled,
         "audioSource": status.audio_source,
@@ -1644,6 +1648,12 @@ def configure_command(
                         "presetId": preset,
                     },
                 )
+                if router:
+                    # An explicit --router is authoritative (the help promises
+                    # recommended | openrouter-mix | disabled); an omitted one
+                    # keeps the stored/synthesized router state untouched on a
+                    # re-save, mirroring the `onboard --provider` contract.
+                    engine.apply("router", {"mode": router})
                 result = engine.persist()
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)

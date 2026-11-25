@@ -48,6 +48,8 @@ from opensquilla.contracts.attachments import (
     can_stage_attachment_mime,
     normalize_attachment_mime,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
+from opensquilla.token_estimation import estimate_material_text_tokens
 
 log = structlog.get_logger(__name__)
 
@@ -356,6 +358,16 @@ def validate_attachments(
                     ),
                 )
                 continue
+            if media_type in IMAGE_ATTACHMENT_MIMES:
+                try:
+                    validate_image_bytes(payload, media_type)
+                except ValueError as exc:
+                    _raise_or_mark(
+                        failure_mode=failure_mode,
+                        failures=failures,
+                        failure=_failure(index, attachment, "invalid_image", str(exc)),
+                    )
+                    continue
             item = dict(attachment)
             item["type"] = media_type
             item["mime"] = media_type
@@ -611,6 +623,17 @@ def validate_attachments(
             )
             continue
 
+        if claimed in IMAGE_ATTACHMENT_MIMES or resolved in IMAGE_ATTACHMENT_MIMES:
+            try:
+                validate_image_bytes(raw_bytes, resolved)
+            except ValueError as exc:
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(index, attachment, "invalid_image", str(exc)),
+                )
+                continue
+
         item = dict(attachment)
         item["type"] = resolved
         item["data"] = base64.b64encode(raw_bytes).decode("ascii")
@@ -657,6 +680,7 @@ async def resolve_attachments(
     disk_budget_bytes: int | None = None,
     accept_opaque: bool = True,
     opaque_limit_bytes: int | None = None,
+    persist_enabled: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not any(isinstance(a, dict) and a.get("file_uuid") for a in validated):
         enforce_total_attachment_bytes(validated)
@@ -706,6 +730,10 @@ async def resolve_attachments(
             opaque_limit_bytes=opaque_limit_bytes,
         )
         item = materialized[0]
+        if not persist_enabled:
+            resolved.append(item)
+            consumed.append(ref)
+            continue
         if material_root is None or not session_id:
             raise ValueError(
                 f"attachments[{index}] file_uuid resolution requires a material target"
@@ -717,16 +745,28 @@ async def resolve_attachments(
             payload=raw_bytes,
             disk_budget_bytes=disk_budget_bytes,
         )
-        resolved.append(
-            make_attachment_ref(
-                sha256=sha,
-                name=item["name"],
-                mime=item["type"],
-                size=len(raw_bytes),
-                session_id=session_id,
-                source="upload",
-            )
+        resolved_ref = make_attachment_ref(
+            sha256=sha,
+            name=item["name"],
+            mime=item["type"],
+            size=len(raw_bytes),
+            session_id=session_id,
+            source="upload",
         )
+        if attachment.get("origin") == "paste":
+            resolved_ref["origin"] = "paste"
+            if item["type"] == "text/plain":
+                try:
+                    decoded_text = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    resolved_ref["_material_chars"] = len(decoded_text)
+                    resolved_ref["_material_estimated_tokens"] = (
+                        estimate_material_text_tokens(decoded_text)
+                    )
+                    resolved_ref["_material_path"] = str(_path)
+        resolved.append(resolved_ref)
         consumed.append(ref)
     enforce_total_attachment_bytes(resolved)
     return resolved, consumed
@@ -746,6 +786,7 @@ async def ingest_attachments(
     opaque_limit_bytes: int | None = None,
     allow_material_refs: bool = False,
     expected_material_scope: str | None = None,
+    persist_enabled: bool = True,
 ) -> AttachmentIngestResult:
     validated, failures = validate_attachments(
         raw_attachments,
@@ -765,6 +806,7 @@ async def ingest_attachments(
         disk_budget_bytes=disk_budget_bytes,
         accept_opaque=accept_opaque,
         opaque_limit_bytes=opaque_limit_bytes,
+        persist_enabled=persist_enabled,
     )
     if failures:
         markers = [failure.marker for failure in failures]
@@ -886,17 +928,18 @@ async def stage_pending_chat_input_attachments(
             payload=raw_bytes,
             disk_budget_bytes=disk_budget_bytes,
         )
-        refs.append(
-            make_pending_chat_input_attachment_ref(
-                sha256=sha,
-                name=_attachment_name(item, index),
-                mime=str(item["type"]),
-                size=len(raw_bytes),
-                session_id=session_id,
-                pending_input_id=pending_input_id,
-                source=source,
-            )
+        pending_ref = make_pending_chat_input_attachment_ref(
+            sha256=sha,
+            name=_attachment_name(item, index),
+            mime=str(item["type"]),
+            size=len(raw_bytes),
+            session_id=session_id,
+            pending_input_id=pending_input_id,
+            source=source,
         )
+        if item.get("origin") == "paste":
+            pending_ref["origin"] = "paste"
+        refs.append(pending_ref)
 
     enforce_total_attachment_bytes(refs)
     write_pending_chat_input_manifest(

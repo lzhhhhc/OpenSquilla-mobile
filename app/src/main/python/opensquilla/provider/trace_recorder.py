@@ -135,6 +135,8 @@ class LLMTraceRecorder:
         headers: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        if not self.enabled:
+            return
         sanitized_payload = _redact(payload)
         self._append(
             {
@@ -147,7 +149,7 @@ class LLMTraceRecorder:
         )
 
     def record_chunk(self, chunk: dict[str, Any]) -> None:
-        if not self.include_chunks:
+        if not self.enabled or not self.include_chunks:
             return
         self._append(
             {
@@ -164,6 +166,8 @@ class LLMTraceRecorder:
     ) -> None:
         """Record response identity without retaining arbitrary HTTP headers."""
 
+        if not self.enabled:
+            return
         safe_ids = _redact(response_ids or [])
         if not safe_ids:
             return
@@ -187,6 +191,8 @@ class LLMTraceRecorder:
         response_ids: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        if not self.enabled:
+            return
         self._append(
             {
                 "event": "llm.response",
@@ -220,6 +226,8 @@ class LLMTraceRecorder:
         in the normal trace record.
         """
 
+        if not self.enabled:
+            return
         normalized_code = str(code or "").strip().lower().replace("-", "_")
         safe_codes = {
             "cancelled",

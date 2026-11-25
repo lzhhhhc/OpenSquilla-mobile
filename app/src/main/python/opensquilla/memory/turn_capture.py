@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
+from opensquilla.memory.io_worker import run_memory_io
 
 _SESSION_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TRUNCATION_SUFFIX = "\n... (truncated)"
@@ -56,6 +58,7 @@ class TurnCaptureService:
         )
         self._turns_parent = self._turns_dir.parent
         self._memory_config = memory_config
+        self._write_lock = asyncio.Lock()
 
     def _settings(self) -> Any | None:
         config = self._memory_config
@@ -174,16 +177,20 @@ class TurnCaptureService:
         self,
         *,
         session_key: str,
+        session_namespace: str | None,
         captured_at: datetime,
         entry: str,
+        roll_max_chars: int | None = None,
     ) -> tuple[str, Path, str | None, str]:
-        roll_max_chars = self._turn_roll_max_chars()
+        if roll_max_chars is None:
+            roll_max_chars = self._turn_roll_max_chars()
+        path_namespace = session_namespace or session_key
 
         for part in range(1, 1000):
             rel_path = (
-                self._turn_rel_path(session_key, captured_at)
+                self._turn_rel_path(path_namespace, captured_at)
                 if part == 1
-                else self._turn_part_rel_path(session_key, captured_at, part)
+                else self._turn_part_rel_path(path_namespace, captured_at, part)
             )
             abs_path = (self._turns_parent / rel_path).resolve()
             try:
@@ -217,6 +224,7 @@ class TurnCaptureService:
         source: dict[str, Any] | None = None,
         captured_at: datetime | None = None,
         no_memory_capture: bool = False,
+        session_namespace: str | None = None,
     ) -> str | None:
         if no_memory_capture:
             return None
@@ -245,10 +253,36 @@ class TurnCaptureService:
             assistant_text=cleaned_assistant,
             source=source,
         )
+        roll_max_chars = self._turn_roll_max_chars()
+        # Retain this lock through cancellation until the complete read/append
+        # and any rollback has settled. Another turn must not read stale data.
+        async with self._write_lock:
+            if not self._enabled():
+                return None
+            return await run_memory_io(
+                self._persist_entry,
+                session_key=session_key,
+                session_namespace=session_namespace,
+                captured_at=captured_at,
+                entry=entry,
+                roll_max_chars=roll_max_chars,
+            )
+
+    def _persist_entry(
+        self,
+        *,
+        session_key: str,
+        session_namespace: str | None,
+        captured_at: datetime,
+        entry: str,
+        roll_max_chars: int,
+    ) -> str:
         rel_path, abs_path, previous_content, new_content = self._select_turn_target(
             session_key=session_key,
+            session_namespace=session_namespace,
             captured_at=captured_at,
             entry=entry,
+            roll_max_chars=roll_max_chars,
         )
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         had_existing = previous_content is not None

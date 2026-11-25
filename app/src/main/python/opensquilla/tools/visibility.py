@@ -9,7 +9,6 @@ from enum import StrEnum
 import structlog
 
 from opensquilla.provider.types import ToolDefinition
-from opensquilla.tools.plan_access import plan_access_allows
 from opensquilla.tools.policy_runtime import (
     ToolSurfaceCapabilities,
     resolve_runtime_tool_surface,
@@ -22,6 +21,11 @@ from opensquilla.tools.types import (
     InteractionMode,
     RegisteredTool,
     ToolContext,
+)
+from opensquilla.tools.workspace_authoring import (
+    WORKSPACE_AUTHORING_TOOLS,
+    restricted_channel_context,
+    workspace_authoring_attested,
 )
 
 log = structlog.get_logger(__name__)
@@ -42,6 +46,8 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "grep_search",
         "image",
         "image_generate",
+        "video_generate",
+        "video_status",
         "audio_provider_capabilities",
         "dubbing_download",
         "dubbing_generate",
@@ -53,10 +59,6 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "pdf",
         "publish_artifact",
         "song_generate",
-        "create_csv",
-        "create_pdf_report",
-        "create_pptx",
-        "create_xlsx",
         "read_file",
         "session_status",
         "sessions_history",
@@ -68,20 +70,27 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "web_discover",
         "web_fetch",
         "web_search",
+        "tool_search",
     }
 )
 
 _CHANNEL_HARD_DENY_NON_OWNER: frozenset[str] = frozenset(
     {
         "apply_patch",
-        "background_process",
         "edit_file",
         "exec_command",
         "execute_code",
         "git_commit",
+        "process",
         "write_file",
     }
 )
+
+# Bounded authoring needs the installed skill instructions as well as file
+# tools. These read-only catalog tools do not mount skill directories or grant
+# script execution; skill_view keeps its registered-resource containment gate.
+# Skill installation and editing retain their existing policy.
+_CHANNEL_WORKSPACE_SKILL_ALLOW: frozenset[str] = frozenset({"skill_list", "skill_view"})
 
 GUEST_SAFE_BASE_TOOL_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -129,7 +138,7 @@ def filter_by_profile(
     return [
         tool
         for tool in tools
-        if profile_allows_tool(tool.name, resolved, explicitly_allowed=explicit)
+        if profile_allows_tool(tool.name, resolved, explicitly_allowed=explicit, context=ctx)
     ]
 
 
@@ -138,9 +147,21 @@ def profile_allows_tool(
     profile: ToolProfile | str,
     *,
     explicitly_allowed: set[str] | frozenset[str] | None = None,
+    context: ToolContext | None = None,
 ) -> bool:
     resolved = ToolProfile(profile)
+    if (
+        tool_name in _CHANNEL_WORKSPACE_SKILL_ALLOW
+        and restricted_channel_context(context)
+        and not workspace_authoring_attested(context)
+    ):
+        return False
     if resolved is ToolProfile.OWNER_FULL:
+        return True
+    if (
+        tool_name in WORKSPACE_AUTHORING_TOOLS | _CHANNEL_WORKSPACE_SKILL_ALLOW
+        and workspace_authoring_attested(context)
+    ):
         return True
     if tool_name in _CHANNEL_DEFAULT_ALLOW:
         return True
@@ -275,14 +296,40 @@ def effective_tool_context(
 
 
 def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
-    if not plan_access_allows(rt.spec, ctx):
-        log.debug("tool_filtered", tool=rt.spec.name, reason="plan_mode_denied")
+    if ctx is not None and ctx.caller_kind is CallerKind.CHANNEL:
+        from opensquilla.safety.permission_matrix import Principal, is_tool_allowed
+
+        decision = is_tool_allowed(
+            rt.spec.name,
+            "group" if ctx.channel_kind == "group" else "dm",
+            Principal(
+                role="operator" if ctx.channel_admin_verified else "user",
+                channel_id=ctx.channel_id or ctx.session_key,
+            ),
+            workspace_authoring_attested=workspace_authoring_attested(ctx),
+        )
+        if not decision.allowed:
+            return False
+    if (
+        ctx is not None
+        and ctx.caller_kind is CallerKind.CHANNEL
+        and not ctx.channel_admin_verified
+        and not profile_allows_tool(
+            rt.spec.name,
+            ToolProfile.CHANNEL_DEFAULT,
+            explicitly_allowed=ctx.allowed_tools,
+            context=ctx,
+        )
+    ):
         return False
     if not guest_safe_tool_allowed(ctx, rt.spec.name):
         log.debug("tool_filtered", tool=rt.spec.name, reason="guest_safe_not_allowed")
         return False
     explicitly_allowed = (
-        ctx is not None and ctx.allowed_tools is not None and rt.spec.name in ctx.allowed_tools
+        ctx is not None and (
+            (ctx.allowed_tools is not None and rt.spec.name in ctx.allowed_tools)
+            or rt.spec.name in ctx.explicitly_allowed_tools
+        )
     )
     surfaced = (
         ctx is not None
@@ -297,19 +344,17 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
             rt.spec.name,
             ToolProfile.CHANNEL_DEFAULT,
             explicitly_allowed=ctx.allowed_tools,
+            context=ctx,
         )
     )
     if (
-        not rt.spec.exposed_by_default
+        rt.spec.default_access == "deny"
         and not explicitly_allowed
         and not surfaced
         and not channel_profile_visible
     ):
         return False
     if ctx is not None:
-        if ctx.exclusive_tools is not None and rt.spec.name not in ctx.exclusive_tools:
-            log.debug("tool_filtered", tool=rt.spec.name, reason="exclusive_ceiling")
-            return False
         if rt.spec.owner_only and not ctx.is_owner:
             log.debug("tool_filtered", tool=rt.spec.name, reason="owner_only")
             return False
@@ -320,27 +365,6 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
             log.debug("tool_filtered", tool=rt.spec.name, reason="denied")
             return False
     return True
-
-
-def apply_exclusive_tool_ceiling(ctx: ToolContext) -> ToolContext:
-    """Apply the final, non-widenable tool ceiling after all policy layers.
-
-    Visibility and dispatch also consult ``exclusive_tools`` directly as
-    defense in depth. This final intersection keeps ``allowed_tools`` truthful
-    for downstream diagnostics and callers that inspect the resolved context.
-    """
-
-    if ctx.exclusive_tools is None:
-        return ctx
-    ceiling = set(ctx.exclusive_tools)
-    ctx.allowed_tools = (
-        ceiling
-        if ctx.allowed_tools is None
-        else set(ctx.allowed_tools) & ceiling
-    )
-    if ctx.surfaced_tools is not None:
-        ctx.surfaced_tools = set(ctx.surfaced_tools) & ceiling
-    return ctx
 
 
 def visible_registered_tools(

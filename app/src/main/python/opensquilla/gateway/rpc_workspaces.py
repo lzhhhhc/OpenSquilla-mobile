@@ -4,20 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import os
+import platform
+import stat
+import sys
 import time
 from collections.abc import Awaitable
 from contextlib import AsyncExitStack
+from pathlib import Path, PureWindowsPath
 from typing import Any, cast
 
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
+from opensquilla.gateway.adapters.workspace_catalog_contract import (
+    register_workspace_catalog_contract,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
+from opensquilla.gateway.workspace_references import read_workspace_reference
 from opensquilla.project_workspaces import (
     adopt_legacy_project_workspaces,
     project_workspace_payload,
@@ -27,6 +38,8 @@ from opensquilla.session.models import ProjectWorkspace
 from opensquilla.session.storage import ProjectSessionSnapshotMismatchError
 
 _d = get_dispatcher()
+_log = logging.getLogger(__name__)
+_CREATE_PARENT_PREFERENCE = "workspaces.create.parentPath"
 
 
 async def _settle_despite_cancellation[T](awaitable: Awaitable[T]) -> T:
@@ -88,7 +101,86 @@ async def _payload(storage: Any, workspace: ProjectWorkspace) -> dict[str, Any]:
     return await project_workspace_payload(storage, workspace)
 
 
-@_d.method("workspaces.list", scope="operator.read")
+def _creation_parent(value: Any) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("parentPath must be a non-empty absolute directory path")
+    parent = Path(value).expanduser()
+    if not parent.is_absolute():
+        raise ValueError("parentPath must be an absolute directory path")
+    parent = parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise ValueError("parentPath must name an existing directory")
+    return parent
+
+
+def _creation_name(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RpcHandlerError("INVALID_PARAMS", "name must be a non-empty directory name")
+    if (
+        value in {".", ".."}
+        or Path(value).is_absolute()
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or (
+            sys.platform == "win32"
+            and (
+                value.endswith((".", " "))
+                or any(ord(character) < 32 or character in '<>:"|?*' for character in value)
+                or PureWindowsPath(value).is_reserved()
+            )
+        )
+    ):
+        raise RpcHandlerError("INVALID_PARAMS", "name must be a single valid directory name")
+    return value
+
+
+def _rollback_empty_created_directory(
+    directory: Path,
+    *,
+    directory_identity: os.stat_result,
+    parent_identity: os.stat_result,
+) -> None:
+    """Remove only the still-owned empty allocation; preserve replacements and contents."""
+
+    try:
+        current = directory.lstat()
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or not os.path.samestat(current, directory_identity)
+            or not os.path.samestat(directory.parent.lstat(), parent_identity)
+            or directory.resolve(strict=True) != directory
+            or getattr(directory, "is_junction", lambda: False)()
+        ):
+            return
+        directory.rmdir()
+    except (OSError, RuntimeError, ValueError):
+        # A nonempty, unavailable, or replaced directory is never ours to delete.
+        return
+
+
+async def _creation_defaults(storage: Any) -> dict[str, Any]:
+    preferred = await storage.get_runtime_preference(_CREATE_PARENT_PREFERENCE)
+    parent: str | None = None
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):
+        home = None
+    for candidate in (preferred, home):
+        if candidate is None:
+            continue
+        try:
+            parent = str(_creation_parent(candidate))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        break
+    return {
+        "parentPath": parent,
+        "hostName": platform.node(),
+        "platform": "windows" if sys.platform == "win32" else "posix",
+    }
+
+
 async def _handle_workspaces_list(
     params: dict | None,
     ctx: RpcContext,
@@ -98,11 +190,88 @@ async def _handle_workspaces_list(
     await adopt_legacy_project_workspaces(storage, ctx.config)
     workspaces = await storage.list_project_workspaces()
     return {
-        "workspaces": [await _payload(storage, workspace) for workspace in workspaces]
+        "workspaces": [await _payload(storage, workspace) for workspace in workspaces],
+        "creationDefaults": await _creation_defaults(storage),
     }
 
 
-@_d.method("workspaces.open", scope="operator.write")
+async def _handle_workspaces_create(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    _require_owner(ctx)
+    values = _params(params)
+    if values.get("trusted") is not True:
+        raise RpcHandlerError(
+            "WORKSPACE_TRUST_REQUIRED", "Creating a project requires explicit trust.",
+        )
+    name = _creation_name(values.get("name"))
+    try:
+        parent = _creation_parent(values.get("parentPath"))
+        parent_identity = parent.lstat()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RpcHandlerError("INVALID_WORKSPACE_PATH", str(exc)) from exc
+    storage = _storage(ctx)
+    directory = parent / name
+
+    async def create_and_register() -> dict[str, Any]:
+        try:
+            directory.mkdir()
+        except FileExistsError as exc:
+            raise RpcHandlerError(
+                "WORKSPACE_ALREADY_EXISTS",
+                "A file or directory already exists at this path. "
+                "Open it explicitly or choose another name.",
+            ) from exc
+        except OSError as exc:
+            raise RpcHandlerError("WORKSPACE_CREATE_FAILED", str(exc)) from exc
+
+        directory_identity: os.stat_result | None = None
+        registration_started = False
+        try:
+            directory_identity = directory.lstat()
+            if (
+                not stat.S_ISDIR(directory_identity.st_mode)
+                or not os.path.samestat(parent.lstat(), parent_identity)
+                or directory.resolve(strict=True) != directory
+                or getattr(directory, "is_junction", lambda: False)()
+            ):
+                raise RpcHandlerError(
+                    "INVALID_WORKSPACE_PATH", "The project path changed during creation.",
+                )
+            resolved = resolve_project_path(str(directory))
+            now = int(time.time() * 1000)
+            registration_started = True
+            workspace = await storage.create_or_restore_project_workspace(
+                path=resolved.path, path_key=resolved.path_key,
+                display_name=resolved.name, trusted_at=now, now_ms=now,
+            )
+        except BaseException:
+            may_remove = not registration_started
+            if registration_started:
+                try:
+                    may_remove = await storage.get_project_workspace_by_path_key(
+                        resolved.path_key,
+                    ) is None
+                except Exception:
+                    # An unknown registration outcome must remain recoverable by list/open.
+                    may_remove = False
+            if may_remove and directory_identity is not None:
+                _rollback_empty_created_directory(
+                    directory, directory_identity=directory_identity,
+                    parent_identity=parent_identity,
+                )
+            raise
+        try:
+            await storage.set_runtime_preference(_CREATE_PARENT_PREFERENCE, str(parent))
+        except Exception:
+            # This hint must not turn a confirmed project creation into a failure.
+            _log.warning("Could not remember the project creation parent", exc_info=True)
+        return {"workspace": await _payload(storage, workspace)}
+
+    return await _settle_despite_cancellation(create_and_register())
+
+
 async def _handle_workspaces_open(
     params: dict | None,
     ctx: RpcContext,
@@ -133,7 +302,6 @@ async def _handle_workspaces_open(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.update", scope="operator.write")
 async def _handle_workspaces_update(
     params: dict | None,
     ctx: RpcContext,
@@ -155,7 +323,6 @@ async def _handle_workspaces_update(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.pin", scope="operator.write")
 async def _handle_workspaces_pin(
     params: dict | None,
     ctx: RpcContext,
@@ -174,7 +341,6 @@ async def _handle_workspaces_pin(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.remove", scope="operator.write")
 async def _handle_workspaces_remove(
     params: dict | None,
     ctx: RpcContext,
@@ -207,7 +373,6 @@ async def _handle_workspaces_remove(
     }
 
 
-@_d.method("workspaces.history.delete", scope="operator.write")
 async def _handle_workspaces_history_delete(
     params: dict | None,
     ctx: RpcContext,
@@ -248,14 +413,6 @@ async def _handle_workspaces_history_delete(
                 # tasks above. Let matching work settle naturally: cancelling a
                 # wrapper cannot stop an underlying writer thread.
                 await drain_pending_flushes_for_sessions(candidate_keys)
-                drain_turn_writes = getattr(
-                    ctx.turn_runner,
-                    "drain_session_background_writes",
-                    None,
-                )
-                if callable(drain_turn_writes):
-                    await drain_turn_writes(candidate_keys)
-
                 session_ids: dict[str, str] = {}
                 for session_key in candidate_keys:
                     node = await storage.get_session(session_key)
@@ -300,7 +457,31 @@ async def _handle_workspaces_history_delete(
     return await _settle_despite_cancellation(_delete_fenced_history())
 
 
+_WORKSPACE_CATALOG_CONTRACT_IMPLEMENTATIONS = {
+    "workspaces.references.read": read_workspace_reference,
+    "workspaces.list": _handle_workspaces_list,
+    "workspaces.create": _handle_workspaces_create,
+    "workspaces.open": _handle_workspaces_open,
+    "workspaces.update": _handle_workspaces_update,
+    "workspaces.pin": _handle_workspaces_pin,
+    "workspaces.remove": _handle_workspaces_remove,
+    "workspaces.history.delete": _handle_workspaces_history_delete,
+}
+
+_WORKSPACE_CATALOG_CONTRACT_HANDLERS = {
+    method: register_workspace_catalog_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _WORKSPACE_CATALOG_CONTRACT_IMPLEMENTATIONS.items()
+}
+
+
 __all__ = [
+    "_handle_workspaces_create",
     "_handle_workspaces_history_delete",
     "_handle_workspaces_list",
     "_handle_workspaces_open",

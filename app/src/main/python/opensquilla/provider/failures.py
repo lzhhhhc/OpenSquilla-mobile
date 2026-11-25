@@ -8,11 +8,14 @@ is a data change (a new matcher row), not a new branch.
 
 from __future__ import annotations
 
+import json
 import re
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+import httpx
 import structlog
 
 from opensquilla.http_retry import parse_retry_after
@@ -20,6 +23,50 @@ from opensquilla.http_retry import parse_retry_after
 from .registry import UnknownProviderError, get_provider_spec
 
 log = structlog.get_logger(__name__)
+
+CONNECTION_FAILED_CODE = "connection_failed"
+
+
+def safe_http_status(value: object) -> int | None:
+    """Accept only a genuine, explicitly supplied HTTP error status."""
+    return value if type(value) is int and 400 <= value <= 599 else None
+
+
+def structured_provider_error_code(body: bytes | str) -> str:
+    """Read only a bounded machine code; never expose response prose as a code."""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    source = error if isinstance(error, dict) else data
+    for key in ("code", "type"):
+        value = source.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", value):
+            return value.lower()
+    return ""
+
+
+def is_connection_failure(error: BaseException) -> bool:
+    """Identify connection establishment failures without matching upstream prose.
+
+    Read/write timeouts and protocol errors do not prove that reconnecting is
+    appropriate. TLS failures can be wrapped in ConnectError, but require a
+    configuration fix rather than an open-ended connection wait.
+    """
+
+    if not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return False
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return False
+        current = current.__cause__ or current.__context__
+    return True
 
 
 class ProviderFailureKind(StrEnum):
@@ -29,6 +76,7 @@ class ProviderFailureKind(StrEnum):
     CONTEXT_OVERFLOW = "context_overflow"
     UNSUPPORTED_FEATURE = "unsupported_feature"
     INSUFFICIENT_CREDITS = "insufficient_credits"
+    USAGE_LIMIT = "usage_limit"
     MODEL_NOT_FOUND = "model_not_found"
     TRANSPORT_TRANSIENT = "transport_transient"
     POLICY_REFUSAL = "policy_refusal"
@@ -161,9 +209,43 @@ def _is_gateway_transient(signal: FailureSignal) -> bool:
     return bool(_GATEWAY_TRANSIENT_RE.search(signal.text))
 
 
+def _is_input_length_range_error(signal: FailureSignal) -> bool:
+    """Recognize the observed input-size range, excluding explicit empty input.
+
+    Qwen errors may be wrapped in a LiteLLM message. The upper bound identifies
+    an input-capacity error, not a tokenizer count or a replacement model limit.
+    """
+    return bool(re.search(
+        r"\brange of input length should be\s*\[\s*1\s*,\s*[1-9][0-9]*\s*\]",
+        signal.text,
+    )) and not bool(re.search(
+        r"\bempty\b|\binput length\s*(?:is|:|=)\s*(?:0|zero)\b", signal.text,
+    ))
+
+
+def _is_anthropic_missing_model(signal: FailureSignal) -> bool:
+    """Anthropic's missing-resource type needs an explicit model target.
+
+    A 404 or ``not_found_error`` can also refer to a route, file, or other
+    resource. Only the provider's ``model: <id>`` shape justifies model
+    fallback when the message does not otherwise say the model is missing.
+    """
+    return (
+        signal.status_code == 404 or "not_found_error" in signal.text
+    ) and bool(
+        re.search(
+            r'(?:^\s*|^HTTP\s+404:\s*|"message"\s*:\s*")model\s*:\s*[^"\s]',
+            signal.message,
+            re.IGNORECASE,
+        )
+    )
+
+
 _MODEL_UNAVAILABLE_SUBSTRINGS = (
     "no endpoints found",
     "model not found",
+    "model_not_found",
+    "model does not exist",
     "model is not available",
     "model not available",
     "not available in your region",
@@ -176,6 +258,15 @@ _MODEL_UNAVAILABLE_SUBSTRINGS = (
 
 # Family-independent kinds checked before any family table.
 _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
+    # A subscription/period usage cap is not RPM throttling or an empty balance.
+    FailureMatcher(
+        ProviderFailureKind.USAGE_LIMIT,
+        raw_codes=frozenset({"usage_limit", "usage_limit_reached", "usage_limited"}),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.USAGE_LIMIT,
+        message_substrings=("usage_limit_reached", "usage_limited", "usage limit reached"),
+    ),
     # Provider-specific adapters use several raw spellings for exhausted
     # credits.  Normalize them once here so every runtime consumer (including
     # Goal settlement) observes the same failure taxonomy.
@@ -190,11 +281,25 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
                 "billing_hard_limit",
                 "insufficient_quota",
                 "provider_quota_exceeded",
-                "usage_limit",
-                "usage_limit_reached",
-                "usage_limited",
             }
         ),
+    ),
+    # HTTP adapters preserve provider machine codes in the error detail even
+    # when the event code is the HTTP status. Check explicit quota evidence
+    # before a 429 is interpreted as a recoverable rate limit.
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        message_substrings=(
+            "insufficient_quota",
+            "billing_hard_limit",
+            "provider_quota_exceeded",
+            "insufficient credits",
+            "insufficient balance",
+        ),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        message_substrings_all=("exceeded your current quota", "billing"),
     ),
     # Local composite-provider validation.  This must classify before a
     # provider-family "does not support" matcher can turn it into
@@ -220,6 +325,14 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
         ),
     ),
     FailureMatcher(
+        ProviderFailureKind.CONTEXT_OVERFLOW,
+        status_codes=frozenset({400}),
+        raw_codes=frozenset({
+            "", "400", "litellm_error", "invalid_parameter_error", "invalid_request_error",
+        }),
+        predicate=_is_input_length_range_error,
+    ),
+    FailureMatcher(
         ProviderFailureKind.POLICY_REFUSAL,
         message_substrings=(
             "content policy",
@@ -235,15 +348,16 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
 
 FAILURE_TABLES: dict[str, tuple[FailureMatcher, ...]] = {
     "openai_compat": (
-        FailureMatcher(ProviderFailureKind.MODEL_NOT_FOUND, status_codes=frozenset({404})),
         FailureMatcher(
             ProviderFailureKind.MODEL_NOT_FOUND,
             message_substrings=_MODEL_UNAVAILABLE_SUBSTRINGS,
         ),
-        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401, 403})),
+        # A bare 403 says only that access was refused; a bare 404 can be
+        # a missing API route. Neither proves a credential or model problem.
+        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401})),
         FailureMatcher(
             ProviderFailureKind.AUTH_INVALID,
-            message_substrings=("invalid api key", "unauthorized"),
+            message_substrings=("invalid api key", "invalid_api_key", "unauthorized"),
         ),
         FailureMatcher(ProviderFailureKind.INSUFFICIENT_CREDITS, status_codes=frozenset({402})),
         FailureMatcher(
@@ -269,12 +383,15 @@ FAILURE_TABLES: dict[str, tuple[FailureMatcher, ...]] = {
         FailureMatcher(ProviderFailureKind.BAD_REQUEST, message_substrings=("invalid_request",)),
     ),
     "anthropic": (
-        FailureMatcher(ProviderFailureKind.MODEL_NOT_FOUND, status_codes=frozenset({404})),
         FailureMatcher(
             ProviderFailureKind.MODEL_NOT_FOUND,
-            message_substrings=("not_found_error", *_MODEL_UNAVAILABLE_SUBSTRINGS),
+            predicate=_is_anthropic_missing_model,
         ),
-        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401, 403})),
+        FailureMatcher(
+            ProviderFailureKind.MODEL_NOT_FOUND,
+            message_substrings=_MODEL_UNAVAILABLE_SUBSTRINGS,
+        ),
+        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401})),
         FailureMatcher(
             ProviderFailureKind.AUTH_INVALID,
             message_substrings=("authentication_error",),
@@ -311,9 +428,9 @@ FAILURE_TABLES: dict[str, tuple[FailureMatcher, ...]] = {
             ProviderFailureKind.MODEL_NOT_FOUND,
             message_substrings_all=("pull", "model"),
         ),
-        # Ollama Cloud / secured remote hosts return standard auth statuses;
+        # Ollama Cloud / secured remote hosts return standard auth failures;
         # without these rows a 401 fell through to UNKNOWN.
-        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401, 403})),
+        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401})),
         FailureMatcher(ProviderFailureKind.AUTH_INVALID, message_substrings=("unauthorized",)),
         FailureMatcher(
             ProviderFailureKind.TRANSPORT_TRANSIENT,
@@ -334,11 +451,17 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     FailureMatcher(ProviderFailureKind.RATE_LIMITED, message_substrings=("rate limit",)),
     FailureMatcher(
         ProviderFailureKind.RATE_LIMITED,
-        raw_codes=frozenset({"provider_retry_after_deadline"}),
+        raw_codes=frozenset({"provider_retry_after_deadline", "rate_limit_retry_exhausted"}),
     ),
     FailureMatcher(
         ProviderFailureKind.PROVIDER_OVERLOADED,
         status_codes=_GATEWAY_TRANSIENT_STATUS_CODES,
+    ),
+    FailureMatcher(
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        raw_codes=frozenset({
+            "provider_overload_retry_after_deadline", "provider_overload_retry_wait_exhausted",
+        }),
     ),
     FailureMatcher(ProviderFailureKind.PROVIDER_OVERLOADED, predicate=_is_gateway_transient),
     FailureMatcher(
@@ -361,6 +484,7 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
                 "incomplete_tool_stream",
                 "provider_pretext_buffer_exhausted",
                 "request_error",
+                CONNECTION_FAILED_CODE,
                 "response_incomplete",
             }
         ),
@@ -384,6 +508,22 @@ def classify_provider_error(
 ) -> ProviderFailureKind:
     """Classify a provider error into a stable runtime failure kind."""
 
+    # Explicit business codes win over contradictory HTTP envelopes/prose.
+    structured_kind = {
+        "account_request_uncertain": ProviderFailureKind.BAD_REQUEST,
+        "usage_limit": ProviderFailureKind.USAGE_LIMIT,
+        "usage_limit_reached": ProviderFailureKind.USAGE_LIMIT,
+        "usage_limited": ProviderFailureKind.USAGE_LIMIT,
+        "insufficient_quota": ProviderFailureKind.INSUFFICIENT_CREDITS,
+        "billing_hard_limit": ProviderFailureKind.INSUFFICIENT_CREDITS,
+        "provider_quota_exceeded": ProviderFailureKind.INSUFFICIENT_CREDITS,
+        "rate_limit_exceeded": ProviderFailureKind.RATE_LIMITED,
+        "rate_limit_error": ProviderFailureKind.RATE_LIMITED,
+        "invalid_api_key": ProviderFailureKind.AUTH_INVALID,
+        "authentication_error": ProviderFailureKind.AUTH_INVALID,
+    }.get((raw_code or "").strip().lower())
+    if structured_kind is not None:
+        return structured_kind
     provider = (provider_name or "").lower()
     family = _failure_family(provider)
     signal = FailureSignal(
@@ -448,6 +588,7 @@ def decide_recovery_action(kind: ProviderFailureKind) -> ProviderRecoveryAction:
     if kind in {
         ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.INSUFFICIENT_CREDITS,
+        ProviderFailureKind.USAGE_LIMIT,
         ProviderFailureKind.MODEL_NOT_FOUND,
         ProviderFailureKind.UNSUPPORTED_FEATURE,
     }:

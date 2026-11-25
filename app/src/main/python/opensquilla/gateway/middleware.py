@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import defaultdict
@@ -18,7 +19,6 @@ from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
     request_origin_allowed,
 )
-from opensquilla.gateway.scopes import is_loopback_address
 
 log = structlog.get_logger(__name__)
 
@@ -31,9 +31,7 @@ _ARTIFACT_PREVIEW_CONTROL_PATH_RE = re.compile(
     r"|artifacts/[^/]+/preview-leases"
     r")/?$"
 )
-_DESKTOP_CANDIDATE_PREVIEW_PATH_RE = re.compile(
-    r"^/api/v1/desktop-artifact-candidate-preview(?:/|$)"
-)
+
 
 
 def _is_artifact_preview_capability_path(path: str) -> bool:
@@ -46,27 +44,13 @@ def _is_artifact_preview_control_path(path: str) -> bool:
     return _ARTIFACT_PREVIEW_CONTROL_PATH_RE.fullmatch(path) is not None
 
 
-def _is_desktop_candidate_preview_path(path: str) -> bool:
-    return _DESKTOP_CANDIDATE_PREVIEW_PATH_RE.match(path) is not None
 
 
-def _desktop_candidate_bridge_authorized(request: Request) -> bool:
-    if not _is_desktop_candidate_preview_path(request.url.path):
-        return False
-    peer_ip = request.client.host if request.client is not None else None
-    if not is_loopback_address(peer_ip) or request.headers.get("origin") is not None:
-        return False
-    supplied = request.headers.get("authorization", "")
-    if not supplied.startswith("Bearer "):
-        return False
-    from opensquilla.gateway.desktop_artifact_bridge import (
-        desktop_artifact_bridge_token_valid,
-    )
-
-    return desktop_artifact_bridge_token_valid(supplied[7:])
 
 
-_CONTROL_PLANE_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz"})
+_CONTROL_PLANE_PATHS = frozenset(
+    {"/health", "/healthz", "/ready", "/readyz", "/readyz/core"}
+)
 
 
 def _path_is_at_or_below(path: str, prefix: str) -> bool:
@@ -142,10 +126,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/healthz",
         "/ready",
         "/readyz",
+        "/readyz/core",
         # These exist only for a Desktop-spawned gateway and authenticate with
         # the per-instance ownership nonce instead of the operator API token.
         "/api/desktop/identity",
         "/api/desktop/shutdown",
+        "/api/desktop/lifecycle",
     }
     PUBLIC_PATH_PREFIXES = ("/api/v1/artifact-preview/",)
 
@@ -158,7 +144,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if (
             request.url.path in self.PUBLIC_PATHS
             or request.url.path.startswith(self.PUBLIC_PATH_PREFIXES)
-            or _desktop_candidate_bridge_authorized(request)
             or _is_control_ui_request(
                 request,
                 base_path=self._config.control_ui.base_path,
@@ -176,10 +161,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if auth_mode == "token":
             token = self._extract_token(request)
-            from opensquilla.gateway.auth import resolve_auth
+            from opensquilla.gateway.auth import resolve_auth_async
 
             peer_ip = request.client.host if request.client is not None else None
-            principal = resolve_auth(
+            principal = await resolve_auth_async(
                 self._config,
                 auth_params={"token": token} if token else {},
                 role_claim="operator",
@@ -228,13 +213,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple sliding-window rate limiter per client IP."""
+    """Opt-in sliding-window request-count policy per client IP."""
 
     def __init__(self, app: ASGIApp, config: GatewayConfig) -> None:
         super().__init__(app)
         self._config = config
         # {ip: [(timestamp, count), ...]}
         self._windows: dict[str, list[float]] = defaultdict(list)
+        # Content reads use their own bounded lane.  They are numerous by
+        # design (one request per bounded range), but must not consume the
+        # control/API budget used by startup and interactive RPCs.
+        self._content_windows: dict[str, list[float]] = defaultdict(list)
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if not self._config.rate_limit.enabled:
@@ -263,6 +252,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         client_ip = self._get_client_ip(request)
         now = time.time()
+        if request.method.upper() == "GET" and path == "/api/content/read":
+            content_window = self._config.rate_limit.content_window_seconds
+            content_max_req = self._config.rate_limit.content_max_requests
+            self._content_windows[client_ip] = [
+                t for t in self._content_windows[client_ip]
+                if now - t < content_window
+            ]
+            if len(self._content_windows[client_ip]) >= content_max_req:
+                return JSONResponse(
+                    {"error": "Too Many Requests", "code": "CONTENT_RATE_LIMITED"},
+                    status_code=429,
+                    headers={"Retry-After": self._retry_after(
+                        self._content_windows[client_ip], content_window, now,
+                    )},
+                )
+            self._content_windows[client_ip].append(now)
+            return await call_next(request)  # type: ignore[no-any-return]
+
         window = self._config.rate_limit.window_seconds
         max_req = self._config.rate_limit.max_requests
 
@@ -271,11 +278,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(self._windows[client_ip]) >= max_req:
             return JSONResponse(
-                {"error": "Too Many Requests", "code": "RATE_LIMITED"}, status_code=429
+                {"error": "Too Many Requests", "code": "RATE_LIMITED"},
+                status_code=429,
+                headers={"Retry-After": self._retry_after(
+                    self._windows[client_ip], window, now,
+                )},
             )
 
         self._windows[client_ip].append(now)
         return await call_next(request)  # type: ignore[no-any-return]
+
+    @staticmethod
+    def _retry_after(timestamps: list[float], window: int, now: float) -> str:
+        # A slot becomes available when the oldest accepted request expires.
+        # Zero-request configurations reject without an existing timestamp.
+        remaining = timestamps[0] + window - now if timestamps else window
+        return str(max(1, math.ceil(remaining)))
 
     def _get_client_ip(self, request: Request) -> str:
         forwarded = request.headers.get("x-forwarded-for")
@@ -306,7 +324,6 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                 )
             if (
                 _is_artifact_preview_control_path(request.url.path)
-                or _is_desktop_candidate_preview_path(request.url.path)
             ):
                 log.error(
                     "http.request_failed",
@@ -354,12 +371,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         ):
             response.headers["content-security-policy"] = (
                 "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
                 "style-src 'self' 'unsafe-inline'; "
-                "img-src 'self' data: blob:; "
+                "img-src 'self' data: blob: https:; "
                 "connect-src 'self' ws: wss: http://*.localhost:*; "
                 "media-src 'self' blob: https:; "
                 "font-src 'self' data:; "
+                "worker-src 'self' blob:; "
                 "frame-src 'self' blob: http://*.localhost:*; "
                 "object-src 'none'; "
                 "frame-ancestors 'self';"

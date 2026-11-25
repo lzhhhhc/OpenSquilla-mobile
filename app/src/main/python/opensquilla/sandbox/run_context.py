@@ -22,6 +22,7 @@ from opensquilla.sandbox.run_mode import (
     project_default_run_mode,
 )
 from opensquilla.sandbox.user_grants import load_user_grants_payload
+from opensquilla.sandbox.user_grants_worker import user_grants_operation
 
 RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
 RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
@@ -74,6 +75,12 @@ class RunContext:
     temporary_grants: tuple[TemporaryGrant, ...] = ()
     run_mode_source: str | None = None
     source: str = "default"
+    # Trusted execution-workspace binding kind.  This is populated from the
+    # session-owned execution_workspace binding at the gateway boundary; it is
+    # deliberately separate from ``workspace`` because a path alone is not an
+    # isolation guarantee.  ``configured`` and absent bindings must never
+    # authorize channel workspace authoring.
+    workspace_binding_kind: str | None = None
 
     def to_origin_payload(self) -> dict[str, Any]:
         return {
@@ -503,6 +510,7 @@ def _with_user_grants(context: RunContext) -> RunContext:
         temporary_grants=context.temporary_grants,
         run_mode_source=context.run_mode_source,
         source=context.source,
+        workspace_binding_kind=context.workspace_binding_kind,
     )
 
 
@@ -548,26 +556,81 @@ async def get_run_context(
     include_user_grants: bool = True,
     session_node: Any | None = None,
 ) -> RunContext:
+    # Read session-manager state inside the mutation scope to avoid retaining
+    # transient updates that are later rolled back. An explicitly supplied node
+    # retains the caller's existing snapshot semantics.
+    async with user_grants_operation() as operation:
+        context = await _get_session_run_context(
+            session_manager, session_key, config=config, workspace=workspace,
+            session_node=session_node,
+        )
+        if include_user_grants:
+            return await operation.run(lambda: _with_user_grants(context))
+        return context
+
+
+async def _get_session_run_context(
+    session_manager: Any,
+    session_key: str,
+    *,
+    config: Any,
+    workspace: str | None,
+    session_node: Any | None = None,
+) -> RunContext:
+    """Read session state while the caller owns ``user_grants_operation``."""
+    binding_kind = None
     node = (
         session_node
         if session_node is not None
         else await _get_session_node(session_manager, session_key)
     )
     if node is not None:
+        binding = getattr(node, "execution_workspace", None)
+        if binding is not None and not getattr(node, "workspace_id", None):
+            from opensquilla.execution_workspaces import validate_execution_workspace
+
+            validated_binding = validate_execution_workspace(binding)
+            workspace = validated_binding["root"]
+            binding_kind = validated_binding.get("kind")
+            if binding_kind == "managed" and (
+                getattr(node, "parent_session_key", None)
+                or getattr(node, "spawned_by", None)
+                or getattr(node, "forked_from_parent", False)
+            ):
+                # Branch/spawn preserves the parent's binding for trusted
+                # owner workflows. That shared directory is not a unique
+                # execution workspace for ordinary channel authoring.
+                binding_kind = None
+        elif getattr(node, "workspace_id", None):
+            # Project workspaces are durable configured roots.  They are valid
+            # for trusted owner workflows, but are never a managed channel
+            # authoring workspace.
+            binding_kind = "configured"
+        else:
+            binding_kind = None
         origin = _origin_dict(node)
         saved = _context_from_payload(
             _without_materialized_user_grants(origin.get(RUN_CONTEXT_ORIGIN_KEY)),
             "saved",
         )
         if saved is not None:
-            return _with_user_grants(saved) if include_user_grants else saved
+            if binding is not None and not getattr(node, "workspace_id", None):
+                saved = replace(
+                    saved,
+                    workspace=workspace,
+                    workspace_binding_kind=binding_kind,
+                )
+            else:
+                saved = replace(saved, workspace_binding_kind=binding_kind)
+            return saved
     configured_mode, _source = await resolve_default_run_mode(session_manager, config)
     context = RunContext(
         run_mode=configured_mode,
         workspace=_workspace_from_payload(workspace),
         source="default",
+        workspace_binding_kind=binding_kind,
     )
-    return _with_user_grants(context) if include_user_grants else context
+    return context
 
 
 async def resolve_default_run_mode(
@@ -602,6 +665,16 @@ async def persist_run_context(
     session_key: str,
     context: RunContext,
 ) -> RunContext:
+    async with user_grants_operation():
+        return await _persist_run_context(session_manager, session_key, context)
+
+
+async def _persist_run_context(
+    session_manager: Any,
+    session_key: str,
+    context: RunContext,
+) -> RunContext:
+    """Persist session state while the caller owns ``user_grants_operation``."""
     node = await _get_session_node(session_manager, session_key)
     if node is None:
         raise KeyError(f"Session not found: {session_key}")

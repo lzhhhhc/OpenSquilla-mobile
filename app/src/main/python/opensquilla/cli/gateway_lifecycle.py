@@ -17,25 +17,17 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from opensquilla.cli.url_utils import normalize_gateway_url
-from opensquilla.paths import default_opensquilla_home, state_dir
+from opensquilla.paths import (
+    default_opensquilla_home,
+    desktop_profile_lifecycle_active,
+    state_dir,
+)
 
 UNMANAGED_GATEWAY_RUNNING = "UNMANAGED_GATEWAY_RUNNING"
 MANAGED_GATEWAY_TARGET_MISMATCH = "MANAGED_GATEWAY_TARGET_MISMATCH"
 REMOTE_GATEWAY_UNAVAILABLE = "REMOTE_GATEWAY_UNAVAILABLE"
 DESKTOP_PROFILE_RECOVERY_REQUIRED = "DESKTOP_PROFILE_RECOVERY_REQUIRED"
 DESKTOP_CONFIG_OUTSIDE_PROFILE = "desktop_config_outside_profile"
-
-_DESKTOP_PROFILE_KINDS = frozenset({"desktop-primary", "desktop-recovery"})
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-
-def desktop_profile_lifecycle_active() -> bool:
-    """Return whether lifecycle bookkeeping belongs to a Desktop profile."""
-
-    profile_kind = os.environ.get("OPENSQUILLA_PROFILE_KIND", "").strip().lower()
-    if profile_kind:
-        return profile_kind in _DESKTOP_PROFILE_KINDS
-    return os.environ.get("OPENSQUILLA_DESKTOP", "").strip().lower() in _TRUTHY
 
 
 def desktop_config_path_is_profile_local(config_path: str | None = None) -> bool:
@@ -81,6 +73,37 @@ def gateway_log_path() -> Path:
 def _running_on_windows() -> bool:
     """Indirection over ``os.name`` so the kill path is easy to exercise in tests."""
     return os.name == "nt"
+
+
+def _gateway_runtime_cwd() -> Path:
+    """Return a stable cwd for a spawned Gateway.
+
+    A Gateway must not inherit a caller's temporary checkout cwd: the checkout
+    can be removed while the child is still serving requests.
+    """
+
+    if getattr(sys, "frozen", False):
+        try:
+            candidate = Path(sys.executable).resolve(strict=True).parent
+        except (OSError, RuntimeError, ValueError):
+            candidate = Path(sys.executable).parent
+    else:
+        try:
+            module_path = Path(__file__).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            module_path = Path(__file__)
+        candidate = next(
+            (
+                parent
+                for parent in module_path.parents
+                if (parent / "pyproject.toml").is_file()
+                and (parent / "src" / "opensquilla").is_dir()
+            ),
+            module_path.parent,
+        )
+    if not candidate.is_dir():
+        raise RuntimeError(f"runtime_root_missing: {candidate}")
+    return candidate
 
 
 # Short bound on how long to wait for a process to disappear after a *hard*
@@ -294,13 +317,19 @@ class GatewayLifecycleManager:
         started_at = self._now()
         try:
             process = self._spawn_gateway(argv)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
+            detail = str(exc)
+            error_code = (
+                detail.split(":", 1)[0].strip().upper()
+                if isinstance(exc, RuntimeError) and ":" in detail
+                else "SPAWN_FAILED"
+            )
             return self._result(
                 "start",
                 "start_failed",
                 ok=False,
-                code="SPAWN_FAILED",
-                message=str(exc),
+                code=error_code,
+                message=detail,
                 exit_code_value=1,
             )
 
@@ -629,6 +658,7 @@ class GatewayLifecycleManager:
         creationflags = 0
         if os.name == "nt":
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        runtime_cwd = _gateway_runtime_cwd()
         try:
             process = subprocess.Popen(  # noqa: S603 - argv is constructed internally.
                 argv,
@@ -637,6 +667,7 @@ class GatewayLifecycleManager:
                 stderr=subprocess.STDOUT,
                 env=env,
                 shell=False,
+                cwd=str(runtime_cwd),
                 start_new_session=os.name != "nt",
                 creationflags=creationflags,
             )

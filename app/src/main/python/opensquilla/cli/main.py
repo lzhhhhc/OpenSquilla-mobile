@@ -11,6 +11,7 @@ import typer
 from opensquilla.cli.stdio import configure_stdio_for_unicode
 from opensquilla.env import load_env, warn_if_proxy_ignored
 from opensquilla.paths import default_opensquilla_home, is_valid_profile_name
+from opensquilla.startup_timing import startup_phase_end, startup_phase_start
 
 configure_stdio_for_unicode()
 
@@ -127,11 +128,11 @@ if not _RECOVERY_OFFLINE:
     _load_env_for_active_home()
     warn_if_proxy_ignored()
 
+_command_imports_started = startup_phase_start("cli_command_imports")
 from opensquilla.cli.agent_cmd import run_agent_command  # noqa: E402
 from opensquilla.cli.agents_cmd import agents_app  # noqa: E402
 from opensquilla.cli.bundle_cmd import bundle_command  # noqa: E402
 from opensquilla.cli.channels_cmd import channels_app  # noqa: E402
-from opensquilla.cli.codetask_cmd import codetask_app  # noqa: E402
 from opensquilla.cli.config_cmd import app as config_app  # noqa: E402
 from opensquilla.cli.cost_cmd import app as cost_app  # noqa: E402
 from opensquilla.cli.cron_cmd import cron_app  # noqa: E402
@@ -141,7 +142,6 @@ from opensquilla.cli.doctor_cmd import doctor_command  # noqa: E402
 from opensquilla.cli.ensemble_cmd import ensemble_app  # noqa: E402
 from opensquilla.cli.init_cmd import init_command  # noqa: E402
 from opensquilla.cli.mcp_server_cmd import app as mcp_server_app  # noqa: E402
-from opensquilla.cli.memory_flush_cmd import memory_flush_session_cmd  # noqa: E402
 from opensquilla.cli.migrate_cmd import migrate_app  # noqa: E402
 from opensquilla.cli.models_cmd import app as models_app  # noqa: E402
 from opensquilla.cli.onboard_cmd import configure_command, onboard_app  # noqa: E402
@@ -155,6 +155,8 @@ from opensquilla.cli.sessions_cmd import app as sessions_app  # noqa: E402
 from opensquilla.cli.skills_cmd import skills_app  # noqa: E402
 from opensquilla.cli.uninstall_cmd import uninstall_command  # noqa: E402
 from opensquilla.observability.cli_logging import configure_cli_structlog  # noqa: E402
+
+startup_phase_end("cli_command_imports", _command_imports_started)
 
 app = typer.Typer(
     name="opensquilla",
@@ -202,7 +204,6 @@ app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(search_app, name="search")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(skills_app, name="skills")
-app.add_typer(codetask_app, name="code-task")
 
 app.command("init")(init_command)
 app.command("doctor")(doctor_command)
@@ -216,10 +217,6 @@ app.command("configure")(configure_command)
 
 memory_app = typer.Typer(help="Memory subsystem commands.")
 app.add_typer(memory_app, name="memory")
-raw_fallbacks_app = typer.Typer(help="Raw fallback receipt commands.")
-memory_app.add_typer(raw_fallbacks_app, name="raw-fallbacks")
-repair_app = typer.Typer(help="Compaction memory repair commands.")
-memory_app.add_typer(repair_app, name="repair")
 
 
 def _build_cli_dream(agent: str, *, force: bool = False, need_provider: bool = True):
@@ -444,204 +441,6 @@ def memory_show_cmd(
         console.print("[dim]... truncated[/dim]")
 
 
-@raw_fallbacks_app.command("list")
-def memory_raw_fallbacks_list_cmd(
-    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
-    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
-) -> None:
-    """List raw fallback receipts from the running gateway."""
-
-    from rich.table import Table
-
-    from opensquilla.cli.gateway_rpc import run_gateway_sync
-    from opensquilla.cli.output import print_json
-    from opensquilla.cli.ui import console
-
-    async def _run(client):
-        return await client.call("memory.raw_fallbacks.list", {"agentId": agent_id})
-
-    payload = run_gateway_sync(_run, json_output=json_output)
-    if json_output:
-        print_json(payload)
-        return
-
-    table = Table(title=f"Raw memory fallbacks - agent={agent_id}", show_header=True)
-    table.add_column("Path")
-    table.add_column("Size bytes", justify="right")
-    table.add_column("Reason")
-    table.add_column("Modified")
-    for row in payload.get("files", []):
-        table.add_row(
-            str(row.get("path") or ""),
-            "" if row.get("sizeBytes") is None else str(row.get("sizeBytes")),
-            str(row.get("reason") or ""),
-            str(row.get("modifiedAt") or ""),
-        )
-    console.print(table)
-
-
-@raw_fallbacks_app.command("show")
-def memory_raw_fallbacks_show_cmd(
-    path: str = typer.Argument(..., help="Raw fallback path"),
-    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
-    from_line: int | None = typer.Option(None, "--from-line", help="Start line, 1-indexed"),
-    lines: int | None = typer.Option(None, "--lines", help="Number of lines to return"),
-    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
-) -> None:
-    """Show one raw fallback receipt from the running gateway."""
-
-    from opensquilla.cli.gateway_rpc import run_gateway_sync
-    from opensquilla.cli.output import print_json
-    from opensquilla.cli.ui import console
-
-    async def _run(client):
-        params: dict[str, object] = {"path": path, "agentId": agent_id}
-        if from_line is not None:
-            params["fromLine"] = from_line
-        if lines is not None:
-            params["lines"] = lines
-        return await client.call("memory.raw_fallbacks.show", params)
-
-    payload = run_gateway_sync(_run, json_output=json_output)
-    if json_output:
-        print_json(payload)
-        return
-    console.print(str(payload.get("content") or ""))
-    if payload.get("truncated"):
-        console.print("[dim]... truncated[/dim]")
-
-
-@repair_app.command("list")
-def memory_repair_list_cmd(
-    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
-    limit: int = typer.Option(50, "--limit", min=1, help="Maximum pending repairs"),
-    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
-    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
-) -> None:
-    """List degraded compaction records pending repair."""
-
-    from rich.table import Table
-
-    from opensquilla.cli.gateway_rpc import run_gateway_sync
-    from opensquilla.cli.output import print_json
-    from opensquilla.cli.ui import console
-
-    async def _run(client):
-        return await client.call(
-            "memory.repair.list",
-            {"agentId": agent_id, "limit": limit},
-        )
-
-    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
-    if json_output:
-        print_json(payload)
-        return
-
-    table = Table(title=f"Memory repair queue - agent={agent_id}", show_header=True)
-    table.add_column("Summary")
-    table.add_column("Session")
-    table.add_column("Compaction")
-    table.add_column("Status")
-    table.add_column("Removed", justify="right")
-    for row in payload.get("items", []):
-        table.add_row(
-            str(row.get("summaryId") or ""),
-            str(row.get("sessionKey") or ""),
-            str(row.get("compactionId") or ""),
-            str(row.get("flushReceiptStatus") or ""),
-            "" if row.get("removedCount") is None else str(row.get("removedCount")),
-        )
-    console.print(table)
-
-
-@repair_app.command("show")
-def memory_repair_show_cmd(
-    summary_id: int | None = typer.Option(None, "--summary-id", help="Repair summary id"),
-    session_key: str = typer.Option("", "--session-key", help="Session key to inspect"),
-    compaction_id: str = typer.Option("", "--compaction-id", help="Compaction id to inspect"),
-    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
-    entry_limit: int = typer.Option(
-        20,
-        "--entry-limit",
-        min=1,
-        help="Maximum preimage entries",
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
-) -> None:
-    """Show archived preimage entries for one degraded compaction."""
-
-    from opensquilla.cli.gateway_rpc import run_gateway_sync
-    from opensquilla.cli.output import print_json
-    from opensquilla.cli.ui import console
-
-    async def _run(client):
-        params: dict[str, object] = {"agentId": agent_id}
-        if summary_id is not None:
-            params["summaryId"] = summary_id
-        if session_key:
-            params["sessionKey"] = session_key
-        if compaction_id:
-            params["compactionId"] = compaction_id
-        if entry_limit != 20:
-            params["entryLimit"] = entry_limit
-        return await client.call("memory.repair.show", params)
-
-    payload = run_gateway_sync(_run, json_output=json_output)
-    if json_output:
-        print_json(payload)
-        return
-    for row in payload.get("entries", []):
-        console.print(f"[{row.get('role', '')}] {row.get('content', '')}")
-
-
-@repair_app.command("run")
-def memory_repair_run_cmd(
-    summary_id: int | None = typer.Option(None, "--summary-id", help="Repair summary id"),
-    session_key: str = typer.Option("", "--session-key", help="Session key to repair"),
-    compaction_id: str = typer.Option("", "--compaction-id", help="Compaction id to repair"),
-    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
-    limit: int = typer.Option(50, "--limit", min=1, help="Maximum repairs to run"),
-    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
-    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
-) -> None:
-    """Retry extraction from archived compaction preimages."""
-
-    from rich.table import Table
-
-    from opensquilla.cli.gateway_rpc import run_gateway_sync
-    from opensquilla.cli.output import print_json
-    from opensquilla.cli.ui import console
-
-    async def _run(client):
-        params: dict[str, object] = {"agentId": agent_id, "limit": limit}
-        if summary_id is not None:
-            params["summaryId"] = summary_id
-        if session_key:
-            params["sessionKey"] = session_key
-        if compaction_id:
-            params["compactionId"] = compaction_id
-        return await client.call("memory.repair.run", params)
-
-    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
-    if json_output:
-        print_json(payload)
-        return
-
-    table = Table(title=f"Memory repair run - agent={agent_id}", show_header=True)
-    table.add_column("Session")
-    table.add_column("Compaction")
-    table.add_column("Status")
-    table.add_column("Reason")
-    for row in payload.get("results", []):
-        table.add_row(
-            str(row.get("sessionKey") or ""),
-            str(row.get("compactionId") or ""),
-            str(row.get("status") or ""),
-            str(row.get("reason") or ""),
-        )
-    console.print(table)
-
-
 @memory_app.command("dream")
 def memory_dream_cmd(
     agent: str = typer.Option("main", "--agent", "-a", help="Agent ID"),
@@ -678,9 +477,6 @@ def memory_dream_cmd(
         raise typer.Exit(code=1)
 
 
-memory_app.command("flush-session")(memory_flush_session_cmd)
-
-
 # ── gateway sub-app ───────────────────────────────────────────────────────────
 
 gateway_app = typer.Typer(
@@ -689,15 +485,15 @@ gateway_app = typer.Typer(
 )
 app.add_typer(gateway_app, name="gateway")
 
-GATEWAY_PROFILE_IN_USE_MARKER = "OPENSQUILLA_PROFILE_IN_USE"
-
-
 @gateway_app.command("run")
 def gateway_run(
     port: int | None = typer.Option(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to bind (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -720,50 +516,15 @@ def gateway_run(
     OPENSQUILLA_GATEWAY_HOST > default (127.0.0.1). Binding to 0.0.0.0 or :: is
     opt-in only — the gateway's default auth assumes loopback scope.
     """
-    from opensquilla.cli.gateway_cmd import run_gateway
-    from opensquilla.gateway.desktop_ownership import (
-        release_active_desktop_gateway_ownership,
-    )
-    from opensquilla.recovery import (
-        LegacyGatewayRunningError,
-        ProfileLockBusyError,
-        guarded_desktop_profile,
-    )
+    from opensquilla.cli.gateway_runner import run_gateway_with_profile
 
-    # The child that owns the gateway retains both the RC4 profile lock and
-    # the legacy gateway lease for its complete write-capable lifetime. The
-    # bounded wait lets a predecessor still releasing its lease (an app
-    # restart, a finishing cron tick) resolve on its own instead of failing
-    # startup with OPENSQUILLA_PROFILE_IN_USE immediately.
-    try:
-        try:
-            with guarded_desktop_profile(lock_timeout=5.0):
-                run_gateway(
-                    port=port,
-                    bind=bind,
-                    listen=listen,
-                    debug=debug,
-                    config_path=config_path,
-                )
-        except (ProfileLockBusyError, LegacyGatewayRunningError):
-            # This marker is consumed by the Desktop launcher. Keep both lines
-            # independent of the profile path carried by the lock exception: paths
-            # may contain user names, and an actionable startup failure does not
-            # need to expose them or a traceback.
-            typer.echo(GATEWAY_PROFILE_IN_USE_MARKER)
-            typer.echo(
-                "Gateway could not start: Another OpenSquilla process is still using "
-                "this profile. Quit every OpenSquilla app or terminal using it, then "
-                "try again; if no process will exit, restart the computer. Do not "
-                "delete profile lock files."
-            )
-            raise typer.Exit(code=1) from None
-    finally:
-        # The record remains available throughout shutdown and disappears only
-        # after guarded_desktop_profile has released the profile writer lease.
-        # A permanent sidecar lock serializes exact-record comparison/removal
-        # with a successor's atomic replacement in the handoff window.
-        release_active_desktop_gateway_ownership()
+    run_gateway_with_profile(
+        port=port,
+        bind=bind,
+        listen=listen,
+        debug=debug,
+        config_path=config_path,
+    )
 
 
 @gateway_app.command("start")
@@ -772,6 +533,7 @@ def gateway_start(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to bind (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -804,6 +566,7 @@ def gateway_status(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to inspect (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -840,6 +603,7 @@ def gateway_stop(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to stop (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -872,6 +636,7 @@ def gateway_restart(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to restart (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -980,12 +745,14 @@ def agent(
     iteration_timeout_seconds: float | None = typer.Option(
         None,
         "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,
@@ -1183,11 +950,7 @@ def reset_cmd(
         ),
     ),
 ) -> None:
-    """Reset a session, flushing its memory synchronously.
-
-    Exit codes: 0 on success (including raw-dump fallback),
-    1 when flush + raw-dump both fail (session preserved).
-    """
+    """Reset a session after saving a deterministic transcript checkpoint."""
     import asyncio
 
     from opensquilla.cli.gateway_client import GatewayClient, GatewayRPCError
@@ -1198,8 +961,7 @@ def reset_cmd(
     # value, so they keep outranking everything, exactly as before. What the
     # literal default used to swallow is the step below it: the gateway the
     # selected profile actually configured. `reset` mutates session state, so
-    # aiming it at the wrong gateway is not a lookup that fails — it flushes
-    # and rotates whatever session key matches on 127.0.0.1:18791.
+    # aiming it at the wrong gateway rotates the matching session on that gateway.
     target_url = normalize_gateway_url(gateway_url) if gateway_url else default_gateway_url()
 
     async def _go():
@@ -1214,36 +976,16 @@ def reset_cmd(
         result = asyncio.run(_go())
     except GatewayRPCError as exc:
         data = exc.data or {}
-        receipt = data.get("flush_receipt", {}) or {}
         typer.secho(f"\u2717 Reset aborted: {exc.message}", fg=typer.colors.RED)
         typer.echo(f"  Session preserved: {data.get('session_id', '?')}")
-        if receipt.get("error"):
-            typer.echo(f"  Cause: {receipt['error']}")
         raise typer.Exit(1)
 
     payload = result
-    receipt = payload.get("flush_receipt") or {}
-    mode = receipt.get("mode", "?")
     typer.secho(
         f"\u2713 Session reset ({payload.get('previous_session_id', '?')} \u2192 "
         f"{payload.get('session_id', '?')}).",
         fg=typer.colors.GREEN,
     )
-    if mode == "llm":
-        dur = receipt.get("duration_ms", 0) / 1000
-        typer.echo(f"  Flush mode: llm ({dur:.1f}s)")
-        for p in receipt.get("flushed_paths") or []:
-            typer.echo(f"  Saved to: {p}")
-    elif mode == "raw":
-        reason = receipt.get("raw_reason", "unknown")
-        dur = receipt.get("duration_ms", 0) / 1000
-        typer.echo(f"  Flush mode: raw (reason: {reason}, after {dur:.1f}s)")
-        for p in receipt.get("flushed_paths") or []:
-            typer.echo(f"  Saved to: {p} (raw transcript dump)")
-    elif mode == "skipped":
-        typer.echo("  Flush mode: skipped (empty transcript)")
-    else:
-        typer.echo(f"  Flush mode: {mode}")
 
 @app.command("version")
 def version_cmd(

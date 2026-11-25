@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.paths import native_io_path
+from opensquilla.token_estimation import estimate_material_text_tokens
 
 ATTACHMENT_REF_KIND = "attachment_ref"
 TRANSCRIPT_MATERIAL_STORE = "transcript"
@@ -536,6 +538,7 @@ def promote_pending_chat_input_attachments(
     pending_input_id: str,
     target_session_id: str,
     disk_budget_bytes: int | None = None,
+    persist_enabled: bool = True,
 ) -> list[dict[str, Any]]:
     """Copy private pending refs into canonical transcript material refs."""
 
@@ -552,6 +555,21 @@ def promote_pending_chat_input_attachments(
         promotion_groups.setdefault(source_session_id, set()).add(
             _validate_sha256(attachment.get("sha256") or attachment.get("material_id"))
         )
+    if not persist_enabled:
+        # The queue retains ownership until admission commits. The live turn
+        # receives its own bytes without a new canonical material reference.
+        return [
+            {
+                "type": attachment.get("mime") or attachment.get("type"),
+                "name": attachment.get("name"),
+                "data": base64.b64encode(
+                    read_attachment_ref_bytes(attachment, media_root=media_root)
+                ).decode("ascii"),
+                "_was_staged": True,
+                **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
+            }
+            for attachment in attachments
+        ]
     # Record before linking. A crash can then leave a harmless cleanup hint,
     # never an undiscoverable canonical orphan.
     for source_session_id, material_ids in promotion_groups.items():
@@ -602,16 +620,28 @@ def promote_pending_chat_input_attachments(
         name = attachment.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("pending attachment name is required")
-        promoted.append(
-            make_attachment_ref(
-                sha256=sha,
-                name=name,
-                mime=mime,
-                size=len(payload),
-                session_id=target_session_id,
-                source="pending_chat_input",
-            )
+        promoted_ref = make_attachment_ref(
+            sha256=sha,
+            name=name,
+            mime=mime,
+            size=len(payload),
+            session_id=target_session_id,
+            source="pending_chat_input",
         )
+        if attachment.get("origin") == "paste":
+            promoted_ref["origin"] = "paste"
+            if mime == "text/plain":
+                try:
+                    decoded_text = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    promoted_ref["_material_chars"] = len(decoded_text)
+                    promoted_ref["_material_estimated_tokens"] = (
+                        estimate_material_text_tokens(decoded_text)
+                    )
+                    promoted_ref["_material_path"] = str(target_path)
+        promoted.append(promoted_ref)
     return promoted
 
 

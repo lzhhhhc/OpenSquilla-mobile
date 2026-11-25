@@ -10,6 +10,11 @@ from typing import Any, Literal, cast, get_args
 
 from pydantic import ValidationError
 
+from opensquilla.application.config_secrets import (
+    clear_runtime_secret_paths,
+    forget_secret_provenance_paths,
+    inherit_runtime_secrets,
+)
 from opensquilla.channels.registry import discover_all, parse_channel_entry
 from opensquilla.gateway.config import (
     AudioConfig,
@@ -22,11 +27,6 @@ from opensquilla.gateway.config import (
     MemoryEmbeddingConfig,
     SquillaRouterConfig,
     _default_tiers,
-)
-from opensquilla.gateway.config_secrets import (
-    clear_runtime_secret_paths,
-    forget_secret_provenance_paths,
-    inherit_runtime_secrets,
 )
 from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,
@@ -54,6 +54,13 @@ from opensquilla.onboarding.redaction import (
     redact_router_tiers_payload,
     redact_search_payload,
 )
+from opensquilla.onboarding.router_policy import (
+    LlmProfileActivationError,
+    explicitly_selects_cross_provider_tier,
+    reconcile_recommended_router,
+    validate_router_candidate,
+    validate_router_reactivation,
+)
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
 from opensquilla.provider.environment import environment_value
 from opensquilla.provider.image_generation_credentials import (
@@ -67,6 +74,7 @@ from opensquilla.provider.image_generation_policy import (
 )
 from opensquilla.provider.preset_registry import ProviderPreset, get_preset
 from opensquilla.router_tiers import (
+    CUSTOM_B5_SELECTION_MODE,
     DEFAULT_TEXT_TIER,
     HIGHEST_TEXT_TIER,
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
@@ -112,21 +120,6 @@ class MutationResult:
     warnings: list[str] = field(default_factory=list)
     public_payload: dict[str, Any] = field(default_factory=dict)
     remove_paths: tuple[str, ...] = ()
-
-
-class LlmProfileActivationError(ValueError):
-    """Stable, secret-free validation failure for profile promotion."""
-
-    def __init__(
-        self,
-        reason: str,
-        message: str | None = None,
-        *,
-        details: Mapping[str, Any] | None = None,
-    ) -> None:
-        self.reason = reason
-        self.details = dict(details or {})
-        super().__init__(message or reason)
 
 
 class LlmProfileRemovalError(ValueError):
@@ -247,23 +240,7 @@ def _reconcile_router_profile_for_provider(
     *,
     preset: ProviderPreset | None = None,
 ) -> None:
-    router_enabled = bool(getattr(cfg.squilla_router, "enabled", True))
-    preset = preset or get_preset(provider_id)
-    if preset is None:
-        raise ValueError(f"provider {provider_id!r} has no managed router preset")
-    router_payload = cfg.squilla_router.model_dump(mode="python")
-    router_payload.pop("tiers", None)
-    router_payload["enabled"] = router_enabled
-    router_payload["preset_binding"] = "follow_primary"
-    if preset.persistable and router_enabled:
-        router_payload["tier_profile"] = provider_id
-    else:
-        router_payload["tier_profile"] = None
-        router_payload["tiers"] = _preset_tiers_with_model(
-            preset,
-            str(getattr(cfg.llm, "model", "") or "").strip(),
-        )
-    cfg.squilla_router = SquillaRouterConfig(**router_payload)
+    reconcile_recommended_router(cfg, provider_id, preset=preset)
 
 
 def _normalize_explicit_text_tier(default_tier: str | None) -> str | None:
@@ -312,6 +289,19 @@ def _merge_router_tiers(
         tier_name = normalize_text_tier(name) or str(name)
         override = _normalize_tier_payload(tier_name, raw_override)
         current = dict(merged.get(tier_name, {}))
+        deployment_changed = any(
+            field_name in override
+            and str(override.get(field_name) or "").strip()
+            != str(current.get(field_name) or "").strip()
+            for field_name in ("provider", "model")
+        )
+        if deployment_changed and "supports_image" not in override:
+            # Capability evidence belongs to a deployment identity. A model-
+            # only/provider-only override must not inherit the managed preset's
+            # legacy declaration for a different deployment. These fields
+            # remain readable for older clients, not runtime capability facts.
+            current.pop("supports_image", None)
+            current.pop("supportsImage", None)
         # A pre-``ensemble_enabled`` client can still submit an explicit
         # per-tier selection mode.  That legacy field is an ownership
         # boundary: do not let a managed preset's new shared-plan flag turn
@@ -340,12 +330,13 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
     legacy_selection_mode = str(
         tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
     ).strip()
+    # Retired image switches do not change the semantic routing preset.
+    # Keep old values in the stored mapping for client compatibility only.
     return {
         "provider": str(tier.get("provider") or "").strip().lower(),
         "model": str(tier.get("model") or "").strip(),
         "description": str(tier.get("description") or "").strip(),
         "thinking_level": (str(thinking or "").strip() or None),
-        "supports_image": bool(tier.get("supports_image", tier.get("supportsImage", False))),
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
         "ensemble_enabled": ensemble_enabled,
         # Once the new tri-state field exists it owns execution. Retained
@@ -507,6 +498,8 @@ def _cross_provider_tier_warnings(
         ensemble_globally_enabled=ensemble_globally_enabled,
     )
     for tier_name in sorted(tiers):
+        if tier_name == "image_model":
+            continue
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
             continue
@@ -656,54 +649,6 @@ def _implicit_primary_and_router(config: GatewayConfig) -> bool:
     )
 
 
-def _router_provider_conflicts(
-    config: GatewayConfig,
-    target_provider: str,
-    *,
-    shared_selection_mode: str | None = None,
-) -> tuple[str, ...]:
-    """Foreign providers that would be vetoed/misrouted after a primary swap."""
-
-    router = config.squilla_router
-    if not bool(getattr(router, "enabled", False)):
-        return ()
-    if bool(getattr(router, "cross_provider_tiers", False)):
-        return ()
-    target = str(target_provider or "").strip().lower()
-    effective_shared_mode = (
-        effective_ensemble_selection_mode(config)
-        if shared_selection_mode is None
-        else str(shared_selection_mode or "").strip()
-    )
-    tiers = getattr(router, "tiers", {}) or {}
-    ensemble_globally_enabled = bool(
-        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-    )
-    dynamic_members_active = router_dynamic_tier_members_active(
-        tiers if isinstance(tiers, Mapping) else {},
-        shared_selection_mode=effective_shared_mode,
-        ensemble_globally_enabled=ensemble_globally_enabled,
-    )
-    conflicts: set[str] = set()
-    if isinstance(tiers, Mapping):
-        for tier_name, tier in tiers.items():
-            if not isinstance(tier, Mapping):
-                continue
-            provider_role = tier_provider_role(
-                tier_name,
-                tier,
-                shared_selection_mode=effective_shared_mode,
-                router_dynamic_members_active=dynamic_members_active,
-                ensemble_globally_enabled=ensemble_globally_enabled,
-            )
-            if provider_role not in {"direct", "dynamic_member"}:
-                continue
-            provider = str(tier.get("provider") or "").strip().lower()
-            if provider and provider != target:
-                conflicts.add(provider)
-    return tuple(sorted(conflicts))
-
-
 def _preserve_router_as_custom(
     cfg: GatewayConfig,
     *,
@@ -712,6 +657,7 @@ def _preserve_router_as_custom(
 ) -> None:
     """Materialize the effective ladder and mark explicit operator ownership."""
 
+    followed_primary = cfg.squilla_router.preset_binding == "follow_primary"
     router_payload = cfg.squilla_router.model_dump(mode="python")
     router_payload["tier_profile"] = None
     router_payload["preset_binding"] = "custom"
@@ -724,6 +670,10 @@ def _preserve_router_as_custom(
     if enable_cross_provider:
         router_payload["cross_provider_tiers"] = True
     cfg.squilla_router = SquillaRouterConfig(**router_payload)
+    if followed_primary:
+        # Managed presets can refresh only in memory at load time. Capture
+        # those effective tiers before custom ownership stops the refresh.
+        cfg.mark_force_persist("squilla_router.tiers")
 
 
 def _apply_primary_provider_router_policy(
@@ -736,11 +686,11 @@ def _apply_primary_provider_router_policy(
 ) -> None:
     """Apply the single Router contract for every primary-provider switch.
 
-    Managed ladders follow the target provider while retaining Router enabled
-    state and all orthogonal settings.  Explicit custom and unclassified
-    legacy ladders are byte-preserved unless the caller selects one of the
-    conflict-resolution actions.  Ensemble state is intentionally outside
-    this helper and is never touched.
+    Switching to OpenRouter or TokenRhythm installs that provider's current
+    recommended ladder. Other providers preserve custom and legacy ladders,
+    while managed ladders follow the target provider. Explicit conflict
+    actions take precedence. Router enabled state, orthogonal settings, and
+    Ensemble state remain unchanged unless an explicit action changes them.
     """
 
     action = _normalize_router_conflict_action(router_action)
@@ -769,6 +719,19 @@ def _apply_primary_provider_router_policy(
         )
         return
 
+    if primary_changed and target in {"openrouter", "tokenrhythm"}:
+        _reconcile_router_profile_for_provider(candidate, target_provider)
+        return
+
+    if (
+        not primary_changed
+        and target in {"openrouter", "tokenrhythm"}
+        and not _implicit_primary_and_router(source)
+    ):
+        # Editing a key or direct model is not consent to replace the saved
+        # routing ladder with a newly downloaded recommendation.
+        return
+
     if binding == "follow_primary" or (
         binding is None and _implicit_primary_and_router(source)
     ):
@@ -782,26 +745,10 @@ def _apply_primary_provider_router_policy(
     if not primary_changed:
         return
 
-    conflicts = _router_provider_conflicts(
-        source,
-        target_provider,
-        shared_selection_mode=effective_ensemble_selection_mode(candidate),
+    validate_router_candidate(
+        candidate,
+        allowed_actions=("use_recommended", "enable_cross_provider", "disable"),
     )
-    if conflicts:
-        joined = ", ".join(conflicts)
-        raise LlmProfileActivationError(
-            "router_provider_conflict",
-            "custom Router tiers reference provider(s) that differ from the "
-            f"new primary: {joined}",
-            details={
-                "conflictProviders": list(conflicts),
-                "allowedRouterActions": [
-                    "use_recommended",
-                    "enable_cross_provider",
-                    "disable",
-                ],
-            },
-        )
 
 
 def upsert_llm_provider(
@@ -839,11 +786,11 @@ def upsert_llm_provider(
     providers or endpoint origins.
 
     Router ownership is explicit and shared with profile activation:
-    ``follow_primary`` reconciles to this provider while preserving Router
-    enabled state and orthogonal settings; ``custom`` and legacy/unclassified
-    ladders are preserved.  A cross-provider custom ladder that cannot execute
-    with cross-provider routing off is rejected unless ``router_action``
-    resolves it explicitly.
+    Switching to OpenRouter or TokenRhythm installs its recommended ladder;
+    ``follow_primary`` likewise reconciles to any target provider. Router
+    enabled state and orthogonal settings are preserved. Other providers keep
+    custom/legacy ladders, rejecting an unexecutable cross-provider ladder
+    unless ``router_action`` resolves it explicitly.
 
     ``image_generation_intent`` is an additive client contract. Its default
     is ``preserve`` for old clients; ``enable_provider_default`` may add the
@@ -991,6 +938,7 @@ def upsert_llm_provider(
     llm_payload.update(
         {
             "provider": provider_id,
+            "credential_source": "manual",
             "model": model_clean,
             "api_key": effective_api_key,
             "api_key_env": effective_api_key_env,
@@ -1224,6 +1172,12 @@ def upsert_router(
         router_payload["preset_binding"] = (
             "follow_primary" if follows_managed_preset else "custom"
         )
+        if provider in {"openrouter", "tokenrhythm"} and source_tiers is not None:
+            # This save already contains the user's complete visible ladder.
+            # Keep those exact values through subsequent default/profile passes.
+            router_payload["recommendation_revision"] = (
+                config.squilla_router.recommendation_revision or "user-saved"
+            )
         writes_packaged_profile = (
             follows_managed_preset and preset is not None and preset.persistable
         )
@@ -1239,28 +1193,21 @@ def upsert_router(
             router_payload["tiers"] = merged_tiers
             public_payload["mode"] = "recommended" if follows_managed_preset else "custom"
             public_payload.update({"enabled": True, "tier_profile": None})
-    warnings: list[str] = []
     if router_payload.get("enabled"):
         _validate_router_tiers(
             cast(dict[str, Any], router_payload.get("tiers") or {}),
             default_tier_clean,
         )
-        warnings = _cross_provider_tier_warnings(
-            cast(dict[str, Any], router_payload.get("tiers") or {}),
-            provider,
-            shared_selection_mode=effective_ensemble_selection_mode(config),
-            ensemble_globally_enabled=bool(
-                getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-            ),
-            cross_provider_enabled=bool(router_payload.get("cross_provider_tiers")),
-            tier_provider_mismatch=str(
-                router_payload.get("tier_provider_mismatch") or "route"
-            ),
-            llm_profiles=getattr(config, "llm_profiles", None),
-        )
 
     new_cfg = _clone(config)
     new_cfg.squilla_router = SquillaRouterConfig(**router_payload)
+    if (
+        config.squilla_router.preset_binding == "follow_primary"
+        and new_cfg.squilla_router.preset_binding == "custom"
+    ):
+        # The effective ladder may equal the load baseline while the file
+        # still holds an older preset. Ownership changes must materialize it.
+        new_cfg.mark_force_persist("squilla_router.tiers")
     if router_mode == "disabled":
         apply_model_routing_mode(new_cfg, "direct")
     elif not bool(getattr(config.squilla_router, "enabled", False)):
@@ -1299,11 +1246,39 @@ def upsert_router(
                 new_cfg.mark_force_persist(f"llm_ensemble.{field_name}")
     if shared_tier_enabled:
         _materialize_c3_ensemble_policy_defaults(new_cfg)
-    # Otherwise this is ladder/settings maintenance on an already-enabled
-    # router (the common Web UI tier-table save and CLI default-tier path).
-    # Applying the mode patch here would silently escalate an operator's
+    if (
+        cross_provider_tiers is None
+        and explicitly_selects_cross_provider_tier(new_cfg, tiers)
+    ):
+        # Saving explicit deployments means executing their selected providers.
+        # Preserve an explicit opt-out and keep implicit legacy reactivation
+        # and primary-provider transitions under their existing conflict policy.
+        new_cfg.squilla_router.cross_provider_tiers = True
+    # Ladder/settings maintenance on an already-enabled router preserves its
+    # strategy (the common Web UI tier-table save and CLI default-tier path).
+    # Applying a mode patch here would silently escalate an operator's
     # rollout_phase='observe'/'prompt_only' to live 'full' routing and turn
     # off a running ensemble, so the stored strategy fields are preserved.
+    validate_router_reactivation(config, new_cfg)
+    warnings: list[str] = []
+    if new_cfg.squilla_router.enabled:
+        warnings = _cross_provider_tier_warnings(
+            new_cfg.squilla_router.tiers,
+            provider,
+            shared_selection_mode=effective_ensemble_selection_mode(new_cfg),
+            ensemble_globally_enabled=new_cfg.llm_ensemble.enabled,
+            cross_provider_enabled=new_cfg.squilla_router.cross_provider_tiers,
+            tier_provider_mismatch=new_cfg.squilla_router.tier_provider_mismatch,
+            llm_profiles=new_cfg.llm_profiles,
+        )
+        legacy_image_tier = new_cfg.squilla_router.tiers.get("image_model")
+        if isinstance(legacy_image_tier, dict) and legacy_image_tier.get("model"):
+            warnings.append(
+                "The legacy image_model setting is preserved for compatibility "
+                "but is not used for image input. Configure an image-capable "
+                "model in c0-c3; if none can process images, the turn continues "
+                "with an image-not-analyzed marker and keeps the original image."
+            )
     public_payload["default_tier"] = new_cfg.squilla_router.default_tier
     public_payload["tiers"] = redact_router_tiers_payload(new_cfg.squilla_router.tiers)
     public_payload["cross_provider_tiers"] = bool(new_cfg.squilla_router.cross_provider_tiers)
@@ -1441,7 +1416,19 @@ def upsert_llm_ensemble(
         and not bool(current.get("enabled", False))
         and selection_mode is None
     ):
-        activation = ensemble_activation_patches(config)
+        # An explicit lineup is the activation input, even when the client
+        # omits the unchanged selection mode from a preview-backed form.
+        # Planning against the old Router here can reject that new lineup or
+        # overwrite it with generated candidates. Preserve a saved mode; on
+        # first configuration, submitted candidates select the custom plan.
+        if candidates is not None:
+            activation = (
+                {}
+                if ensemble_selection_configured(config)
+                else {"llm_ensemble.selection_mode": CUSTOM_B5_SELECTION_MODE}
+            )
+        else:
+            activation = ensemble_activation_patches(config)
         if activation:
             merged["selection_mode"] = activation["llm_ensemble.selection_mode"]
             generated_fields.add("selection_mode")
@@ -1498,6 +1485,7 @@ def upsert_llm_ensemble(
     if proposer_max_retries is not None:
         new_cfg.mark_force_persist("llm_ensemble.proposer_max_retries")
 
+    validate_router_reactivation(config, new_cfg)
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
         "selection_mode": new_ensemble.selection_mode,
@@ -1950,6 +1938,9 @@ def upsert_image_generation_provider(
     new_cfg.mark_force_persist("image_generation.enabled")
     new_cfg.mark_force_persist("image_generation.binding")
     new_cfg.image_generation.primary = primary_model
+    # A direct provider save selects this route even when it matches the
+    # schema default. Keep the selection through sparse persistence/reload.
+    new_cfg.mark_force_persist("image_generation.primary")
     new_cfg.image_generation.size = effective_size
     new_cfg.image_generation.output_format = cast(ImageOutputFormat, effective_output_format)
     new_cfg.image_generation.fallbacks = effective_fallbacks
@@ -2722,7 +2713,16 @@ def upsert_llm_profile(
     else:
         effective_proxy = str(proxy or "").strip()
 
+    from opensquilla.desktop_account import account_credential
+    account_only = (
+        not effective_api_key and not effective_api_key_env and not effective_pool
+        and (
+            getattr(existing, "credential_source", "manual") == "account"
+            or not existing and account_credential(provider) is not None
+        )
+    )
     profile = LlmProviderProfile(
+        credential_source="account" if account_only else "manual",
         model=effective_model,
         api_key=effective_api_key,
         api_key_env=effective_api_key_env,
@@ -2831,6 +2831,32 @@ def clear_llm_profile_credentials(
 def remove_llm_profile(config: GatewayConfig, *, provider_id: str) -> MutationResult:
     """Remove an unused provider profile, refusing dangling route references."""
     provider = str(provider_id or "").strip().lower()
+    from opensquilla.desktop_account import account_credential
+    if provider == "tokenrhythm" and account_credential(provider) is not None:
+        # Removing the manual connection must preserve the account's models
+        # and routing references, including when both share the primary provider.
+        new_cfg = _clone(config)
+        targets: list[LlmProviderConfig | LlmProviderProfile] = []
+        paths = set()
+        if str(config.llm.provider).lower() == provider:
+            targets.append(new_cfg.llm)
+            paths.add("llm.api_key")
+        for key in _llm_profile_storage_keys(new_cfg, provider):
+            targets.append(new_cfg.llm_profiles[key])
+            paths.add(f"llm_profiles.{key}.api_key")
+        if not targets:
+            raise KeyError(f"LLM profile {provider!r} does not exist")
+        for target in targets:
+            target.api_key = ""
+            target.api_key_env = ""
+            target.credential_source = "account"
+            if hasattr(target, "api_key_env_pool"):
+                target.api_key_env_pool = []
+        clear_runtime_secret_paths(new_cfg, paths)
+        return MutationResult(
+            config=new_cfg, changed=True, restart_required=False,
+            public_payload={"provider": provider, "removed": True},
+        )
     profile_keys = _llm_profile_storage_keys(config, provider)
     if not profile_keys:
         raise KeyError(f"LLM profile {provider!r} does not exist")
@@ -2882,10 +2908,11 @@ def activate_llm_profile(
     """Atomically promote a stored profile and demote the current primary.
 
     The mutation is pure: callers must persist the returned candidate before
-    applying it to the running gateway.  Managed Router presets follow the new
-    primary; custom/legacy Router state and all Ensemble fields remain intact
-    unless ``router_action`` explicitly resolves a provider conflict. Image
-    defaults likewise require an explicit ``image_generation_intent``.
+    applying it to the running gateway. Switching to OpenRouter or TokenRhythm
+    installs its recommended Router ladder. Other providers preserve custom
+    ladders and synchronize managed presets. Router mode and all Ensemble
+    fields remain intact unless ``router_action`` explicitly changes them.
+    Image defaults require an explicit ``image_generation_intent``.
     """
     from opensquilla.provider.deployment import resolve_provider_deployment
 
@@ -2939,6 +2966,7 @@ def activate_llm_profile(
         profiles.pop(key, None)
     if previous_provider:
         profiles[previous_provider] = LlmProviderProfile(
+            credential_source=config.llm.credential_source,
             model=str(config.llm.model or ""),
             api_key=str(config.llm.api_key or ""),
             api_key_env=str(config.llm.api_key_env or ""),
@@ -2950,6 +2978,7 @@ def activate_llm_profile(
         )
     new_cfg.llm_profiles = profiles
     new_cfg.llm = LlmProviderConfig(
+        credential_source=profile.credential_source,
         provider=provider,
         model=model_id,
         api_key=str(profile.api_key or ""),
@@ -2957,6 +2986,9 @@ def activate_llm_profile(
         base_url=str(profile.base_url or spec.default_base_url or ""),
         proxy=str(profile.proxy or ""),
     )
+    # The default provider must remain explicit on disk: a legacy config with
+    # omitted provider and explicit credentials is otherwise read as OpenRouter.
+    new_cfg.mark_force_persist("llm.provider")
     _apply_primary_provider_router_policy(
         config,
         new_cfg,
@@ -3012,6 +3044,57 @@ def activate_llm_profile(
         changed=True,
         restart_required=False,
         public_payload=public_payload,
+    )
+
+
+def upsert_and_activate_llm_profile(
+    config: GatewayConfig,
+    *,
+    provider_id: str,
+    model: str | None = None,
+    api_key: str | None = None,
+    api_key_env: str | None = None,
+    api_key_env_pool: list[str] | tuple[str, ...] | None = None,
+    preserve_api_key: bool = False,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    router_action: str | None = None,
+    image_generation_intent: str | None = None,
+) -> MutationResult:
+    """Build one fully validated candidate for saving and promoting a draft.
+
+    Both component mutations are pure, so validation failure cannot save a
+    partial draft. Reuse promotion's demotion and credential provenance rules.
+    Active edits must use the primary-provider operation, never a shadow profile.
+    """
+    provider = str(provider_id or "").strip().lower()
+    if provider == str(config.llm.provider or "").strip().lower():
+        raise LlmProfileActivationError(
+            "already_active", f"provider {provider!r} is already active"
+        )
+    saved = upsert_llm_profile(
+        config,
+        provider_id=provider,
+        model=model,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        api_key_env_pool=api_key_env_pool,
+        preserve_api_key=preserve_api_key,
+        base_url=base_url,
+        proxy=proxy,
+    )
+    activated = activate_llm_profile(
+        saved.config,
+        provider_id=provider,
+        router_action=router_action,
+        image_generation_intent=image_generation_intent,
+    )
+    return MutationResult(
+        config=activated.config,
+        changed=saved.changed or activated.changed,
+        restart_required=saved.restart_required or activated.restart_required,
+        warnings=[*saved.warnings, *activated.warnings],
+        public_payload=activated.public_payload,
     )
 
 

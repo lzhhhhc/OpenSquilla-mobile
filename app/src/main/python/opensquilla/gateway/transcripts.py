@@ -36,7 +36,6 @@ from opensquilla.attachment_refs import (
     transcript_material_path,
     write_transcript_material,
 )
-from opensquilla.prompt_annotations import normalize_prompt_annotation_snapshots
 
 log = logging.getLogger(__name__)
 
@@ -90,10 +89,6 @@ def _was_staged(attachment: dict[str, Any]) -> bool:
     return bool(attachment.get("_was_staged"))
 
 
-def _transcript_dir(media_root: Path, session_id: str) -> Path:
-    return Path(media_root) / "transcripts" / session_id
-
-
 def build_transcript_attachment_envelope(
     *,
     text: str,
@@ -103,7 +98,10 @@ def build_transcript_attachment_envelope(
     media_root: Path,
     persist_enabled: bool,
     disk_budget_bytes: int | None = None,
-    prompt_annotations: object = None,
+    page_context: dict[str, Any] | None = None,
+    workspace_files: list[dict[str, Any]] | None = None,
+    selected_skills: list[dict[str, str]] | None = None,
+    local_path_references: list[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the JSON envelope written to ``transcript_entries.content``.
 
@@ -113,6 +111,8 @@ def build_transcript_attachment_envelope(
 
     When ``disk_budget_bytes`` is provided and a staged write would exceed it,
     the function raises instead of falling back to persistent inline base64.
+    With persistence disabled, every attachment shape becomes metadata plus
+    an unavailable marker; existing material is neither linked nor deleted.
     """
 
     persisted_attachments: list[dict[str, Any]] = []
@@ -123,6 +123,25 @@ def build_transcript_attachment_envelope(
             attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
         )
         name = attachment.get("name", "attachment")
+        if not persist_enabled:
+            size = attachment.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                size = None
+                data = attachment.get("data")
+                if isinstance(data, str):
+                    try:
+                        size = len(base64.b64decode(data, validate=True))
+                    except (ValueError, TypeError):
+                        pass
+            persisted_attachments.append(
+                {
+                    "name": name,
+                    "mime": media_type,
+                    "size": size,
+                    "missing_reason": "attachment persistence disabled",
+                }
+            )
+            continue
         if is_attachment_ref(attachment):
             sha = attachment["sha256"]
             persisted_attachments.append(
@@ -132,6 +151,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": attachment.get("size"),
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
             continue
@@ -139,7 +159,7 @@ def build_transcript_attachment_envelope(
         if not isinstance(data, str) or not isinstance(media_type, str):
             continue
 
-        if persist_enabled and _was_staged(attachment):
+        if _was_staged(attachment):
             try:
                 payload = base64.b64decode(data, validate=True)
             except (ValueError, TypeError) as exc:
@@ -178,27 +198,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
-                }
-            )
-        elif _was_staged(attachment):
-            try:
-                payload = base64.b64decode(data, validate=True)
-            except (ValueError, TypeError) as exc:
-                log.warning("transcript.persist_decode_failed name=%s err=%s", name, exc)
-                persisted_attachments.append(
-                    {
-                        "name": name,
-                        "mime": media_type,
-                        "missing_reason": "attachment decode failed",
-                    }
-                )
-                continue
-            persisted_attachments.append(
-                {
-                    "name": name,
-                    "mime": media_type,
-                    "size": len(payload),
-                    "missing_reason": "attachment persistence disabled",
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
         else:
@@ -208,15 +208,27 @@ def build_transcript_attachment_envelope(
                     "type": media_type,
                     "name": name,
                     "data": data,
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
 
     envelope_payload: dict[str, Any] = {"text": text, "attachments": persisted_attachments}
     if display_text is not None:
         envelope_payload["display_text"] = display_text
-    normalized_annotations = normalize_prompt_annotation_snapshots(prompt_annotations)
-    if normalized_annotations:
-        envelope_payload["prompt_annotations"] = list(normalized_annotations)
+    if page_context is not None:
+        envelope_payload["page_context"] = page_context
+    if workspace_files:
+        from opensquilla.workspace_files import normalize_workspace_files
+
+        envelope_payload["workspace_files"] = normalize_workspace_files(workspace_files)
+    if selected_skills:
+        envelope_payload["selected_skills"] = selected_skills
+    if local_path_references:
+        from opensquilla.contracts.local_path_references import normalize_local_path_references
+
+        envelope_payload["local_path_references"] = list(normalize_local_path_references(
+            local_path_references, message=display_text if display_text is not None else text,
+        ))
     envelope = json.dumps(envelope_payload)
     return envelope, disk_writes
 
@@ -283,6 +295,8 @@ def rebuild_attachments_for_replay(
                 session_id=session_id,
                 source="transcript",
             )
+            if entry.get("origin") == "paste":
+                rebuilt_ref["origin"] = "paste"
             missing_markers.append(attachment_ref_marker(rebuilt_ref))
         else:
             missing_reason = entry.get("missing_reason")
@@ -302,6 +316,7 @@ def rebuild_attachments_for_replay(
                         "type": mime,
                         "data": data,
                         "name": raw_name if isinstance(raw_name, str) else "attachment",
+                        **({"origin": "paste"} if entry.get("origin") == "paste" else {}),
                     }
                 )
 

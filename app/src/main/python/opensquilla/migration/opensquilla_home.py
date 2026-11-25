@@ -54,7 +54,7 @@ from opensquilla.migration.source_snapshot_windows import (
     copy_windows_snapshot_file,
     scan_windows_source_tree,
 )
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.recovery.locking import (
     LegacyGatewayLock,
     LegacyGatewayLockFileSnapshot,
@@ -131,11 +131,10 @@ _EXCLUDED_TOP_LEVEL_DIRS = frozenset(
         "recovery-profiles",
     }
 )
-#: Machine-local run worktrees are intentionally not portable profile data.
-#: They contain cloned repositories, virtual environments, native build output,
-#: and per-run provider snapshots.  The source is left untouched so operators
-#: can still recover a patch or transcript from the originating installation.
-_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS = frozenset({"code-task"})
+#: Worktrees and Desktop account sessions belong to the source installation.
+#: Copying refresh tokens or installation IDs would make two profiles share a
+#: rotating login. The target must create its own installation and sign in.
+_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS = frozenset({"code-task", "desktop-account"})
 #: The initial snapshot is inspection-only: it supplies bounded config/dotenv
 #: reads before data roots are classified, and is never copied.  On POSIX it may
 #: therefore record any relative link that stays lexically inside the source
@@ -1676,93 +1675,6 @@ def _scan_source_tree_posix(
         os.close(root_descriptor)
 
 
-def _scan_source_tree_path(
-    root: Path,
-    *,
-    destination_prefix: Path,
-    role: str,
-    excluded: set[Path] | frozenset[Path] = frozenset(),
-    excluded_leaf_suffixes: tuple[str, ...] = (),
-) -> _SourceSnapshot:
-    """Create a stable, no-follow manifest with temporary content digests."""
-    if destination_prefix.is_absolute() or ".." in destination_prefix.parts:
-        raise OSError(f"import destination prefix is unsafe: {destination_prefix}")
-    root_stat = root.lstat()
-    if _supported_entry_type(root, root_stat) != "directory":
-        raise OSError(f"import root is not a directory: {root}")
-    root_identity = _identity_from_stat(root_stat)
-    entries: list[_ManifestEntry] = []
-    pending: list[tuple[Path, Path]] = [(root, Path())]
-    while pending:
-        directory, relative_directory = pending.pop()
-        before_directory = directory.lstat()
-        if _supported_entry_type(directory, before_directory) != "directory":
-            raise OSError(f"source directory changed type during enumeration: {directory}")
-        try:
-            with os.scandir(directory) as iterator:
-                children = sorted(iterator, key=lambda child: child.name)
-        except OSError as exc:
-            raise OSError(f"could not enumerate source directory: {directory}") from exc
-        for child in children:
-            relative = relative_directory / child.name
-            if relative in excluded or any(parent in excluded for parent in relative.parents):
-                continue
-            if child.name.endswith(excluded_leaf_suffixes):
-                continue
-            path = Path(child.path)
-            result = child.stat(follow_symlinks=False)
-            entry_type = _supported_entry_type(path, result)
-            entry = _ManifestEntry(
-                source=path,
-                relative=relative,
-                entry_type=entry_type,
-                identity=_identity_from_stat(result),
-                mode=int(result.st_mode),
-                size=int(result.st_size),
-                mtime_ns=int(result.st_mtime_ns),
-                digest=None,
-            )
-            digest = _digest_regular_file(path, expected=entry) if entry_type == "file" else None
-            entries.append(
-                _ManifestEntry(
-                    source=entry.source,
-                    relative=entry.relative,
-                    entry_type=entry.entry_type,
-                    identity=entry.identity,
-                    mode=entry.mode,
-                    size=entry.size,
-                    mtime_ns=entry.mtime_ns,
-                    digest=digest,
-                )
-            )
-            if entry_type == "directory":
-                pending.append((path, relative))
-        after_directory = directory.lstat()
-        if (
-            _identity_from_stat(after_directory) != _identity_from_stat(before_directory)
-            or (
-                not excluded_leaf_suffixes
-                and int(after_directory.st_mtime_ns) != int(before_directory.st_mtime_ns)
-            )
-        ):
-            raise OSError(f"source directory changed during enumeration: {directory}")
-    after_root = root.lstat()
-    if _identity_from_stat(after_root) != root_identity:
-        raise OSError(f"source root changed during enumeration: {root}")
-    entries.sort(key=lambda entry: (len(entry.relative.parts), entry.relative.as_posix()))
-    return _SourceSnapshot(
-        root=root,
-        destination_prefix=destination_prefix,
-        identity=root_identity,
-        root_mode=int(root_stat.st_mode),
-        root_mtime_ns=int(root_stat.st_mtime_ns),
-        entries=tuple(entries),
-        role=role,
-        excluded=frozenset(excluded),
-        excluded_leaf_suffixes=tuple(excluded_leaf_suffixes),
-    )
-
-
 def _scan_source_tree(
     root: Path,
     *,
@@ -2202,9 +2114,12 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Staging and atomic temporary names can exceed MAX_PATH even when the
+    # published receipt path fits. Keep this spelling local to filesystem I/O.
+    io_path = native_io_path(path)
+    io_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        prefix=f".{path.name}.", suffix=".tmp", dir=io_path.parent
     )
     temporary = Path(temporary_name)
     try:
@@ -2214,8 +2129,8 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
-        os.replace(_ext(temporary), _ext(path))
-        _fsync_directory(path.parent)
+        os.replace(temporary, io_path)
+        _fsync_directory(io_path.parent)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -2609,30 +2524,6 @@ def _read_small_regular_bytes(path: Path, *, limit: int) -> bytes | None:
         return None
 
 
-def _tree_size_bytes(root: Path) -> int:
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        directory = Path(dirpath)
-        safe_dirnames: list[str] = []
-        for name in dirnames:
-            path = directory / name
-            try:
-                if _supported_entry_type(path, path.lstat()) == "directory":
-                    safe_dirnames.append(name)
-            except OSError:
-                continue
-        dirnames[:] = safe_dirnames
-        for name in filenames:
-            try:
-                path = directory / name
-                result = path.lstat()
-                if _supported_entry_type(path, result) == "file":
-                    total += result.st_size
-            except OSError:
-                continue
-    return total
-
-
 def _era_hint(home: Path) -> str:
     receipt = home / "install-receipt.json"
     receipt_bytes = _read_small_regular_bytes(receipt, limit=_LAYOUT_RECEIPT_MAX_BYTES)
@@ -2878,9 +2769,11 @@ def _migration_dir_candidates() -> list[Path]:
 
 def _known_migration_ids() -> set[str]:
     """Return the migration ids shipped with this binary (yoyo id == file stem)."""
+    from opensquilla.migration_compatibility import known_migration_ids
+
     for candidate in _migration_dir_candidates():
         try:
-            ids = {entry.stem for entry in candidate.glob("V*.py")}
+            ids = known_migration_ids(candidate)
         except OSError:
             continue
         if ids:
@@ -2888,8 +2781,10 @@ def _known_migration_ids() -> set[str]:
     return set()
 
 
-def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
+def _read_applied_migration_ledger(db_path: Path) -> dict[str, str | None] | None:
     """Read the yoyo ledger read-only; ``None`` when the db cannot be inspected."""
+    from opensquilla.migration_compatibility import read_migration_ledger
+
     try:
         with tempfile.TemporaryDirectory(prefix="opensquilla-sqlite-inspect-") as temporary:
             copied_db = _copy_sqlite_bundle(
@@ -2902,26 +2797,11 @@ def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
                 uri=True,
             )
             try:
-                table_rows = connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name LIKE '%yoyo_migration'"
-                ).fetchall()
-                table = next(
-                    (
-                        name
-                        for (name,) in table_rows
-                        if isinstance(name, str) and name.endswith("yoyo_migration")
-                    ),
-                    None,
-                )
-                if table is None:
-                    return set()
-                rows = connection.execute(f'SELECT migration_id FROM "{table}"').fetchall()
+                return read_migration_ledger(connection)
             finally:
                 connection.close()
     except (OSError, sqlite3.Error):
         return None
-    return {str(migration_id) for (migration_id,) in rows if migration_id}
 
 
 def _read_session_count(db_path: Path) -> int | None:
@@ -4085,10 +3965,11 @@ class OpenSquillaHomeMigrator:
             current = staging
             for component in snapshot.destination_prefix.parts:
                 current /= component
+                io_current = native_io_path(current)
                 try:
-                    value = current.lstat()
+                    value = io_current.lstat()
                 except FileNotFoundError:
-                    current.mkdir()
+                    io_current.mkdir()
                     continue
                 try:
                     entry_type = _supported_entry_type(current, value)
@@ -4109,15 +3990,16 @@ class OpenSquillaHomeMigrator:
             if snapshot.destination_prefix != Path():
                 snapshot_destination = ensure_snapshot_destination(snapshot)
                 os.chmod(
-                    snapshot_destination,
+                    native_io_path(snapshot_destination),
                     (snapshot.root_mode & 0o777) | 0o700,
                 )
             for entry in snapshot.entries:
                 destination = staging / snapshot.destination_prefix / entry.relative
+                io_destination = native_io_path(destination)
                 if entry.entry_type == "directory":
-                    if destination.exists() or destination.is_symlink():
+                    if io_destination.exists() or io_destination.is_symlink():
                         try:
-                            destination_stat = destination.lstat()
+                            destination_stat = io_destination.lstat()
                             destination_type = _supported_entry_type(
                                 destination, destination_stat
                             )
@@ -4130,8 +4012,8 @@ class OpenSquillaHomeMigrator:
                                 f"source roots collide on a non-directory: {destination}"
                             )
                     else:
-                        destination.mkdir(parents=True, exist_ok=False)
-                    os.chmod(destination, (entry.mode & 0o777) | 0o700)
+                        io_destination.mkdir(parents=True, exist_ok=False)
+                    os.chmod(io_destination, (entry.mode & 0o777) | 0o700)
                     continue
 
                 if entry.entry_type == "symlink":
@@ -4143,7 +4025,7 @@ class OpenSquillaHomeMigrator:
                                 f"source roots contain conflicting links for {destination}"
                             )
                         continue
-                    if destination.exists() or destination.is_symlink():
+                    if io_destination.exists() or io_destination.is_symlink():
                         raise OSError(f"staging destination already exists: {destination}")
                     copied_target = _copy_snapshot_symlink_posix(
                         snapshot,
@@ -4151,7 +4033,7 @@ class OpenSquillaHomeMigrator:
                         destination,
                     )
                     if copied_target != entry.link_target:
-                        destination.unlink(missing_ok=True)
+                        io_destination.unlink(missing_ok=True)
                         raise OSError(f"source link changed while copied: {entry.source}")
                     copied_links[destination] = copied_target
                     continue
@@ -4167,13 +4049,13 @@ class OpenSquillaHomeMigrator:
                             f"source roots contain conflicting files for {destination}"
                         )
                     continue
-                if destination.exists() or destination.is_symlink():
+                if io_destination.exists() or io_destination.is_symlink():
                     raise OSError(f"staging destination already exists: {destination}")
                 copied_digest = _copy_snapshot_file(snapshot, entry, destination)
                 if copied_digest != entry.digest:
-                    destination.unlink(missing_ok=True)
+                    io_destination.unlink(missing_ok=True)
                     raise OSError(f"source file changed while copied: {entry.source}")
-                os.chmod(destination, (entry.mode & 0o777) | 0o600)
+                os.chmod(io_destination, (entry.mode & 0o777) | 0o600)
                 copied_files[destination] = copied_digest
 
     def _target_free_bytes(self) -> int:
@@ -4451,7 +4333,7 @@ class OpenSquillaHomeMigrator:
                     f"source sessions.db could not be snapshotted safely ({exc})",
                 )
                 return True
-            applied = _read_applied_migration_ids(copied_db)
+            applied = _read_applied_migration_ledger(copied_db)
             if applied is None:
                 self._record(
                     "preflight/schema",
@@ -4462,15 +4344,25 @@ class OpenSquillaHomeMigrator:
                     "refusing an unverifiable import",
                 )
                 return True
-            unknown = sorted(applied - known)
-            if unknown:
+            from opensquilla.migration_compatibility import classify_migration_ledger
+
+            compatibility = classify_migration_ledger(applied, known)
+            if compatibility.code is not None:
+                unknown = compatibility.conflicting_ids
+                detail = (
+                    "source home uses an unsupported development Goal lineage; "
+                    "keep the original database and WAL and use its original build"
+                    if compatibility.code == "state_unsupported_goal_lineage"
+                    else "source home has an unverified historical migration alias"
+                    if compatibility.code == "state_migration_alias_mismatch"
+                    else "source home was written by a newer OpenSquilla; update OpenSquilla first"
+                )
                 self._record(
                     "preflight/schema",
                     sessions_db,
                     None,
                     "error",
-                    "source home was written by a newer OpenSquilla "
-                    f"(unknown migrations: {', '.join(unknown)}); update OpenSquilla first",
+                    f"{detail} (migrations: {', '.join(unknown)})",
                 )
                 return True
             self._record("preflight/schema", sessions_db, None, "skipped", "ok")
@@ -5022,15 +4914,22 @@ class OpenSquillaHomeMigrator:
                 if resolved in seen:
                     continue
                 seen.add(resolved)
-                if _path_is_relative_to_lexical(root, source / "code-task"):
+                nonportable = next(
+                    (
+                        entry for entry in sorted(_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS)
+                        if _path_is_relative_to_lexical(root, source / entry)
+                    ),
+                    None,
+                )
+                if nonportable:
                     self._record(
                         "preflight/data-root",
                         root,
                         self.target / name,
                         "error",
-                        f"configured {name} root points inside source code-task; "
-                        "machine-local code-task runs are not portable",
-                        {"stable_code": "configured_code_task_root"},
+                        f"configured {name} root points inside source {nonportable}; "
+                        "machine-local data is not portable",
+                        {"stable_code": f"configured_{nonportable.replace('-', '_')}_root"},
                     )
                     self._blocked = True
                     continue
@@ -5178,15 +5077,22 @@ class OpenSquillaHomeMigrator:
                     )
                     self._blocked = True
                     continue
-                if _path_is_relative_to_lexical(configured_workspace, source / "code-task"):
+                nonportable = next(
+                    (
+                        entry for entry in sorted(_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS)
+                        if _path_is_relative_to_lexical(configured_workspace, source / entry)
+                    ),
+                    None,
+                )
+                if nonportable:
                     self._record(
                         "preflight/data-root",
                         configured_workspace,
                         self.target / "workspace" / "agents" / agent_id,
                         "error",
                         f"configured workspace for agent {agent_id} points inside "
-                        "source code-task; machine-local code-task runs are not portable",
-                        {"stable_code": "configured_code_task_root"},
+                        f"source {nonportable}; machine-local data is not portable",
+                        {"stable_code": f"configured_{nonportable.replace('-', '_')}_root"},
                     )
                     self._blocked = True
                     continue
@@ -5370,7 +5276,7 @@ class OpenSquillaHomeMigrator:
                     entry,
                     None,
                     "skipped",
-                    "machine-local code-task runs remain unchanged in the source profile",
+                    f"machine-local {entry.name} data remains unchanged in the source profile",
                 )
                 continue
             entries.append(entry)

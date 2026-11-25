@@ -41,12 +41,6 @@ def _message_prefix_messages(messages: list[Message], *, tail_count: int = 2) ->
     return list(messages[:-tail_count])
 
 
-def _message_prefix_payload(messages: list[Message], *, tail_count: int = 2) -> list[Any]:
-    return [
-        _jsonable(message) for message in _message_prefix_messages(messages, tail_count=tail_count)
-    ]
-
-
 def _message_prefix_item_kind(message: Message) -> str:
     content = message.content
     if isinstance(content, str):
@@ -344,13 +338,13 @@ def _finalize_compaction_when_owner_stops(
         return
 
     if owner.cancelled():
-        status = "cancelled"
+        status = "failed" if source == "manual" else "cancelled"
         reason = "owner_task_cancelled"
     else:
         try:
             owner_error = owner.exception()
         except asyncio.CancelledError:
-            status = "cancelled"
+            status = "failed" if source == "manual" else "cancelled"
             reason = "owner_task_cancelled"
         else:
             status = "failed"
@@ -451,7 +445,7 @@ def notify_compaction(
     )
 
     turn_context = current_turn_context()
-    if turn_context is not None:
+    if turn_context is not None and str(event_payload["source"]).lower() != "manual":
         turn_id = str(turn_context.get("turn_id") or turn_context.get("task_id") or "").strip()
         task_id = str(turn_context.get("task_id") or turn_id).strip()
         if turn_id:
@@ -607,6 +601,15 @@ def register_active_compaction(
     if task.done():
         return
     _active_compaction_tasks[(session_key, compaction_id)] = task
+    task.add_done_callback(
+        partial(
+            _finalize_compaction_when_owner_stops,
+            session_key,
+            compaction_id,
+            "manual",
+            "manual",
+        )
+    )
 
 
 def cancel_active_compactions(session_key: str) -> tuple[asyncio.Task[Any], ...]:

@@ -27,6 +27,8 @@ from importlib import resources
 
 import structlog
 
+from opensquilla.router_tiers import TEXT_TIERS, TierConfig, normalize_tier_mapping
+
 log = structlog.get_logger(__name__)
 
 # The nine profile ids that existed as hardcoded dict literals in
@@ -57,6 +59,55 @@ CURATED_INLINE_PRESET_IDS: frozenset[str] = frozenset(
 )
 
 _PRESETS_SUBDIR = "presets"
+
+# Model sequences actually shipped before the current mixed-model presets.
+# Old Desktop saves could label these ladders custom even when unchanged.
+# Match the complete sequence, never individual model names, so a deliberately
+# edited or mixed-provider ladder remains operator-owned.
+PREVIOUS_RECOMMENDED_TEXT_MODELS: dict[str, frozenset[tuple[str, ...]]] = {
+    "openrouter": frozenset({
+        (
+            "qwen/qwen3.7-flash", "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro-0813", "z-ai/glm-5.3",
+        ),
+        (
+            "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+            "z-ai/glm-5.2", "z-ai/glm-5.2",
+        ),
+        (
+            "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+            "z-ai/glm-5.2", "anthropic/claude-opus-4.8",
+        ),
+    }),
+    "tokenrhythm": frozenset({
+        ("qwen3.7-flash", "deepseek-flash", "deepseek-v4-pro-0813", "glm-5.3"),
+        ("deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.7-code", "glm-5.1"),
+        ("deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.7-code", "glm-5.2"),
+        ("qwen3.7-flash", "deepseek-v4-flash-0731", "glm-5.2", "glm-5.2"),
+        ("deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "kimi-k2.7-code", "glm-5.2"),
+    }),
+}
+
+
+def router_ladder_provider(
+    tiers: Mapping[str, object] | None, fallback_provider: str = "",
+) -> str | None:
+    """Resolve the text ladder's provider without rebinding it to the primary.
+
+    Missing provider fields inherit the primary. The separate image tier does
+    not own the text ladder; mixed text providers have no single preset.
+    """
+    normalized = normalize_tier_mapping(tiers)
+    fallback = fallback_provider.strip().lower()
+    providers = {
+        (TierConfig.from_value(normalized[name]).provider or fallback).strip().lower()
+        for name in TEXT_TIERS if name in normalized
+    }
+    if not providers:
+        return fallback or None
+    if len(providers) != 1:
+        return None
+    return providers.pop() or None
 
 
 @dataclass(frozen=True)
@@ -105,15 +156,16 @@ def _tier(
     description: str,
     *,
     thinking_level: str = "",
-    supports_image: bool = False,
+    supports_image: bool | None = None,
     image_only: bool = False,
 ) -> dict:
     entry: dict[str, object] = {
         "provider": provider_id,
         "model": model,
         "description": description,
-        "supports_image": supports_image,
     }
+    if supports_image is not None:
+        entry["supports_image"] = supports_image
     if thinking_level:
         entry["thinking_level"] = thinking_level
     if image_only:
@@ -303,7 +355,6 @@ def _synthesized_tiers(provider_id: str, default_model: str) -> dict[str, dict]:
                 f"{provider_id} {role} route (synthesized default; no curated "
                 f"per-tier model ladder)."
             ),
-            "supports_image": False,
         }
     return tiers
 

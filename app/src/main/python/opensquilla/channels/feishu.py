@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from websockets.exceptions import InvalidStatus
 from websockets.protocol import State as WebSocketState
 
 from opensquilla.channels._attachment_io import (
@@ -50,6 +51,7 @@ from opensquilla.channels.transports import InboundEventEnvelope, InboundEventHa
 from opensquilla.channels.types import (
     Attachment,
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -249,6 +251,59 @@ def _feishu_sdk_websocket_state(ws_client: Any | None) -> WebSocketState | None:
 def _feishu_sdk_websocket_is_open(ws_client: Any | None) -> bool:
     """Return whether lark-oapi has a connection proven to be open."""
     return _feishu_sdk_websocket_state(ws_client) is WebSocketState.OPEN
+
+
+def _feishu_terminal_handshake_code(error: InvalidStatus) -> int | None:
+    """Preserve the SDK's terminal vendor codes for modern handshake errors."""
+    response = error.response
+    try:
+        code = int(response.headers["handshake-status"])
+        # The SDK only recognizes vendor errors with both status and message.
+        response.headers["handshake-msg"]
+        if code == 403:
+            return code
+        if code == 514 and int(response.headers["handshake-autherrcode"]) == 1000040350:
+            return code
+    except (LookupError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _adapt_feishu_sdk_handshake_errors(
+    ws_client: Any, on_terminal_error: Callable[[Exception], None],
+) -> None:
+    """Bridge Lark 1.5's legacy exception catch without altering other clients."""
+    sdk_module = inspect.getmodule(type(ws_client))
+    if sdk_module is None or sdk_module.__name__ != "lark_oapi.ws.client":
+        return
+    connect = ws_client._connect
+
+    async def connect_with_handshake_errors() -> None:
+        try:
+            await connect()
+        except InvalidStatus as exc:
+            code = _feishu_terminal_handshake_code(exc)
+            if code is None:
+                raise
+            # The SDK logs this exception before our diagnostic redactor runs.
+            # Do not copy untrusted response headers into that log message.
+            raise sdk_module.ClientException(
+                code, "Feishu WebSocket handshake was rejected",
+            ) from None
+
+    ws_client._connect = connect_with_handshake_errors
+
+    receive_messages = ws_client._receive_message_loop
+
+    async def receive_with_terminal_errors() -> None:
+        try:
+            await receive_messages()
+        except sdk_module.ClientException as exc:
+            # Reconnect runs in this background task. Without supervision its
+            # terminal error leaves Client.start() waiting in _select forever.
+            on_terminal_error(exc)
+
+    ws_client._receive_message_loop = receive_with_terminal_errors
 
 
 class _FeishuWebSocketRuntimeError(RuntimeError):
@@ -465,19 +520,16 @@ class FeishuWebhookTransport:
         event_id = header.get("event_id")
         event_type = header.get("event_type", "")
 
-        if event_id and not self._dedupe.check_and_add(event_id):
-            return Response(status_code=200)
-
         if self._handler is not None:
-            await self._handler(
-                InboundEventEnvelope(
-                    source="feishu:webhook",
-                    event_id=event_id,
-                    event_type=event_type,
-                    raw=data,
-                    received_at=datetime.now(UTC),
-                )
+            handler = self._handler
+            envelope = InboundEventEnvelope(
+                source="feishu:webhook",
+                event_id=event_id,
+                event_type=event_type,
+                raw=data,
+                received_at=datetime.now(UTC),
             )
+            await self._dedupe.run_once(event_id, lambda: handler(envelope))
 
         return Response(status_code=200)
 
@@ -561,6 +613,14 @@ class FeishuWebSocketTransport:
 
         startup_error: list[Exception] = []
 
+        def _terminal_sdk_error(error: Exception) -> None:
+            diagnostic = self._record_error(error)
+            startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
+            log.warning("feishu.websocket_failed", error=diagnostic["message"])
+            self._stop_sdk_event_loop()
+
+        _adapt_feishu_sdk_handshake_errors(ws_client, _terminal_sdk_error)
+
         def _run() -> None:
             worker_loop = asyncio.new_event_loop()
             self._worker_loop = worker_loop
@@ -574,7 +634,7 @@ class FeishuWebSocketTransport:
                     )
                     startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
             except asyncio.CancelledError:
-                if not self._stop_requested.is_set():
+                if not self._stop_requested.is_set() and not startup_error:
                     diagnostic = self._record_error(
                         "Feishu WebSocket client loop was cancelled unexpectedly"
                     )
@@ -788,7 +848,14 @@ class FeishuWebSocketTransport:
             result = disconnect()
             if inspect.iscoroutine(result):
                 sdk_loop = self._sdk_event_loop()
-                if sdk_loop is not None and sdk_loop.is_running():
+                worker_alive = self._thread is not None and self._thread.is_alive()
+                if (
+                    sdk_loop is not None
+                    and not sdk_loop.is_closed()
+                    and (worker_alive or sdk_loop.is_running())
+                ):
+                    # Client.start() pauses this loop between connect/reconnect
+                    # and _select. Its socket and lock still belong to it.
                     future = asyncio.run_coroutine_threadsafe(result, sdk_loop)
                     try:
                         await asyncio.wait_for(
@@ -805,11 +872,10 @@ class FeishuWebSocketTransport:
                         )
                         future.cancel()
                         self._stop_sdk_event_loop()
-                        retry = disconnect()
-                        if inspect.isawaitable(retry):
-                            await retry
-                        elif hasattr(retry, "close"):
-                            retry.close()
+                        # Cancellation/draining stays on the owning loop; a
+                        # caller-loop retry cannot safely close its transport.
+                elif sdk_loop is not None:
+                    result.close()
                 else:
                     await result
             elif inspect.isawaitable(result):
@@ -1168,15 +1234,15 @@ class FeishuChannel:
     # Inbound
     # ------------------------------------------------------------------
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    async def enqueue(self, message: IncomingMessage) -> None:
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, message, self._queue)
+        await durable_enqueue(self, message, self._queue)
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
         self._last_message_at = datetime.now(UTC)
-        log.debug("feishu.receive", content=msg.content[:80])
+        log.debug("feishu.receive", content_chars=len(msg.content))
         return msg
 
     # ------------------------------------------------------------------
@@ -1189,15 +1255,14 @@ class FeishuChannel:
         return self._transport.create_route(path)
 
     async def _handle_inbound_event(self, envelope: InboundEventEnvelope) -> None:
-        if (
-            envelope.source == "feishu:websocket"
-            and envelope.event_id
-            and not self._dedupe.check_and_add(envelope.event_id)
-        ):
-            return
+        key = envelope.event_id if envelope.source == "feishu:websocket" else None
+        await self._dedupe.run_once(key, lambda: self._handle_inbound_once(envelope))
 
+    async def _handle_inbound_once(self, envelope: InboundEventEnvelope) -> None:
         if envelope.event_type == "im.message.receive_v1":
-            self.enqueue(self._with_event_provenance(self.parse_event(envelope.raw), envelope))
+            await self.enqueue(
+                self._with_event_provenance(self.parse_event(envelope.raw), envelope)
+            )
         elif envelope.event_type == "im.chat.member.bot.added_v1":
             chat_id = envelope.raw.get("event", {}).get("chat_id", "unknown")
             log.info(
@@ -1229,10 +1294,10 @@ class FeishuChannel:
             )
         elif envelope.event_type == "card.action.trigger":
             if msg := self._parse_approval_card_action(envelope.raw):
-                self.enqueue(self._with_event_provenance(msg, envelope))
+                await self.enqueue(self._with_event_provenance(msg, envelope))
                 return
             if msg := self._parse_clarify_card_action(envelope.raw):
-                self.enqueue(self._with_event_provenance(msg, envelope))
+                await self.enqueue(self._with_event_provenance(msg, envelope))
                 return
             log.info("feishu.card_action_ignored", event_id=envelope.event_id)
         else:
@@ -1710,14 +1775,12 @@ class FeishuChannel:
             "receive_id": chat_id,
             "msg_type": "text",
             "content": json.dumps({"text": _normalize_outbound_text(content)}),
+            "uuid": _feishu_delivery_uuid(request_uuid),
         }
         resp = await retry_request(
             client.post,
             "/im/v1/messages",
-            params={
-                "receive_id_type": receive_id_type,
-                "uuid": _feishu_delivery_uuid(request_uuid),
-            },
+            params={"receive_id_type": receive_id_type},
             json=payload,
             headers=headers,
         )
@@ -1740,10 +1803,10 @@ class FeishuChannel:
         resp = await retry_request(
             client.post,
             f"/im/v1/messages/{message_id}/reply",
-            params={"uuid": _feishu_delivery_uuid(request_uuid)},
             json={
                 "msg_type": "text",
                 "content": json.dumps({"text": _normalize_outbound_text(content)}),
+                "uuid": _feishu_delivery_uuid(request_uuid),
             },
             headers=headers,
         )
@@ -1793,16 +1856,14 @@ class FeishuChannel:
                 "receive_id": chat_id,
                 "msg_type": "text",
                 "content": json.dumps({"text": _normalize_outbound_text(message.content)}),
+                "uuid": request_uuid,
             }
             payload["msg_type"] = "interactive"
             payload["content"] = json.dumps(message.metadata["card"])
             resp = await retry_request(
                 client.post,
                 "/im/v1/messages",
-                params={
-                    "receive_id_type": receive_id_type,
-                    "uuid": request_uuid,
-                },
+                params={"receive_id_type": receive_id_type},
                 json=payload,
                 headers=headers,
             )
@@ -1817,13 +1878,17 @@ class FeishuChannel:
             )
         log.debug("feishu.send", chat_id=chat_id)
 
-    async def send_file(
+    async def _send_file(
         self,
         chat_id: str,
         file_path: str,
         file_type: str = "file",
+        *,
+        request_uuid: str | None = None,
+        reply_message_id: str | None = None,
+        reply_in_thread: bool = False,
     ) -> ChannelSendResult:
-        """Upload and send a file to a Feishu chat."""
+        """Upload and send a file, reusing a provider request UUID on retry."""
         chat_id = str(chat_id or "").strip()
         if not chat_id:
             raise ValueError("feishu.send_file: chat target is required")
@@ -1866,19 +1931,24 @@ class FeishuChannel:
             message_type = "file"
             content = {"file_key": key}
 
-        receive_id_type = _feishu_receive_id_type(chat_id)
-        payload = {
-            "receive_id": chat_id,
+        payload: dict[str, Any] = {
             "msg_type": message_type,
             "content": json.dumps(content),
+            "uuid": _feishu_delivery_uuid(request_uuid),
         }
+        params: dict[str, str] = {}
+        if reply_message_id:
+            endpoint = f"/im/v1/messages/{reply_message_id}/reply"
+            if reply_in_thread:
+                payload["reply_in_thread"] = True
+        else:
+            endpoint = "/im/v1/messages"
+            payload["receive_id"] = chat_id
+            params["receive_id_type"] = _feishu_receive_id_type(chat_id)
         resp = await retry_request(
             client.post,
-            "/im/v1/messages",
-            params={
-                "receive_id_type": receive_id_type,
-                "uuid": _feishu_delivery_uuid(),
-            },
+            endpoint,
+            params=params,
             json=payload,
             headers=headers,
         )
@@ -1891,6 +1961,37 @@ class FeishuChannel:
             target_id=chat_id,
             provider_message_id=message_id,
             provider_file_id=provider_file_id,
+        )
+
+    async def send_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        file_type: str = "file",
+    ) -> ChannelSendResult:
+        """Upload and send a file to a Feishu chat.
+
+        Keep the legacy signature for direct callers.  Contextual artifact
+        delivery uses :meth:`deliver_artifact` so the durable outbox identity
+        can reach Feishu's provider-level ``uuid`` parameter.
+        """
+
+        return await self._send_file(chat_id, file_path, file_type=file_type)
+
+    async def deliver_artifact(
+        self,
+        request: ChannelArtifactDeliveryRequest,
+    ) -> ChannelSendResult:
+        """Deliver an artifact to the exact chat that originated the request."""
+
+        metadata = self.build_reply_message("", request.inbound).metadata
+        reply_message_id = metadata.get("reply_message_id")
+        return await self._send_file(
+            request.inbound.channel_id,
+            request.file_path,
+            request_uuid=request.delivery_id,
+            reply_message_id=reply_message_id if isinstance(reply_message_id, str) else None,
+            reply_in_thread=bool(metadata.get("native_thread_id")),
         )
 
     async def edit(self, message_id: str, content: str) -> None:

@@ -11,6 +11,10 @@ from typing import Any
 
 import structlog
 
+from opensquilla.contracts.adapters.sessions_changed_contract import (
+    SESSIONS_CHANGED_EVENT,
+    observe_sessions_changed_payload,
+)
 from opensquilla.engine.types import AgentEvent
 from opensquilla.gateway.scopes import operator_scope_satisfies
 from opensquilla.gateway.session_streams import get_session_streams
@@ -22,8 +26,8 @@ def bridge_event_name(event: AgentEvent) -> str:
     """Return the canonical ``session.event.*`` name for an engine event.
 
     Derives the name from the event's ``kind`` discriminator (e.g. a
-    :class:`~opensquilla.engine.types.MetaStepStateEvent` whose ``kind`` is
-    ``"meta_step_state"`` maps to ``"session.event.meta_step_state"``).
+    :class:`~opensquilla.engine.types.TextDeltaEvent` whose ``kind`` is
+    ``"text_delta"`` maps to ``"session.event.text_delta"``).
 
     This single derivation point lets new event types (engine dataclasses
     in :mod:`opensquilla.engine.types`) flow through to WebSocket
@@ -61,13 +65,22 @@ class EventBridge:
                 ``sessions.changed``).
             payload: Event payload dict.
         """
-        if self._subs is None:
+        if self._subs is None or (replay_recorded and payload is None):
             return
 
         try:
-            send_payload = payload or {}
+            send_payload = payload if payload is not None else {}
+            if event_name == SESSIONS_CHANGED_EVENT:
+                send_payload = observe_sessions_changed_payload(
+                    send_payload,
+                    source="gateway.event_bridge",
+                    allow_legacy=False,
+                )
             if event_name.startswith("session.event.") and not replay_recorded:
-                send_payload = get_session_streams().record(session_key, event_name, send_payload)
+                recorded = get_session_streams().record(session_key, event_name, send_payload)
+                if recorded is None:
+                    return
+                send_payload = recorded
 
             subscriber_ids = self._subs.get_message_subscribers(session_key)
             if event_name.startswith("sessions."):
@@ -111,7 +124,13 @@ class EventBridge:
         if self._registry is None:
             return
         try:
-            send_payload = payload or {}
+            send_payload = payload if payload is not None else {}
+            if event_name == SESSIONS_CHANGED_EVENT:
+                send_payload = observe_sessions_changed_payload(
+                    send_payload,
+                    source="gateway.event_bridge.broadcast_scoped",
+                    allow_legacy=False,
+                )
             for conn in self._registry.all():
                 principal = getattr(conn, "principal", None)
                 scopes = getattr(principal, "scopes", None)

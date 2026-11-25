@@ -15,6 +15,10 @@ def serve(home_dir: str) -> int:
     os.environ["HOME"] = home_dir
     os.environ.setdefault("OPENSQUILLA_STATE_DIR", os.path.join(home_dir, "state"))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    # Anonymous install telemetry is a desktop install-count metric; on a phone
+    # it only burns radio/wake time on first boot. setdefault keeps an explicit
+    # operator opt-in possible (unset the var in the environment or config).
+    os.environ.setdefault("OPENSQUILLA_TELEMETRY_DISABLED", "1")
     # ── Mobile resilience profile ────────────────────────────────────────
     # EMUI/MagicOS freezes the whole process whenever the app is not the
     # foreground app — even with an active foreground service. Freezing
@@ -77,16 +81,22 @@ def serve(home_dir: str) -> int:
     # Android is a single-instance app: a stale gateway.pid (left behind by a
     # hard kill) blocks startup once the recorded pid gets reused by another
     # process — the gateway then refuses to boot ("already running") and the
-    # app appears stuck on the launch screen. The pid-lock has no meaning for
-    # us, so clear it before every boot.
+    # app appears stuck on the launch screen. Upstream 0.5.8 additionally
+    # takes an flock on gateway.pid.lock (gateway/pidlock.py); a killed
+    # process releases the OS lock automatically, but the leftover files are
+    # still meaningless across app restarts, so clear both before every boot.
     try:
-        _pid_path = os.path.join(os.environ["OPENSQUILLA_STATE_DIR"], "state", "gateway.pid")
-        if os.path.exists(_pid_path):
-            _stale_pid = open(_pid_path, "r").read().strip()
-            os.remove(_pid_path)
-            print(f"[pidlock] cleared stale gateway.pid (pid={_stale_pid})", file=_diag)
+        _state_root = os.path.join(os.environ["OPENSQUILLA_STATE_DIR"], "state")
+        _removed = []
+        for _name in ("gateway.pid", "gateway.pid.lock"):
+            _p = os.path.join(_state_root, _name)
+            if os.path.exists(_p):
+                os.remove(_p)
+                _removed.append(_name)
+        if _removed:
+            print(f"[pidlock] cleared stale: {', '.join(_removed)}", file=_diag)
         else:
-            print("[pidlock] no stale gateway.pid", file=_diag)
+            print("[pidlock] no stale gateway files", file=_diag)
     except Exception as _e:
         print(f"[pidlock] clear failed: {_e!r}", file=_diag)
 

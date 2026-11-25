@@ -14,6 +14,9 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.provider.activity import safe_activity_model
+from opensquilla.provider.failures import ProviderFailureKind, safe_http_status
+
 USAGE_ACCOUNTING_BARRIER_CODES = frozenset(
     {
         "usage_accounting_busy",
@@ -28,6 +31,11 @@ _ACTIVITY_PHASES = {
         {"requesting", "reasoning", "retry_wait", "retrying", "fallback"}
     ),
 }
+_PROVIDER_ACTIVITY_REASONS = frozenset({
+    "initial", "rate_limited", "provider_overloaded", "transport_transient",
+    "reasoning_only", "empty_response", "stream_incomplete", "invalid_response",
+    "context_overflow", "unknown",
+})
 _MAX_ACTIVITY_PHASES = 32
 _MAX_ACTIVITY_ENTRIES = 2048
 _MAX_RETRY_AFTER_MS = 900_000
@@ -39,11 +47,52 @@ _ACTIVITY_ENTRY_TYPES = frozenset(
 _MAINTENANCE_STATES = frozenset(
     {"running", "completed", "skipped", "stale", "cancelled", "failed"}
 )
-_MAINTENANCE_REASONS = frozenset({"within_budget", "within_compaction_budget"})
+_BENIGN_MAINTENANCE_REASONS = frozenset({"within_budget", "within_compaction_budget"})
+_MAINTENANCE_REASONS = _BENIGN_MAINTENANCE_REASONS | {"summary_failed"}
+
+
+def _maintenance_failure_detail_allowed(state: str, reason: object) -> bool:
+    # A summary that failed safely leaves the source unchanged and is reported
+    # as skipped. Preserve that failure without treating a budget no-op as one.
+    benign = isinstance(reason, str) and reason in _BENIGN_MAINTENANCE_REASONS
+    return state == "failed" or state == "skipped" and not benign
 
 
 def is_usage_accounting_barrier(code: object) -> bool:
     return isinstance(code, str) and code.strip().lower() in USAGE_ACCOUNTING_BARRIER_CODES
+
+
+def safe_compaction_recovery(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or value.get("phase") not in {"retry_wait", "retrying"}:
+        return None
+    reason = value.get("reason")
+    if reason not in _PROVIDER_ACTIVITY_REASONS:
+        return None
+    result: dict[str, Any] = {"phase": value["phase"], "reason": reason}
+    for key, maximum in (("retry_attempt", 10_000), ("retry_limit", 10_000),
+                         ("retry_after_ms", _MAX_RETRY_AFTER_MS),
+                         ("started_at", _MAX_TIMESTAMP_MS)):
+        parsed = _safe_nonnegative_int(value.get(key), maximum=maximum)
+        if parsed is not None:
+            result[key] = parsed
+    http_status = safe_http_status(value.get("http_status"))
+    if value["phase"] == "retry_wait" and http_status is not None:
+        result["http_status"] = http_status
+    return result
+
+
+def safe_compaction_failure_detail(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    kind = value.get("failure_kind")
+    if kind not in {item.value for item in ProviderFailureKind}:
+        return None
+    result: dict[str, Any] = {"failure_kind": kind}
+    http_status = safe_http_status(value.get("http_status"))
+    if http_status is not None:
+        result["http_status"] = http_status
+    # No raw provider code or message: the normalized kind is enough to render.
+    return result
 
 
 def safe_retry_after_ms(value: object) -> int | None:
@@ -226,6 +275,26 @@ def _json_record(value: object) -> Mapping[str, Any] | None:
     return parsed if isinstance(parsed, Mapping) else None
 
 
+def _matches_committed_output(
+    done: Mapping[str, Any], *, reasoning_length: int, text_length: int
+) -> bool:
+    """Whether streamed reasoning/text lengths equal what ``done`` committed.
+
+    Producers that do not report a committed value (older ``done`` payloads)
+    cannot be checked and are accepted as before.
+    """
+
+    if "reasoning_content" in done:
+        committed = done["reasoning_content"]
+        if committed is None or isinstance(committed, str):
+            if _utf16_length(committed or "") != reasoning_length:
+                return False
+    committed_text = done.get("text_snapshot")
+    if isinstance(committed_text, str) and _utf16_length(committed_text) != text_length:
+        return False
+    return True
+
+
 def build_terminal_activity_snapshot(
     events: object,
     *,
@@ -256,6 +325,7 @@ def build_terminal_activity_snapshot(
     maintenance: dict[str, int] = {}
     interrupts: dict[str, dict[str, Any]] = {}
     terminal_boundary = _safe_positive_int(terminal_at)
+    done_payload: Mapping[str, Any] | None = None
 
     def append(entry: dict[str, Any]) -> None:
         nonlocal complete
@@ -270,6 +340,8 @@ def build_terminal_activity_snapshot(
 
         if suffix in {"done", "error"}:
             terminal_boundary = _event_end_at(payload)
+            if suffix == "done":
+                done_payload = payload
             continue
 
         if suffix == "answer_generation_reset":
@@ -345,8 +417,17 @@ def build_terminal_activity_snapshot(
                 "at": at,
             }
             reason = _safe_text(payload.get("reason"), maximum=64)
-            if reason == "rate_limited":
+            if reason in _PROVIDER_ACTIVITY_REASONS:
                 entry["reason"] = reason
+            for model_field in ("model", "from_model"):
+                model_value = safe_activity_model(payload.get(model_field))
+                if model_value is not None and (
+                    model_field == "model" or phase == "fallback"
+                ):
+                    entry[model_field] = model_value
+            http_status = safe_http_status(payload.get("http_status"))
+            if phase == "retry_wait" and http_status is not None:
+                entry["http_status"] = http_status
             retry_after = _safe_nonnegative_int(
                 payload.get("retry_after_ms", payload.get("retryAfterMs")),
                 maximum=_MAX_RETRY_AFTER_MS,
@@ -589,6 +670,10 @@ def build_terminal_activity_snapshot(
             continue
 
         if suffix == "compaction":
+            # Manual maintenance has its own operation identity and UI record,
+            # even when its admission is queued behind this assistant turn.
+            if str(payload.get("source") or "").lower() == "manual":
+                continue
             compaction_id = _safe_text(
                 payload.get("compaction_id", payload.get("compactionId")), maximum=200
             )
@@ -622,12 +707,22 @@ def build_terminal_activity_snapshot(
             )
             if reason in _MAINTENANCE_REASONS:
                 entry["reason"] = reason
+            recovery = safe_compaction_recovery(payload.get("recovery"))
+            failure_detail = safe_compaction_failure_detail(payload.get("failure_detail"))
+            if state == "running" and recovery is not None:
+                entry["recovery"] = recovery
+            if _maintenance_failure_detail_allowed(state, reason) and failure_detail is not None:
+                entry["failure_detail"] = failure_detail
             prior_index = maintenance.get(compaction_id)
             if prior_index is None:
                 maintenance[compaction_id] = len(entries)
                 append(entry)
             elif prior_index < len(entries):
-                prior = entries[prior_index]
+                prior = dict(entries[prior_index])
+                if state != "running":
+                    prior.pop("recovery", None)
+                if "failure_detail" not in entry:
+                    prior.pop("failure_detail", None)
                 entries[prior_index] = {
                     **prior,
                     **entry,
@@ -655,6 +750,20 @@ def build_terminal_activity_snapshot(
             block["status"] = "completed"
         append(block)
         persisted_reasoning_blocks += 1
+
+    if done_payload is not None and not _matches_committed_output(
+        done_payload,
+        reasoning_length=reasoning_offset,
+        text_length=sum(
+            int(entry["text_utf16_length"])
+            for entry in entries
+            if entry["type"] == "segment" and entry["segment_type"] == "text"
+        ),
+    ):
+        # A model call that failed after streaming leaves deltas that the
+        # committed transcript never keeps. The stream order is still recorded,
+        # but the record can no longer claim to cover the transcript.
+        complete = False
 
     for interrupt in interrupts.values():
         if "resolution" not in interrupt or "ended_at" not in interrupt:
@@ -757,7 +866,8 @@ def _terminal_activity_snapshot_v2(
         if entry_type == "phase":
             allowed = {
                 "type", "id", "order", "kind", "phase", "at", "reason",
-                "ended_at", "retry_after_ms", "retry_attempt", "retry_limit", "round",
+                "ended_at", "retry_after_ms", "retry_attempt", "retry_limit",
+                "round", "http_status", "model", "from_model",
             }
             if set(raw) - allowed:
                 return None
@@ -783,11 +893,29 @@ def _terminal_activity_snapshot_v2(
                 "at": at,
                 "ended_at": ended_at,
             }
+            if kind != "provider" and any(
+                raw.get(model_field) is not None for model_field in ("model", "from_model")
+            ):
+                return None
             if kind == "provider":
-                if raw.get("reason") is not None:
-                    if raw.get("reason") != "rate_limited":
+                for model_field in ("model", "from_model"):
+                    if raw.get(model_field) is None:
+                        continue
+                    model_value = safe_activity_model(raw[model_field])
+                    if model_value is None or (model_field == "from_model" and phase != "fallback"):
                         return None
-                    entry["reason"] = "rate_limited"
+                    entry[model_field] = model_value
+                if raw.get("reason") is not None:
+                    if raw.get("reason") not in _PROVIDER_ACTIVITY_REASONS:
+                        return None
+                    entry["reason"] = raw["reason"]
+                http_status = safe_http_status(raw.get("http_status"))
+                if raw.get("http_status") is not None and (
+                    http_status is None or phase != "retry_wait"
+                ):
+                    return None
+                if http_status is not None:
+                    entry["http_status"] = http_status
                 retry_after = _safe_nonnegative_int(
                     raw.get("retry_after_ms"), maximum=_MAX_RETRY_AFTER_MS
                 )
@@ -817,7 +945,8 @@ def _terminal_activity_snapshot_v2(
             elif any(
                 raw.get(field) is not None
                 for field in (
-                    "reason", "retry_after_ms", "retry_attempt", "retry_limit", "round"
+                    "reason", "retry_after_ms", "retry_attempt", "retry_limit",
+                    "round", "http_status"
                 )
             ):
                 return None
@@ -943,7 +1072,7 @@ def _terminal_activity_snapshot_v2(
         elif entry_type == "maintenance":
             allowed = {
                 "type", "id", "order", "maintenance_type", "state", "at",
-                "ended_at", "source", "durability", "reason",
+                "ended_at", "source", "durability", "reason", "recovery", "failure_detail",
             }
             if set(raw) - allowed:
                 return None
@@ -965,6 +1094,14 @@ def _terminal_activity_snapshot_v2(
                 "at": at,
                 "ended_at": ended_at,
             }
+            if state == "running":
+                recovery = safe_compaction_recovery(raw.get("recovery"))
+                if recovery is not None:
+                    entry["recovery"] = recovery
+            if _maintenance_failure_detail_allowed(state, raw.get("reason")):
+                failure_detail = safe_compaction_failure_detail(raw.get("failure_detail"))
+                if failure_detail is not None:
+                    entry["failure_detail"] = failure_detail
             for field in ("source", "durability"):
                 if raw.get(field) is None:
                     continue

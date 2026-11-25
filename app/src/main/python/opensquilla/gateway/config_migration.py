@@ -6,9 +6,11 @@ import copy
 import datetime
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
+import tomllib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,14 +18,15 @@ from pathlib import Path
 from typing import Any
 
 import tomli_w
+from pydantic import TypeAdapter
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION as LATEST_CONFIG_VERSION
+from opensquilla.lossless_toml import LosslessTomlPatchError, patch_import_config
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
-# Schema version stamped into every migrated payload. Bump this together with
-# a new ``_MIGRATIONS`` entry whenever a one-time value migration is added.
-# ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
-LATEST_CONFIG_VERSION = 1
+# The shared version also gates lightweight profile recovery. Bump it together
+# with a new ``_MIGRATIONS`` entry whenever a one-time value migration is added.
 
 
 class ConfigParseError(ValueError):
@@ -40,6 +43,19 @@ class ConfigParseError(ValueError):
 
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
+        "memory.flush_enabled",
+        "memory.flush_triggers",
+        "memory.flush_pre_compaction",
+        "memory.flush_timeout_seconds",
+        "memory.flush_background_timeout_seconds",
+        "memory.flush_backoff_initial_seconds",
+        "memory.flush_backoff_max_seconds",
+        "memory.flush_archive_max_bytes",
+        "memory.flush_compaction_requires_safe_receipt",
+        "memory.flush_compaction_safety_mode",
+        "memory.repair_enabled",
+        "memory.repair_interval_seconds",
+        "memory.repair_max_items_per_tick",
         "memory.profile",
         "memory.cost.embedding_cache",
         "memory.cost.rerank_cache",
@@ -90,8 +106,23 @@ DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(
     k.removeprefix("agent_token_saving.")
     for k in DEPRECATED_AGENT_TOKEN_SAVING_FIELDS
 )
+DEPRECATED_SKILL_FILTER_LEAVES: frozenset[str] = frozenset(
+    {
+        "filter_enabled",
+        "filter_top_k",
+        "filter_strategy",
+        "filter_lexical_top_n",
+        "filter_semantic_top_n",
+        "filter_rrf_k",
+        "filter_embedding_model",
+    }
+)
+DEPRECATED_SKILL_FILTER_FIELDS: frozenset[str] = frozenset(
+    f"skills.{leaf}" for leaf in DEPRECATED_SKILL_FILTER_LEAVES
+)
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
+_LEGACY_TELEMETRY_BOOL: TypeAdapter[bool | None] = TypeAdapter(bool | None)
 
 
 def _legacy_llm_ensemble_timeout_number(value: Any) -> float | None:
@@ -109,11 +140,16 @@ _LEGACY_MEMORY_FIELDS_SEEN: set[str] = set()
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_WARN_LOCK = threading.Lock()
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_WARNED = False
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_SEEN: set[str] = set()
+_LEGACY_SKILL_FILTER_WARN_LOCK = threading.Lock()
+_LEGACY_SKILL_FILTER_WARNED = False
 
 
 @dataclass(frozen=True)
 class ConfigMigrationResult:
     payload: dict[str, Any]
+    # Pre-migration payload exactly as validated at load time, so the write
+    # path can patch the on-disk bytes from it to ``payload``.
+    original: dict[str, Any]
     changes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     removed_fields: tuple[str, ...] = ()
@@ -123,6 +159,7 @@ class ConfigMigrationResult:
 @dataclass
 class _MigrationBuilder:
     payload: dict[str, Any]
+    original: dict[str, Any]
     changes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     removed_fields: list[str] = field(default_factory=list)
@@ -131,6 +168,7 @@ class _MigrationBuilder:
         changed = bool(self.changes or self.removed_fields)
         return ConfigMigrationResult(
             payload=self.payload,
+            original=self.original,
             changes=tuple(self.changes),
             warnings=tuple(self.warnings),
             removed_fields=tuple(self.removed_fields),
@@ -170,13 +208,13 @@ def handle_deprecated_memory_fields(
         warnings.warn(
             f"OpenSquilla: {n} legacy memory.* config field(s) ignored "
             f"(e.g. {first_three}); see {log_ref} for details. "
-            f"These fields will be removed in 0.2.0.",
+            "These fields will be cleaned during config rewrite.",
             DeprecationWarning,
             stacklevel=6,
         )
         logging.getLogger(__name__).warning(
             "OpenSquilla: %d legacy memory.* config field(s) ignored (e.g. %s); "
-            "see %s for details. These fields will be removed in 0.2.0.",
+            "see %s for details. These fields will be cleaned during config rewrite.",
             n,
             first_three,
             log_ref,
@@ -228,6 +266,65 @@ def handle_deprecated_agent_token_saving_fields(
             first_three,
             log_ref,
         )
+
+
+def _handle_deprecated_skill_filter_fields(
+    found: dict[str, object],
+    source: str,
+) -> None:
+    """Log value shapes and issue one process warning for removed filter keys."""
+
+    global _LEGACY_SKILL_FILTER_WARNED
+    if not found:
+        return
+    with _LEGACY_SKILL_FILTER_WARN_LOCK:
+        should_warn = not _LEGACY_SKILL_FILTER_WARNED
+        _LEGACY_SKILL_FILTER_WARNED = True
+    _write_legacy_field_log(found, source)
+    if not should_warn:
+        return
+    fields = ", ".join(sorted(found))
+    message = (
+        "OpenSquilla: removed Skill relevance-filter configuration was ignored "
+        f"and will be cleaned during config rewrite ({fields}); the Skill "
+        "catalog now uses deterministic eligibility and visibility projection."
+    )
+    warnings.warn(message, DeprecationWarning, stacklevel=6)
+    logging.getLogger(__name__).warning(message)
+
+
+def strip_deprecated_skill_filter_settings(data: dict[str, object]) -> dict[str, object]:
+    """Discard only retired filter keys before nested settings validation."""
+
+    removed = {
+        f"skills.{key}": value
+        for key, value in data.items()
+        if key in DEPRECATED_SKILL_FILTER_LEAVES
+    }
+    if not removed:
+        return data
+    _handle_deprecated_skill_filter_fields(removed, "settings_validation")
+    return {key: value for key, value in data.items() if key not in DEPRECATED_SKILL_FILTER_LEAVES}
+
+
+def handle_deprecated_skill_filter_env() -> None:
+    """Ignore and warn for legacy filter environment variables.
+
+    Values are never parsed or logged. Both the historical nested SkillsConfig
+    prefix and the top-level nested-settings spelling are recognized.
+    """
+
+    found: dict[str, object] = {}
+    for leaf in sorted(DEPRECATED_SKILL_FILTER_LEAVES):
+        upper = leaf.upper()
+        for env_name in (
+            f"OPENSQUILLA_SKILLS_{upper}",
+            f"OPENSQUILLA_GATEWAY_SKILLS__{upper}",
+        ):
+            if env_name in os.environ:
+                found[env_name] = os.environ[env_name]
+    if found:
+        _handle_deprecated_skill_filter_fields(found, "environment")
 
 
 def _write_legacy_field_log(found: dict[str, object], source: str) -> None:
@@ -316,13 +413,20 @@ def migrate_config_payload(
     still reports changes and migration warnings, but no compatibility log,
     process warning, logging record, or process warning sentinel is touched.
     """
-    builder = _MigrationBuilder(payload=copy.deepcopy(data))
+    builder = _MigrationBuilder(payload=copy.deepcopy(data), original=copy.deepcopy(data))
 
+    _strip_retired_product_features(builder)
+    _strip_video_duration_limit(builder)
+    _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
         builder,
         emit_diagnostics=emit_diagnostics,
     )
+    _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
+    _strip_removed_router_compaction_fields(builder)
+    _strip_router_self_learning(builder)
+    _normalize_telemetry_upload_preference(builder)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
     _disable_unverifiable_feishu_webhook_entries(builder)
@@ -343,6 +447,91 @@ def migrate_config_payload(
     return builder.result()
 
 
+def _strip_video_duration_limit(builder: _MigrationBuilder) -> None:
+    """Discard the retired operator cap while preserving provider defaults."""
+    video = builder.payload.get("video_generation")
+    if isinstance(video, dict) and "max_duration_seconds" in video:
+        video.pop("max_duration_seconds")
+        builder.removed_fields.append("video_generation.max_duration_seconds")
+
+
+def _strip_retired_product_features(builder: _MigrationBuilder) -> None:
+    """Discard obsolete mode settings without inspecting or logging their values."""
+    if "meta_skill" in builder.payload:
+        builder.payload.pop("meta_skill")
+        builder.removed_fields.append("meta_skill")
+    skills = builder.payload.get("skills")
+    if isinstance(skills, dict) and "coding_mode" in skills:
+        skills.pop("coding_mode")
+        builder.removed_fields.append("skills.coding_mode")
+    if {"meta_skill", "skills.coding_mode"}.intersection(builder.removed_fields):
+        builder.warnings.append(
+            "MetaSkill and Coding Mode were removed; ordinary agents, coding tools "
+            "and skills use the normal tool and skill permissions."
+        )
+
+
+def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
+    privacy = builder.payload.get("privacy")
+    if not isinstance(privacy, dict):
+        return
+    legacy_choices = (
+        _LEGACY_TELEMETRY_BOOL.validate_python(privacy.get(name))
+        for name in ("reliability_diagnostics_enabled", "product_analytics_enabled")
+    )
+    # Match the prior config model's boolean coercion before discarding retired
+    # fields. Invalid old values must still raise rather than silently enable.
+    choices = tuple(legacy_choices)
+    if any(choice is False for choice in choices):
+        privacy["disable_network_observability"] = True
+        builder.changes.append("Preserved legacy telemetry opt-out in the global privacy switch")
+    for name in (
+        "reliability_diagnostics_enabled",
+        "reliability_notice_version",
+        "reliability_consented_at_utc",
+        "product_analytics_enabled",
+        "product_analytics_notice_version",
+        "product_analytics_consented_at_utc",
+    ):
+        if name in privacy:
+            privacy.pop(name)
+            builder.removed_fields.append(f"privacy.{name}")
+
+
+def _strip_router_self_learning(builder: _MigrationBuilder) -> None:
+    """Discard retired training settings without reading any learning artifacts."""
+    router = builder.payload.get("squilla_router")
+    if isinstance(router, dict) and "self_learning" in router:
+        router.pop("self_learning")
+        builder.removed_fields.append("squilla_router.self_learning")
+        builder.warnings.append(
+            "Router self-learning was removed; routing uses the configured base model. "
+            "Existing memory settings and training files are unchanged."
+        )
+
+
+def _strip_removed_router_compaction_fields(builder: _MigrationBuilder) -> None:
+    """Always-run: discard the retired C3/T3 compaction switches."""
+    router = builder.payload.get("squilla_router")
+    if not isinstance(router, dict):
+        return
+    for leaf in ("upgrade_to_c3_compaction_enabled", "upgrade_to_t3_compaction_enabled"):
+        if leaf in router:
+            router.pop(leaf)
+            builder.removed_fields.append(f"squilla_router.{leaf}")
+    if any(
+        field in builder.removed_fields
+        for field in (
+            "squilla_router.upgrade_to_c3_compaction_enabled",
+            "squilla_router.upgrade_to_t3_compaction_enabled",
+        )
+    ):
+        builder.warnings.append(
+            "squilla_router upgrade compaction switches were removed; "
+            "all before-turn compaction now uses the target-budget preflight"
+        )
+
+
 def _payload_config_version(payload: dict[str, Any]) -> int:
     """Return the payload's migration stamp; anything missing or invalid is 0.
 
@@ -354,6 +543,16 @@ def _payload_config_version(payload: dict[str, Any]) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return int(value)
+
+
+def _strip_removed_sandbox_fields(builder: _MigrationBuilder) -> None:
+    """Always-run: strip sandbox fields removed from the strict settings model."""
+    sandbox = builder.payload.get("sandbox")
+    if not isinstance(sandbox, dict):
+        return
+    if "auto_setup" in sandbox:
+        sandbox.pop("auto_setup")
+        builder.removed_fields.append("sandbox.auto_setup")
 
 
 def _normalize_memory_fields(
@@ -454,6 +653,31 @@ def _normalize_agent_token_saving_fields(
                 "agent_token_saving.tool_result_compression_* was removed; "
                 "tokenjuice projection is now the built-in tool-result path"
             )
+
+
+def _normalize_skill_filter_fields(
+    builder: _MigrationBuilder,
+    *,
+    emit_diagnostics: bool,
+) -> None:
+    """Always-run compatibility strip for removed ``skills.filter_*`` keys."""
+
+    skills = builder.payload.get("skills")
+    if not isinstance(skills, dict):
+        return
+    removed: dict[str, object] = {}
+    for leaf in sorted(DEPRECATED_SKILL_FILTER_LEAVES):
+        if leaf in skills:
+            removed[f"skills.{leaf}"] = skills.pop(leaf)
+    if not removed:
+        return
+    builder.removed_fields.extend(sorted(removed))
+    builder.warnings.append(
+        "removed Skill relevance-filter configuration was discarded; "
+        "catalog projection is deterministic"
+    )
+    if emit_diagnostics:
+        _handle_deprecated_skill_filter_fields(removed, "config_migration")
 
 
 def _clamp_search_max_results(builder: _MigrationBuilder) -> None:
@@ -650,16 +874,134 @@ def _migrate_v1_llm_ensemble_legacy_timeouts(builder: _MigrationBuilder) -> None
             )
 
 
+def _migrate_v2_primary_router_recommendations(builder: _MigrationBuilder) -> None:
+    """Initialize missing curated text routing without replacing saved choices.
+
+    Old model names and ownership labels cannot establish consent to an
+    update. Preserve every explicit text tier, including partial legacy
+    ladders; replacing one requires the operator's recommendation action.
+    """
+    llm = builder.payload.get("llm")
+    router = builder.payload.get("squilla_router")
+    if not isinstance(llm, dict) or not isinstance(router, dict):
+        return
+    provider = str(llm.get("provider") or "").strip().lower()
+    if "provider" not in llm:
+        from opensquilla.provider.credentials import (
+            credential_provider_hint,
+            endpoint_provider_hint,
+        )
+
+        # Older files can leave the primary implicit. Use the same distinctive
+        # evidence as the config resolver without persisting an inferred
+        # llm.provider or guessing from arbitrary models/custom endpoints.
+        hints = {
+            credential_provider_hint(llm.get("api_key")),
+            credential_provider_hint(api_key_env=llm.get("api_key_env")),
+            endpoint_provider_hint(llm.get("base_url")),
+        } - {""}
+        if str(router.get("tier_profile") or "").strip().lower() == "openrouter":
+            hints.add("openrouter")
+        if len(hints) == 1:
+            provider = next(iter(hints))
+            if not {"api_key", "api_key_env"} & llm.keys():
+                # The runtime also considers ambient keys in this case. A
+                # conflicting environment cannot authorize a permanent reset.
+                ambient = {
+                    candidate for candidate, name in (
+                        ("openrouter", "OPENROUTER_API_KEY"),
+                        ("tokenrhythm", "TOKENRHYTHM_API_KEY"),
+                    ) if os.environ.get(name, "").strip()
+                }
+                if ambient - {provider}:
+                    return
+    if provider not in {"openrouter", "tokenrhythm"}:
+        return
+    existing_tiers = router.get("tiers")
+    if existing_tiers is not None and not isinstance(existing_tiers, dict):
+        return  # Keep malformed payloads subject to normal config validation.
+
+    from opensquilla.provider.preset_registry import get_preset
+    from opensquilla.router_tiers import TEXT_TIERS, normalize_text_tier
+
+    has_saved_text = any(
+        normalize_text_tier(name) in TEXT_TIERS for name in existing_tiers or {}
+    )
+    profile = str(router.get("tier_profile") or "").strip().lower()
+    if profile == "tokenrhythm":
+        # TokenRhythm cannot be persisted as a compact legacy profile. Keep
+        # inline choices authoritative; only a pointer without text tiers
+        # needs expansion to preserve its provider recommendation identity.
+        router.pop("tier_profile", None)
+        if not has_saved_text:
+            preset = get_preset("tokenrhythm")
+            if preset is not None:
+                router["tiers"] = {**preset.tier_defaults(), **(existing_tiers or {})}
+        builder.changes.append(
+            "squilla_router.tier_profile: normalized unsupported tokenrhythm profile "
+            "to inline tiers"
+        )
+        return
+    if router.get("preset_binding") == "custom":
+        return
+    if has_saved_text:
+        return
+    if profile and profile != provider:
+        return  # A saved recommendation may intentionally use another provider.
+
+    preset = get_preset(provider)
+    if preset is None:
+        return
+    defaults = preset.tier_defaults()
+    tiers = dict(existing_tiers or {})
+    for name in TEXT_TIERS:
+        tiers[name] = dict(defaults[name])
+    if "image_model" not in tiers and "image_model" in defaults:
+        tiers["image_model"] = defaults["image_model"]
+    router["tiers"] = tiers
+    router["preset_binding"] = "follow_primary"
+    if not preset.persistable or router.get("tier_profile") != provider:
+        router.pop("tier_profile", None)
+    builder.changes.append(
+        f"squilla_router: initialized missing text tiers from {provider} recommendations"
+    )
+
+
 # One-time value migrations, walked in ascending version order. An entry with
 # version N runs only when the payload's config_version stamp is below N.
 # Keep versions strictly increasing and cap them at LATEST_CONFIG_VERSION.
 _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
     (1, _migrate_v1_llm_ensemble_legacy_timeouts),
+    (2, _migrate_v2_primary_router_recommendations),
 ]
 
 
-def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
-    """Atomically replace one TOML config file (same-dir temp, fsync, 0600).
+class ConfigMigrationConflictError(ValueError):
+    """A migration must not replace a config changed since validation."""
+
+
+def _same_toml_payload(left: Any, right: Any) -> bool:
+    """Compare parsed TOML without treating unchanged NaN values as conflicts."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_toml_payload(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_toml_payload(a, b) for a, b in zip(left, right, strict=True)
+        )
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+    return bool(left == right)
+
+
+def atomic_replace_bytes(
+    target: str | Path, data: bytes, *, expected_bytes: bytes | None = None
+) -> None:
+    """Atomically replace one config file with exact bytes (same-dir temp, fsync, 0600).
 
     Every writer that replaces ``config.toml`` converges on this helper so the
     crash-durability contract lives in exactly one place. The recovery module
@@ -668,19 +1010,24 @@ def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
     there.
     """
 
-    target = Path(path)
+    target_path = Path(target)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
+        prefix=f".{target_path.name}.",
         suffix=".tmp",
-        dir=os.fspath(native_io_path(target.parent)),
+        dir=os.fspath(native_io_path(target_path.parent)),
     )
     try:
         with os.fdopen(fd, "wb") as fh:
-            tomli_w.dump(payload, fh)
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, native_io_path(target))
+        if (
+            expected_bytes is not None
+            and native_io_path(target_path).read_bytes() != expected_bytes
+        ):
+            raise ConfigMigrationConflictError("source config changed while preparing migration")
+        os.replace(tmp_name, native_io_path(target_path))
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -689,27 +1036,102 @@ def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically replace one TOML config file with serialized ``payload``.
+
+    Serialization stays here; the byte-landing contract lives in
+    :func:`atomic_replace_bytes`, which every writer that replaces
+    ``config.toml`` converges on.
+    """
+    atomic_replace_bytes(path, tomli_w.dumps(payload).encode("utf-8"))
+
+
 def backup_and_write_migrated_config(
     path: str | Path,
     payload: dict[str, Any],
     result: ConfigMigrationResult,
 ) -> Path:
-    """Back up and atomically replace a migrated user config file."""
+    """Back up and atomically replace a migrated user config file.
+
+    Only a source matching the validated payload may be migrated. Unsupported
+    lossless patches retain the previous full-serialization fallback, but a
+    changed source never falls back to writing the stale payload. A nonblocking
+    shared write lock keeps startup from waiting on another config persister;
+    both rewrite paths also verify the source bytes immediately before replace.
+    """
+    # Import after GatewayConfig has finished loading its module: config_store
+    # itself imports the config models and migration helpers.
+    from opensquilla.onboarding.config_store import _config_write_lock, _logical_path_from_io
+
     target = Path(path)
-    backup = make_config_backup(target)
-    atomic_write_config(target, payload)
-    os.chmod(native_io_path(target), 0o600)
+    target_io = native_io_path(target)
+    if target_io.is_symlink():
+        try:
+            target = _logical_path_from_io(target_io.resolve())
+        except RuntimeError as exc:
+            # A link changed into a loop after validation must not block load.
+            raise ConfigMigrationConflictError(
+                "source config link changed since validation"
+            ) from exc
+        target_io = native_io_path(target)
+    rewrite = "comment-preserving"
+    lossless_error: str | None = None
+    with _config_write_lock(target, blocking=False):
+        source_bytes = target_io.read_bytes()
+        try:
+            source_payload = tomllib.loads(source_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigMigrationConflictError("source config changed since validation") from exc
+        if not _same_toml_payload(source_payload, result.original):
+            raise ConfigMigrationConflictError("source config changed since validation")
+        try:
+            patched = patch_import_config(source_bytes, result.original, payload)
+        except LosslessTomlPatchError as exc:
+            rewrite = "full-reserialize"
+            lossless_error = str(exc)
+            patched = tomli_w.dumps(payload).encode("utf-8")
+        backup = make_config_backup(target)
+        atomic_replace_bytes(target, patched, expected_bytes=source_bytes)
+        os.chmod(target_io, 0o600)
+    extra: dict[str, Any] = {
+        "path": str(target),
+        "backup": str(backup),
+        "changes": list(result.changes),
+        "removed_fields": list(result.removed_fields),
+        "warnings": list(result.warnings),
+        "rewrite": rewrite,
+    }
+    if lossless_error is not None:
+        extra["lossless_error"] = lossless_error
     logging.getLogger(__name__).warning(
-        "OpenSquilla config migrated for 0.2.0 schema",
-        extra={
-            "path": str(target),
-            "backup": str(backup),
-            "changes": list(result.changes),
-            "removed_fields": list(result.removed_fields),
-            "warnings": list(result.warnings),
-        },
+        "OpenSquilla config migrated",
+        extra=extra,
     )
     return backup
+
+
+def rewrite_migrated_config_best_effort(
+    path: Path, migration: ConfigMigrationResult
+) -> None:
+    """Persist an already validated migration without making writes a load prerequisite."""
+    try:
+        backup_and_write_migrated_config(path, migration.payload, migration)
+    except ConfigMigrationConflictError as error:
+        logging.getLogger(__name__).warning(
+            "OpenSquilla config migration skipped for %s (%s); running from the "
+            "migrated payload in memory without overwriting the changed file.",
+            path,
+            error,
+            extra={"path": str(path), "rewrite": "skipped-conflict"},
+        )
+    except OSError as error:
+        logging.getLogger(__name__).warning(
+            "OpenSquilla config migration could not rewrite %s (%s); running "
+            "from the migrated payload in memory. Persistence will be retried "
+            "on a later load.",
+            path,
+            error,
+        )
 
 
 _CONFIG_BACKUP_KEEP = 10

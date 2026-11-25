@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import math
+import secrets
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -36,6 +40,12 @@ from .tokenrhythm_correlation import (
 
 log = structlog.get_logger(__name__)
 _TOKENS_PER_MTOK = Decimal("1000000")
+# Persisted identities must survive restarts, but must not make API keys or
+# proxy passwords cheap to guess from a copied private catalog snapshot.
+_IDENTITY_MEMO_KEY = secrets.token_bytes(32)
+_IDENTITY_MEMO: OrderedDict[bytes, str] = OrderedDict()
+_IDENTITY_MEMO_LOCK = threading.Lock()
+_IDENTITY_MEMO_LIMIT = 256
 TOKENRHYTHM_PUBLIC_CATALOG_URL = "https://tokenrhythm.studio/api/models"
 TOKENRHYTHM_API_BASE_URL = "https://tokenrhythm.studio/v1"
 _TOKENRHYTHM_OFFICIAL_API_HOST = "tokenrhythm.studio"
@@ -185,12 +195,23 @@ def canonical_tokenrhythm_base_url(value: str) -> str:
 
 
 def _identity_digest(domain: str, *parts: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(f"opensquilla:{domain}:v1".encode())
-    for part in parts:
-        digest.update(b"\0")
-        digest.update(part.encode())
-    return digest.hexdigest()
+    salt = f"opensquilla:{domain}:v2".encode()
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
+    # Only process-keyed indices and stretched outputs enter the memo. Raw
+    # secrets and fast unkeyed hashes are never retained as cache keys.
+    index = hmac.digest(_IDENTITY_MEMO_KEY, salt + b"\0" + payload, "sha256")
+    with _IDENTITY_MEMO_LOCK:
+        cached = _IDENTITY_MEMO.get(index)
+        if cached is not None:
+            _IDENTITY_MEMO.move_to_end(index)
+            return cached
+    result = hashlib.pbkdf2_hmac("sha256", payload, salt, 600_000, dklen=32).hex()
+    with _IDENTITY_MEMO_LOCK:
+        _IDENTITY_MEMO[index] = result
+        _IDENTITY_MEMO.move_to_end(index)
+        if len(_IDENTITY_MEMO) > _IDENTITY_MEMO_LIMIT:
+            _IDENTITY_MEMO.popitem(last=False)
+    return result
 
 
 def tokenrhythm_authority_identity(
@@ -239,12 +260,15 @@ def tokenrhythm_transport_fingerprint(
     )
 
 
-def tokenrhythm_public_transport_fingerprint(*, proxy: str) -> str:
+def tokenrhythm_public_transport_fingerprint(*, proxy: str, api_key: str = "") -> str:
     """Return a private refresh identity for the keyless public request."""
 
     proxy_digest = _identity_digest(
         "tokenrhythm-proxy", str(proxy or "").strip()
     )
+    from opensquilla.desktop_account import is_account_credential
+    if is_account_credential(api_key):
+        return _identity_digest("tokenrhythm-account-public-transport", proxy_digest, api_key)
     return _identity_digest("tokenrhythm-public-transport", proxy_digest)
 
 
@@ -1139,7 +1163,8 @@ async def _fetch_tokenrhythm_catalog[CatalogModelT](
     raw_message = ""
     raw_state = ""
     try:
-        async with httpx.AsyncClient(
+        from opensquilla.desktop_account import account_http_client
+        async with account_http_client(api_key,
             timeout=timeout,
             trust_env=_trust_env(),
             proxy=proxy or None,
@@ -1165,6 +1190,15 @@ async def _fetch_tokenrhythm_catalog[CatalogModelT](
                 ),
                 api_key,
             )
+            if source == "published" and url == TOKENRHYTHM_PUBLIC_CATALOG_URL:
+                from opensquilla.provider.media_pricing import register_media_catalog
+
+                register_media_catalog(
+                    "tokenrhythm",
+                    payload.get("data", []),
+                    base_url=TOKENRHYTHM_API_BASE_URL,
+                    source_url=url,
+                )
     except asyncio.CancelledError:
         cancelled_request_error = asyncio.CancelledError()
     except httpx.HTTPError as exc:
@@ -1219,16 +1253,19 @@ async def fetch_tokenrhythm_published(
     url: str = TOKENRHYTHM_PUBLIC_CATALOG_URL,
     *,
     proxy: str = "",
+    api_key: str = "",
     timeout: float = 5.0,
 ) -> dict[str, TokenRhythmPublishedModel]:
     """Fetch and normalize the keyless public website catalog."""
 
+    from opensquilla.desktop_account import is_account_credential
+    local_credential = api_key if is_account_credential(api_key) else ""
     headers = provider_app_headers(url)
     try:
         return await _fetch_tokenrhythm_catalog(
             url,
             headers=headers,
-            api_key="",
+            api_key=local_credential,
             proxy=proxy,
             timeout=timeout,
             source="published",
@@ -1289,28 +1326,25 @@ def merge_tokenrhythm_catalog(
     published: Mapping[str, TokenRhythmPublishedModel],
     declared: Mapping[str, TokenRhythmDeclaredModel],
 ) -> dict[str, TokenRhythmCatalogModel]:
-    """Merge metadata for authenticated ids only; public rows grant no access."""
+    """Merge chat metadata for authenticated ids only; public rows grant no access.
+
+    Status is descriptive provider metadata, including promotional values such
+    as ``special_offer``. Preserve it for display without overriding membership
+    in the authenticated catalog.
+    """
     published_by_id = {model_id.lower(): value for model_id, value in published.items()}
     result: dict[str, TokenRhythmCatalogModel] = {}
     for model_id, declared_model in declared.items():
         published_model = published_by_id.get(model_id.lower())
-        declared_status = (declared_model.status or "").lower()
         if (
             declared_model.model_type is not None
             and declared_model.model_type.lower() != "chat"
-        ) or declared_status not in ("", "online", "testing"):
+        ):
             continue
-        published_status = (
-            (published_model.status or "").lower()
-            if published_model is not None
-            else ""
-        )
-        if published_model is not None and (
-            (
-                published_model.model_type is not None
-                and published_model.model_type.lower() != "chat"
-            )
-            or published_status not in ("", "online", "testing")
+        if (
+            published_model is not None
+            and published_model.model_type is not None
+            and published_model.model_type.lower() != "chat"
         ):
             continue
         result[model_id] = TokenRhythmCatalogModel(
@@ -1350,11 +1384,9 @@ def _price_per_mtok(pricing: TokenRhythmPricing, raw: str | None) -> float | Non
 def tokenrhythm_published_catalog_entries(
     published: Mapping[str, TokenRhythmPublishedModel],
 ) -> TokenRhythmCatalogEntries:
+    """Project chat metadata regardless of status; this table grants no access."""
     entries: dict[str, dict[str, Any]] = {}
     for model_id, model in published.items():
-        status = (model.status or "").lower()
-        if status not in ("", "online", "testing"):
-            continue
         if model.model_type is not None and model.model_type.lower() != "chat":
             continue
         fields: dict[str, Any] = {}

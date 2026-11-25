@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import questionary
 import tomli_w
 import typer
 
@@ -17,12 +16,16 @@ def _default_model_for_provider(provider: str) -> str:
     if normalized == "openrouter":
         return "deepseek/deepseek-v4-pro"
     if normalized == "deepseek":
-        return "deepseek-v4-flash"
+        return "deepseek-flash"
     return "openai/gpt-4o-mini"
 
 
 def run_init() -> None:
     """Create a basic OpenSquilla home with env and config files."""
+    # CLI registration also runs when Desktop starts its Gateway. Only the
+    # interactive wizard needs the terminal prompt stack.
+    import questionary
+
     home = default_opensquilla_home()
     env_path = home / ".env"
     config_path = home / "config.toml"

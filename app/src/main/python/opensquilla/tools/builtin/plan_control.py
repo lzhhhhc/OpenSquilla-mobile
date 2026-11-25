@@ -11,7 +11,6 @@ from opensquilla.session.plans import (
     MAX_PLAN_MARKDOWN_CHARS,
     MAX_PLAN_STEP_DETAILS_CHARS,
     MAX_PLAN_STEP_ID_CHARS,
-    MAX_PLAN_STEP_REASON_CHARS,
     MAX_PLAN_STEP_TITLE_CHARS,
     MAX_PLAN_STEPS,
     MAX_PLAN_TITLE_CHARS,
@@ -34,90 +33,6 @@ _MAX_OPTION_COUNT = 3
 _MAX_OPTION_LABEL_CHARS = 120
 _MAX_OPTION_DESCRIPTION_CHARS = 500
 log = structlog.get_logger(__name__)
-
-
-def _plan_step_status(run: Any, step_id: str | None) -> str:
-    """Return the server-authoritative status for one bounded plan step."""
-
-    if not step_id:
-        return "unavailable"
-    for state in list(getattr(run, "step_states", []) or []):
-        if isinstance(state, dict) and str(state.get("step_id") or "") == step_id:
-            return str(state.get("status") or "unavailable")
-    return "unavailable"
-
-
-def _checkpoint_conflict_error(
-    *,
-    requested_step_id: str,
-    run: Any | None,
-    task_id: str,
-) -> SafeToolError:
-    """Create a sanitized recovery contract without exposing storage internals."""
-
-    run_status = str(getattr(run, "status", "") or "unavailable")
-    current_step_id = str(getattr(run, "current_step_id", "") or "") or None
-    current_step_status = _plan_step_status(run, current_step_id)
-    same_task = (
-        run is not None
-        and str(getattr(run, "active_task_id", "") or "") == task_id
-    )
-    retryable = (
-        run_status == "running"
-        and current_step_id is not None
-        and same_task
-    )
-    if retryable:
-        recovery = {
-            "action": "checkpoint_current_step",
-            "step_id": current_step_id,
-            "allowed_statuses": ["completed", "skipped", "blocked"],
-            "instruction": (
-                "Retry plan_run_checkpoint for this current step only after it "
-                "truthfully reaches the stated result. If later steps are already "
-                "finished, checkpoint each missed step one at a time in plan order, "
-                "following the current step returned by every successful checkpoint."
-            ),
-        }
-        error: SafeToolError = RetryableToolInputError(
-            json.dumps(
-                {
-                    "error": "plan_checkpoint_conflict",
-                    "requested_step_id": requested_step_id,
-                    "plan_run_status": run_status,
-                    "current_step": {
-                        "step_id": current_step_id,
-                        "status": current_step_status,
-                    },
-                    "recovery": recovery,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        return error
-    return SafeToolError(
-        json.dumps(
-            {
-                "error": "plan_checkpoint_unavailable",
-                "requested_step_id": requested_step_id,
-                "plan_run_status": run_status,
-                "current_step": {
-                    "step_id": current_step_id,
-                    "status": current_step_status,
-                },
-                "recovery": {
-                    "action": "stop_checkpointing",
-                    "instruction": (
-                        "Do not retry this checkpoint. The PlanRun is no longer "
-                        "owned by this active implementation turn."
-                    ),
-                },
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    )
 
 
 def _plan_mode_context() -> Any:
@@ -157,8 +72,9 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
 @tool(
     name="submit_plan",
     description=(
-        "Submit the complete structured plan for the current Plan turn. "
-        "This creates a new immutable revision and ends the turn."
+        "Submit the complete structured plan for user review in the current Plan turn. "
+        "This creates a new immutable revision and ends the planning turn; "
+        "it does not authorize or start implementation."
     ),
     params={
         "title": {
@@ -170,8 +86,10 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
         "markdown": {
             "type": "string",
             "description": (
-                "Complete human-readable plan. Do not use Markdown task-list "
-                "checkboxes as execution state."
+                "Complete human-readable plan, including the requested deliverables "
+                "and acceptance requirements. Methods and step order may adapt during "
+                "implementation without dropping those requirements. Do not use "
+                "Markdown task-list checkboxes as execution state."
             ),
             "minLength": 1,
             "maxLength": MAX_PLAN_MARKDOWN_CHARS,
@@ -207,7 +125,7 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
         },
     },
     required=["title", "markdown", "steps"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.CONTROL,
     terminates_turn=True,
 )
@@ -248,8 +166,8 @@ async def submit_plan(
     name="request_user_input",
     description=(
         "Ask one to three concise questions when a missing user decision "
-        "materially changes the plan. On supported interactive surfaces this "
-        "waits for the answer and then continues the same Plan turn."
+        "materially changes the task. On supported interactive surfaces this "
+        "waits for the answer and then continues the same task."
     ),
     params={
         "questions": {
@@ -301,13 +219,15 @@ async def submit_plan(
         }
     },
     required=["questions"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.CONTROL,
 )
 async def request_user_input(questions: list[dict[str, Any]]) -> str:
     """Return a structured clarification request without creating a plan."""
 
-    ctx = _plan_mode_context()
+    ctx = current_tool_context.get()
+    if ctx is None:
+        raise ValueError("request_user_input requires runtime context")
     if getattr(ctx, "interaction_mode", None) is not InteractionMode.INTERACTIVE:
         raise ValueError("request_user_input requires an interactive surface")
     if not isinstance(questions, list) or not 1 <= len(questions) <= _MAX_QUESTION_COUNT:
@@ -411,7 +331,7 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
             "clarify_schema": {
                 "mode": "form",
                 "presentation": "plan_questionnaire_v1",
-                "intro": "The plan needs a decision before it can be completed.",
+                "intro": "The task needs a decision before it can be completed.",
                 "fields": fields,
             },
             "questions": normalized,
@@ -421,125 +341,46 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
 
 
 @tool(
-    name="plan_run_checkpoint",
+    name="update_plan",
     description=(
-        "Persist progress for the PlanRun attached to this implementation turn. "
-        "Checkpoint the current step immediately after it reaches the stated result "
-        "and before starting a later step. Never jump over the current step. If work "
-        "finished multiple steps before progress was recorded, checkpoint those "
-        "steps one at a time in plan order. A blocked checkpoint ends the turn. "
-        "After a final completed checkpoint is accepted, publish any final artifact "
-        "and write the concise user-facing delivery summary."
+        "Replace the optional progress list for this task. Use a concise progress "
+        "view for substantive multi-step work, including approved-plan implementation. "
+        "Start the list before substantive implementation, with current work in progress; "
+        "do not defer all reporting until the end. Skip simple questions and single-step "
+        "tasks. Once used, keep it aligned "
+        "with actual work at meaningful milestones and before the final response "
+        "when an update is needed. Batch related changes instead of updating after "
+        "every tool call, and do not resend an unchanged list. Add, remove, reorder "
+        "or reopen steps as the work changes; do not mark unperformed or unverified "
+        "work complete. This does not enter Plan mode or create a Goal. "
+        "Progress describes actual work and does not control tool permissions, "
+        "execution order or task completion."
     ),
     params={
-        "step_id": {
-            "type": "string",
-            "description": "The plan step whose state changed.",
-            "minLength": 1,
-            "maxLength": MAX_PLAN_STEP_ID_CHARS,
+        "steps": {
+            "type": "array", "maxItems": 20,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "status": {"type": "string",
+                               "enum": ["pending", "in_progress", "completed"]},
+                },
+                "required": ["step", "status"], "additionalProperties": False,
+            },
         },
-        "step_status": {
-            "type": "string",
-            "enum": ["completed", "blocked", "skipped"],
-        },
-        "reason": {
-            "type": "string",
-            "description": "Required explanation when blocked or skipped.",
-            "maxLength": MAX_PLAN_STEP_REASON_CHARS,
-        },
+        "explanation": {"type": "string", "maxLength": 1000},
     },
-    required=["step_id", "step_status"],
-    exposed_by_default=False,
+    required=["steps"],
+    default_access="deny",
 )
-async def plan_run_checkpoint(
-    step_id: str,
-    step_status: str,
-    next_step_id: str | None = None,
-    reason: str | None = None,
-) -> str:
-    """CAS one server-authoritative PlanRun transition and publish its snapshot."""
-
+async def update_plan(steps: list[dict[str, Any]], explanation: str | None = None) -> str:
     ctx = current_tool_context.get()
-    if ctx is None:
-        raise ValueError("plan_run_checkpoint requires runtime context")
-    if str(getattr(ctx, "collaboration_mode", "default")) == "plan":
-        raise ValueError("PlanRun progress cannot be changed in Plan mode")
-    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    storage = getattr(ctx, "plan_storage", None)
-    if not run_id or not task_id or storage is None:
-        raise ValueError(
-            "plan_run_checkpoint is available only during plan implementation"
-        )
-    normalized_step_id = _clean_text(
-        step_id,
-        field="step_id",
-        max_chars=MAX_PLAN_STEP_ID_CHARS,
-    )
-    normalized_status = str(step_status or "").strip().lower()
-    if normalized_status not in {"completed", "blocked", "skipped"}:
-        raise ValueError("step_status must be completed, blocked, or skipped")
-    normalized_next = str(next_step_id or "").strip() or None
-    normalized_reason = str(reason or "").strip() or None
-    if normalized_status in {"blocked", "skipped"} and normalized_reason is None:
-        raise ValueError(f"reason is required when step_status is {normalized_status}")
     if (
-        normalized_reason is not None
-        and len(normalized_reason) > MAX_PLAN_STEP_REASON_CHARS
+        ctx is None or ctx.subagent_depth > 0
+        or str(ctx.collaboration_mode) != "default"
+        or not callable(ctx.update_progress)
     ):
-        raise RetryableToolInputError(
-            f"reason must be at most {MAX_PLAN_STEP_REASON_CHARS} characters"
-        )
-
-    current = await storage.get_plan_run(run_id)
-    if current is None:
-        raise ValueError("The active PlanRun no longer exists")
-    from opensquilla.session.plans import PlanRunConflictError, plan_run_snapshot
-
-    try:
-        updated = await storage.checkpoint_plan_run(
-            run_id,
-            expected_state_revision=int(current.state_revision),
-            step_id=normalized_step_id,
-            step_status=normalized_status,
-            next_step_id=normalized_next,
-            expected_active_task_id=task_id,
-            reason=normalized_reason,
-        )
-    except PlanRunConflictError as exc:
-        refreshed = await storage.get_plan_run(run_id)
-        raise _checkpoint_conflict_error(
-            requested_step_id=normalized_step_id,
-            run=refreshed,
-            task_id=task_id,
-        ) from exc
-
-    snapshot = plan_run_snapshot(updated)
-    actual_next = str(snapshot.get("currentStepId") or "").strip() or None
-    if normalized_next is not None and normalized_next != actual_next:
-        log.warning(
-            "plan_run.checkpoint_next_step_ignored",
-            run_id=run_id,
-            task_id=task_id,
-            has_actual_next_step=actual_next is not None,
-        )
-    emitter = getattr(ctx, "plan_event_emitter", None)
-    if callable(emitter) and ctx.session_key:
-        try:
-            await emitter(
-                ctx.session_key,
-                "session.event.plan_run",
-                {"session_key": ctx.session_key, "plan_run": snapshot},
-            )
-        except Exception as exc:  # noqa: BLE001 - durable checkpoint already committed
-            log.warning(
-                "plan_run.checkpoint_event_emit_failed",
-                session_key=ctx.session_key,
-                plan_run_id=run_id,
-                state_revision=snapshot["stateRevision"],
-                error=str(exc),
-            )
-    return json.dumps(
-        {"status": "checkpoint_recorded", "plan_run": snapshot},
-        ensure_ascii=False,
-    )
+        raise SafeToolError("Progress requires a running main Default task")
+    progress = await ctx.update_progress(steps, explanation)
+    return json.dumps({"status": "accepted", "progress": progress}, ensure_ascii=False)

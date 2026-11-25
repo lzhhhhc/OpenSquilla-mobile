@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from functools import wraps
+from typing import Concatenate
 
 import structlog
 
@@ -28,11 +30,26 @@ from .types import (
     ReservationRejectionReason,
     ScheduleKind,
     SessionTarget,
-    clear_reservation,
+    is_rescheduled_one_shot,
 )
 
 __all__ = ["DeliveryReport", "JobStore"]
 log = structlog.get_logger(__name__)
+
+
+def _committed_write[**P, R](
+    method: Callable[Concatenate[JobStore, P], Awaitable[R]],
+) -> Callable[Concatenate[JobStore, P], Awaitable[R]]:
+    @wraps(method)
+    async def owned(self: JobStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        return await self._run_write(lambda: method(self, *args, **kwargs))
+
+    return owned
+
+# Keep retired workflows inert even when the best-effort boot cleanup fails.
+# GLOB preserves the case-sensitive literal prefix used by that cleanup.
+_RETIRED_HANDLER_KEY = "auto_propose"
+_RETIRED_JOB_NAME_PREFIX = "auto_propose:"
 
 _CREATE_RUNS_TABLE = """
 CREATE TABLE IF NOT EXISTS scheduler_runs (
@@ -355,6 +372,10 @@ class JobStore:
         self._db_path = db_path
         self._conn: aiosqlite.Connection | None = None
         self._idempotent_create_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._write_owner: asyncio.Task | None = None
+        self._write_batch = False
+        self._write_failed: BaseException | None = None
 
     async def open(self) -> None:
         if self._conn is None:
@@ -478,9 +499,12 @@ class JobStore:
             )
 
     async def close(self) -> None:
-        if self._conn:
-            await self._conn.close()
-            self._conn = None
+        if self._write_owner is asyncio.current_task():
+            raise RuntimeError("Cannot close JobStore inside its write transaction")
+        async with self._write_lock:
+            connection, self._conn = self._conn, None
+            if connection is not None:
+                await self._drain_write(connection.close())
 
     async def __aenter__(self) -> JobStore:
         await self.open()
@@ -616,13 +640,18 @@ class JobStore:
             ),
         )
 
+    @_committed_write
     async def save(self, job: CronJob) -> None:
         await self._execute_save(job)
-        await self._db().commit()
 
-    async def create_or_get(self, job: CronJob) -> CronJob:
-        """Atomically create an idempotent job or return the existing row."""
+    @_committed_write
+    async def create_or_get(
+        self, job: CronJob, *, validate_new: Callable[[], None] | None = None,
+    ) -> CronJob:
+        """Return an existing row, or validate and create under the idempotency lock."""
         if not job.idempotency_key:
+            if validate_new is not None:
+                validate_new()
             await self.save(job)
             return job
 
@@ -631,11 +660,14 @@ class JobStore:
             if existing is not None:
                 existing.deduplicated = True
                 return existing
+            if validate_new is not None:
+                validate_new()
             try:
                 await self._execute_save(job)
-                await self._db().commit()
             except aiosqlite.IntegrityError:
-                await self._db().rollback()
+                if self._write_batch:
+                    raise
+                await self._rollback_owned()
                 existing = await self.get_by_idempotency_key(job.idempotency_key)
                 if existing is None:
                     raise
@@ -645,13 +677,176 @@ class JobStore:
 
     async def save_no_commit(self, job: CronJob) -> None:
         """Insert/update a job without committing — use inside transaction()."""
-        await self._execute_save(job)
+        if self._write_owner is not asyncio.current_task():
+            raise RuntimeError("save_no_commit requires transaction()")
+        await self._run_write(lambda: self._execute_save(job))
+
+    async def _drain_write[R](self, work: Awaitable[R]) -> R:
+        """Wait for owned work despite repeated caller cancellation."""
+        task = asyncio.ensure_future(work)
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except BaseException:
+                break
+        try:
+            result = task.result()
+        except BaseException as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _run_write[R](self, work: Callable[[], Awaitable[R]]) -> R:
+        if self._write_owner is asyncio.current_task():
+            try:
+                return await work()
+            except BaseException as exc:
+                self._write_failed = exc
+                raise
+
+        # Waiting for admission is cancellable. Once admitted, keep the owner
+        # alive through SQL and transaction cleanup before releasing the lock.
+        async with self._write_lock:
+            async def owned() -> R:
+                async with self._owned_transaction():
+                    return await work()
+
+            return await self._drain_write(owned())
+
+    async def _finish_write(self, cleanup: Callable[[], Awaitable[None]]) -> None:
+        """Drain idempotent cleanup even if shutdown also cancels its child task.
+
+        Native aiosqlite can cancel an awaiter before the queued SQLite call
+        completes. Requeue only commit/rollback, never the business write.
+        """
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            async def invoke_cleanup() -> None:
+                await cleanup()
+
+            task = asyncio.create_task(invoke_cleanup())
+            try:
+                await self._drain_write(task)
+            except asyncio.CancelledError as exc:
+                if not task.cancelled():
+                    raise
+                cancellation = cancellation or exc
+                continue
+            if cancellation is not None:
+                raise cancellation
+            return
+
+    @asynccontextmanager
+    async def _owned_transaction(self, *, batch: bool = False):
+        self._write_owner = asyncio.current_task()
+        self._write_batch = batch
+        self._write_failed = None
+        try:
+            try:
+                yield self
+                if self._write_failed is not None:
+                    raise RuntimeError(
+                        "Scheduler transaction contains a failed write",
+                    ) from self._write_failed
+                if self._db().in_transaction:
+                    await self._finish_write(self._db().commit)
+                    if self._db().in_transaction:
+                        raise RuntimeError("Scheduler commit left an active transaction")
+            except BaseException:
+                if self._conn is not None:
+                    await self._rollback_owned()
+                raise
+        finally:
+            self._write_owner = None
+            self._write_batch = False
+            self._write_failed = None
+
+    async def _rollback_owned(self) -> None:
+        connection = self._db()
+        try:
+            await self._finish_write(connection.rollback)
+        except asyncio.CancelledError:
+            if connection.in_transaction:
+                await self._retire_writer(connection)
+            raise
+        except BaseException:
+            await self._retire_writer(connection)
+            raise
+        if connection.in_transaction:
+            await self._retire_writer(connection)
+            raise RuntimeError("Scheduler rollback left an active transaction")
+
+    async def _retire_writer(self, connection: aiosqlite.Connection) -> None:
+        # A failed rollback must never let the next writer commit uncertain
+        # state. Do not retry native close: it may retire its Python handle even
+        # when cancellation leaves the already queued physical close pending.
+        if self._conn is connection:
+            self._conn = None
+        await self._drain_write(connection.close())
 
     @asynccontextmanager
     async def transaction(self):
-        """Batch multiple save_no_commit() calls into a single commit."""
-        yield self
-        await self._db().commit()
+        """Own the shared writer until its batch commits or rolls back.
+
+        Only the owning task may nest writes. Readers remain independent, and
+        cross-connection edits still require a conditional database update.
+        """
+        if self._write_owner is asyncio.current_task():
+            try:
+                yield self
+            except BaseException as exc:
+                self._write_failed = exc
+                raise
+            return
+        async with self._write_lock:
+            async with self._owned_transaction(batch=True):
+                yield self
+
+    @_committed_write
+    async def update_configuration(self, job: CronJob, previous: CronJob) -> bool:
+        """Update an existing configuration only while its read fence still matches.
+
+        Execution ownership and accounting are never copied from the editor's
+        snapshot. A failed comparison requires reloading and reapplying the edit.
+        """
+        def values(value: CronJob) -> dict[str, object]:
+            return {
+                "name": value.name, "cron_expr": value.cron_expr,
+                "handler_key": value.handler_key, "payload": json.dumps(value.payload),
+                "status": value.status.value, "updated_at": self._iso(value.updated_at),
+                "next_run_at": self._iso(value.next_run_at),
+                "schedule_kind": value.schedule_kind.value, "schedule_raw": value.schedule_raw,
+                "session_target": value.session_target.value, "session_key": value.session_key,
+                "timeout_seconds": value.timeout_seconds, "wake_mode": value.wake_mode.value,
+                "enabled": int(value.enabled), "backoff_until": self._iso(value.backoff_until),
+                "consecutive_errors": value.consecutive_errors,
+                "delivery_json": _serialize_delivery(value.delivery),
+                "origin_session_key": value.origin_session_key,
+                "tool_policy_json": json.dumps(value.tool_policy or {}),
+                "tz": value.tz, "anchor_at": self._iso(value.anchor_at),
+            }
+
+        old_values = values(previous)
+        changed = {key: value for key, value in values(job).items() if value != old_values[key]}
+        assignments = ", ".join(f"{key} = ?" for key in changed)
+        async with self._db().execute(
+            f"""UPDATE scheduler_jobs SET {assignments}
+                WHERE id = ? AND updated_at = ? AND reservation_token = ?
+                  AND status = ? AND enabled = ? AND run_count = ? AND error_count = ?""",
+            [
+                *changed.values(), job.id,
+                previous.updated_at.isoformat(), previous.reservation_token,
+                previous.status.value, int(previous.enabled),
+                previous.run_count, previous.error_count,
+            ],
+        ) as cursor:
+            return cursor.rowcount == 1
 
     async def get(self, job_id: str) -> CronJob | None:
         async with self._db().execute(
@@ -702,6 +897,7 @@ class JobStore:
             owner=owner,
         )
 
+    @_committed_write
     async def _reserve_job_for_run(
         self,
         job_id: str,
@@ -749,8 +945,6 @@ class JobStore:
             """,
             [JobStatus.RUNNING.value, *params],
         )
-        await self._db().commit()
-
         if cur.rowcount == 1:
             job = await self.get(job_id)
             if job is None:
@@ -805,44 +999,127 @@ class JobStore:
             message="Job could not be reserved",
         )
 
+    @_committed_write
+    async def finalize_reserved_job(
+        self,
+        job: CronJob,
+        reservation_token: str,
+        expected_updated_at: datetime,
+        *,
+        delete: bool = False,
+    ) -> bool:
+        """Commit a result only if its reservation and input snapshot still match.
+
+        A concurrent edit requires the caller to reload and recompute the result.
+        Never upsert here: a deleted job must stay deleted.
+        """
+        predicate = (job.id, reservation_token, expected_updated_at.isoformat())
+        if delete:
+            cur = await self._db().execute(
+                """DELETE FROM scheduler_jobs
+                   WHERE id = ? AND reservation_token = ? AND updated_at = ?""",
+                predicate,
+            )
+        else:
+            cur = await self._db().execute(
+                """
+                UPDATE scheduler_jobs
+                SET status = ?, enabled = ?, next_run_at = ?,
+                    run_count = ?, error_count = ?, last_error = ?,
+                    consecutive_errors = ?, backoff_until = ?,
+                    updated_at = MAX(updated_at, ?),
+                    reservation_token = '', reserved_at = NULL, reserved_by = '',
+                    reservation_source = '', scheduled_run_at = NULL
+                WHERE id = ? AND reservation_token = ? AND updated_at = ?
+                """,
+                (
+                    job.status.value, int(job.enabled), self._iso(job.next_run_at),
+                    job.run_count, job.error_count, job.last_error,
+                    job.consecutive_errors, self._iso(job.backoff_until),
+                    job.updated_at.isoformat(), *predicate,
+                ),
+            )
+        return cur.rowcount == 1
+
     async def finalize_reserved_missing_handler(
         self,
         job_id: str,
         reservation_token: str,
         error: str,
     ) -> bool:
-        current = await self.get(job_id)
-        if current is None or current.reservation_token != reservation_token:
-            return False
-        current.status = JobStatus.FAILED
-        current.error_count += 1
-        current.consecutive_errors += 1
-        current.last_error = error
-        current.next_run_at = None
-        current.backoff_until = None
-        current.updated_at = datetime.now(UTC)
-        clear_reservation(current)
-        await self.save(current)
-        return True
+        while True:
+            current = await self.get(job_id)
+            if current is None or current.reservation_token != reservation_token:
+                return False
+            expected_updated_at = current.updated_at
+            if current.status not in (JobStatus.PAUSED, JobStatus.DISABLED):
+                if is_rescheduled_one_shot(current):
+                    current.status = JobStatus.PENDING
+                    current.consecutive_errors = 0
+                else:
+                    current.status = JobStatus.FAILED
+                    current.consecutive_errors += 1
+                    current.next_run_at = None
+                current.error_count += 1
+                current.last_error = error
+                current.backoff_until = None
+                current.updated_at = datetime.now(UTC)
+            if await self.finalize_reserved_job(current, reservation_token, expected_updated_at):
+                return True
 
+    @_committed_write
     async def release_reservation(
         self,
         job_id: str,
         reservation_token: str,
     ) -> bool:
-        current = await self.get(job_id)
-        if current is None or current.reservation_token != reservation_token:
-            return False
-        clear_reservation(current)
-        if current.status == JobStatus.RUNNING:
-            current.status = JobStatus.PENDING
-        current.updated_at = datetime.now(UTC)
-        await self.save(current)
-        return True
+        # Fence the cleanup in the write itself. A read followed by save()
+        # can overwrite a new owner or resurrect a concurrently deleted job.
+        async with self._db().execute(
+            """
+            UPDATE scheduler_jobs
+            SET status = CASE WHEN status = ? THEN ? ELSE status END,
+                reservation_token = '',
+                reserved_at = NULL,
+                reserved_by = '',
+                reservation_source = '',
+                scheduled_run_at = NULL,
+                updated_at = MAX(updated_at, ?)
+            WHERE id = ? AND reservation_token = ?
+            """,
+            (
+                JobStatus.RUNNING.value,
+                JobStatus.PENDING.value,
+                datetime.now(UTC).isoformat(),
+                job_id,
+                reservation_token,
+            ),
+        ) as cur:
+            released = cur.rowcount == 1
+        return released
 
+    @_committed_write
+    async def recover_reservation(self, previous: CronJob, now: datetime) -> bool:
+        """Clear a startup reservation only if the observed owner still matches."""
+        async with self._db().execute(
+            """UPDATE scheduler_jobs
+               SET status = CASE WHEN status = ? THEN ? ELSE status END,
+                   reservation_token = '', reserved_at = NULL, reserved_by = '',
+                   reservation_source = '', scheduled_run_at = NULL,
+                   updated_at = MAX(updated_at, ?)
+               WHERE id = ? AND updated_at = ? AND reservation_token = ?
+                 AND reserved_by = ? AND status = ?""",
+            (
+                JobStatus.RUNNING.value, JobStatus.PENDING.value, self._iso(now),
+                previous.id, previous.updated_at.isoformat(), previous.reservation_token,
+                previous.reserved_by, previous.status.value,
+            ),
+        ) as cursor:
+            return cursor.rowcount == 1
+
+    @_committed_write
     async def delete(self, job_id: str) -> None:
         await self._db().execute("DELETE FROM scheduler_jobs WHERE id = ?", (job_id,))
-        await self._db().commit()
 
     async def list_active(self) -> list[CronJob]:
         """Return all jobs that are not deleted."""
@@ -868,14 +1145,20 @@ class JobStore:
             """
             SELECT MIN(next_run_at) FROM scheduler_jobs
             WHERE status = ? AND enabled = 1 AND next_run_at IS NOT NULL
+              AND handler_key != ? AND name NOT GLOB ?
             """,
-            (JobStatus.PENDING.value,),
+            (
+                JobStatus.PENDING.value,
+                _RETIRED_HANDLER_KEY,
+                f"{_RETIRED_JOB_NAME_PREFIX}*",
+            ),
         ) as cur:
             row = await cur.fetchone()
             if row and row[0]:
                 return datetime.fromisoformat(row[0])
             return None
 
+    @_committed_write
     async def save_execution(self, execution: JobExecution) -> None:
         await self._db().execute(
             """
@@ -896,7 +1179,6 @@ class JobStore:
                 execution.delivery_status,
             ),
         )
-        await self._db().commit()
 
     async def list_executions(self, job_id: str, limit: int = 20) -> list[JobExecution]:
         async with self._db().execute(
@@ -928,6 +1210,7 @@ class JobStore:
                 for r in rows
             ]
 
+    @_committed_write
     async def prune_runs(self, max_age_days: int = 30, max_per_job: int = 100) -> int:
         """Delete old execution records. Returns total rows deleted."""
         from datetime import UTC, timedelta
@@ -960,7 +1243,6 @@ class JobStore:
             )
             deleted += cur3.rowcount
 
-        await self._db().commit()
         return deleted
 
     async def iter_due(self, now: datetime) -> AsyncIterator[CronJob]:
@@ -971,9 +1253,16 @@ class JobStore:
             SELECT * FROM scheduler_jobs
             WHERE status = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
               AND (backoff_until IS NULL OR backoff_until <= ?)
+              AND handler_key != ? AND name NOT GLOB ?
             ORDER BY next_run_at
             """,
-            (JobStatus.PENDING.value, now_iso, now_iso),
+            (
+                JobStatus.PENDING.value,
+                now_iso,
+                now_iso,
+                _RETIRED_HANDLER_KEY,
+                f"{_RETIRED_JOB_NAME_PREFIX}*",
+            ),
         ) as cur:
             async for row in cur:
                 yield _row_to_job(row)

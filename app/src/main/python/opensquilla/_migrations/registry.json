@@ -1,0 +1,209 @@
+{
+  "migrations": {
+    "V001__initial_schema": {
+      "ledger_hash": "f8a5255cbc8d7094d88289b6e1dd02bb73fbffbdf97ced47d88799ceb4cfde6e",
+      "source_sha256": "e7da334b2101f42a25c4430969765b37412ccdd5b6cd346f9fd12e1630e395d2"
+    },
+    "V002__scheduler_session_fields": {
+      "ledger_hash": "335ac2e449bfe0f30bec8a0308c76b51ec10f480ec88aeef7250ce769e8a70ee",
+      "source_sha256": "16a911450d9ca6c1a23894394bbdc49ce3588f7adae8fdd860168e11620c82c3"
+    },
+    "V003__heartbeat_ticks": {
+      "ledger_hash": "2732174eb02055fd93931e860feaa8b68879cbe1cb984f7d3616d5392f75bb8e",
+      "source_sha256": "86bca8e432849fe101f159151f4aea27d412b3d9f86df92e10337f29d26e44f7"
+    },
+    "V004__memory_schema_version": {
+      "ledger_hash": "3a223b7c95ec8c0bbfd9064e8b766d225788f03f761dd9f5081ef0eef7295f6b",
+      "source_sha256": "46b6be374db6a3d7d32207d3e7add7fb838523c945f01274ed8a57e987b2f283"
+    },
+    "V005__agent_tasks": {
+      "ledger_hash": "8480378c8c5f6f322c1707a8b01f56d67a8b392ea67b6f8e199b2b36aeb1468f",
+      "source_sha256": "9dfa46ff5fb84f73b8c4fa1c372d7914e2c7e9fab94c200f80a325daef6ea000"
+    },
+    "V006__scheduler_reservations": {
+      "ledger_hash": "8952b70e6da7ff9b4906eff0b5e3a126774809bc218b2ef3bb9c6e5c2c675f6b",
+      "source_sha256": "d9b5668af7de16b31d7a171711e66d4036c88b81102c40aba87cb8938bb8d358"
+    },
+    "V007__session_cost_source_rollup": {
+      "ledger_hash": "e5e4065a0b057e695b3714874a89d1eefee32992a5413d3a20c87d33047c3868",
+      "source_sha256": "faa7c9ca3e2d6bdf99fed815b928547df0d70fc3c0e3b5f1a1d3bf7f6c2f0c9f"
+    },
+    "V008__scheduler_job_tool_policy": {
+      "ledger_hash": "4d3e53e28b07c15f4376c1c29fffce510998a6168f8813de4e77ad2f349dcb0e",
+      "source_sha256": "34e729b7a525b171688cbc83eff863b3707c1c60f1d664b30e7ee750395f5fb8"
+    },
+    "V009__transcript_reasoning_content": {
+      "ledger_hash": "48dc08849da7082cee9fb31705f191c903e954424217d79853458b4f44009139",
+      "source_sha256": "a79b92dbd9473ede229fa9973674782820f3b1c3b2360950d22110e41a39c109"
+    },
+    "V010__meta_skill_runs": {
+      "ledger_hash": "b8fa71f746d6fa9c9ed7a53431dbf461981aee112b5f6d359a2ee7ce567e7ae0",
+      "source_sha256": "ff8e719f1a7bc6752d61b5e8536b432f6d658d671be4f99bc19cc9fb72a7df06"
+    },
+    "V010__transcript_turn_usage": {
+      "ledger_hash": "e6baa87a081e3b02b468e572ec56ce1143305971359de45a14c0e68757948668",
+      "source_sha256": "c500f9bddda64309977be6c0356156321e55a916f5b3f1b27c5f40e7371810d2"
+    },
+    "V011__meta_skill_runs_triggered_by_auto": {
+      "ledger_hash": "d90c228ae7e7bc7a538047155c84246f58c969cbcea733632678fd7596a792a2",
+      "source_sha256": "b72b6ddb00537dc4db38f691bbd61ff4d2f9e768261482761ce7f1fca3845737"
+    },
+    "V012__meta_skill_run_steps_allow_llm_chat": {
+      "ledger_hash": "cea1bccbed0a87f37701530f74b5ad508c48fe6da4c28e3fb1efd4ed792f071b",
+      "source_sha256": "bcbff57615fe8480f98000bd6960f692951d1772f95d7fa90ba9f26a78ca44d0"
+    },
+    "V013__meta_skill_runs_clarify": {
+      "ledger_hash": "f056b89cfd71e19a17af4319f0082930e8de9f046bf456213a747afca4746f15",
+      "source_sha256": "5757743e81a8a9b85bb2af01dce71d5abbcd7e0c0d4d33ecc191c5dd9802e203"
+    },
+    "V014__meta_skill_run_steps_allow_user_input": {
+      "ledger_hash": "54c1e21aeb9fc554d58c680ae879bf7ee1f41fb3b6fdae45b6b61e9302091e4e",
+      "source_sha256": "af9a259c61ad080227607dd3be7156376e9626d12f3f70ff607f54e58fa59a20"
+    },
+    "V015__meta_skill_step_usage": {
+      "ledger_hash": "0f2fd2e6c3b4474ff4311c4dfa22894c3cd7af14e74b7d417289897e40f1c33f",
+      "source_sha256": "14557b1c5f90a699d9d9b2c42d56d005345ffcee8b8c1410b913e5b25ac36c21"
+    },
+    "V016__meta_skill_runs_triggered_by_manual_command": {
+      "ledger_hash": "5ab0a762718508de688c19d227fe5885b0497e1737a3b2abe2af9f079d75acc4",
+      "source_sha256": "f8d0302b6f18af918cbee1641e0ee27c8b9bd66c9d50ca53dfe94b826afa9858"
+    },
+    "V017__router_decisions": {
+      "ledger_hash": "761b244747cdb20a6a8bca3afcd29ae6ce28618136626f5b14c08eb4905e9e60",
+      "source_sha256": "9d10cb002ad782f0cb0e00cdf7bc70a059b7b3544af313385920fd582bed318a"
+    },
+    "V018__router_decisions_ts_index": {
+      "ledger_hash": "2a1d1375a006bebda94655c0396eec40a5cb07761c7da2d2380e90aba4e268d1",
+      "source_sha256": "c95d655638826cb87c6bf65cecef1d85c6aa2dfbf4267cdda09f29a6bc70cb8e"
+    },
+    "V019__turn_errors": {
+      "ledger_hash": "9ae7a6ed59553c6b8610135be7d769a471aaf9b22d49f525aa5142df87ad0955",
+      "source_sha256": "124889414156b0b1aed1080ce2c72de9b430db44f8af011f5bb8d25b9e8fe82f"
+    },
+    "V020__turn_ingress_receipts": {
+      "ledger_hash": "383a9e656005400232e4c152a7ba9d6dabf45439e2f6f2916a5c2037ccec4d79",
+      "source_sha256": "b67129e841b31fe86b9e3887f2d9e423781c59996545444861703f60da791853"
+    },
+    "V021__usage_ledger": {
+      "ledger_hash": "bb6a16fb23923afe24f6ffd5fd82aaed1009a3dea838316a64f7015f51d5ce13",
+      "source_sha256": "fe8bed21748a74f33cef6889424ad4e34bffaed28508aa2a767b53cda7b52bc3"
+    },
+    "V022__telemetry_daily_usage": {
+      "ledger_hash": "a3da327dec37247a4146025632c3ce3e7c115ad1a1fca96e72a4a51e945d3c5f",
+      "source_sha256": "1f8579218e6e8c3760c57507e3e1b4de8dad5799292a76fce1cee6f6887537e0"
+    },
+    "V023__router_deployment_telemetry": {
+      "ledger_hash": "fff2b0ba4b586319c9f6f28d407fa1a9533843e4e33b5cc98ae86e416d9bfba4",
+      "source_sha256": "298f676c7359b15bea369f46a005942242713985f6f75e901c061b2744855816"
+    },
+    "V024__usage_native_billing_receipts": {
+      "ledger_hash": "188a1afee3887b9cc282a5773da3eede55c8e7032883709e2e8b1637bc3fa10e",
+      "source_sha256": "575a89f9f7972058206aa8264eb6271d99703f185f72701db4bbfc5563793ec5"
+    },
+    "V025__session_collaboration_state": {
+      "ledger_hash": "5db75a17c3fda810a17977a252e9c1c71914f753d857638230acf68ad84ca7d3",
+      "source_sha256": "04834e2a61b92b5dadd3a2a61ea916f78c83101a763a9a0403f448aeb4660c3e"
+    },
+    "V026__plan_revisions": {
+      "ledger_hash": "10d74d6275d190418625b5dd46752cf49010130b80e7e3fe632e1fffc6bb3701",
+      "source_sha256": "4036f09c570c850befff1d11f0c24a50d7f0b4794fa19429881a1b0e33aa2441"
+    },
+    "V027__plan_runs": {
+      "ledger_hash": "a170daebac8938324d00d5f8848760213e8b30991b3f01ac1e426443a7dce8d9",
+      "source_sha256": "cd0de97af65200aacb3cd3cdeffc1c578ad47ba80584a26668e9749738873cb3"
+    },
+    "V028__project_workspaces": {
+      "ledger_hash": "5fe559261a44ffacb5df4dee2667e6bad606bde6dac301e36800c16714ff74a5",
+      "source_sha256": "f0316dd6754532e1ccc609b7a9805122b7591bcb60f806ee8f900abf231aaeae"
+    },
+    "V029__sandbox_policy_tokens": {
+      "ledger_hash": "bb45c37e946b797b56b04c84597b3b9d08478d9d2263aaad0d86e832f8821383",
+      "source_sha256": "e862a24134301040284b2ee7b3d2b929361e285dd536824c6c7eb64012c9d36f"
+    },
+    "V030__meta_control_intents": {
+      "ledger_hash": "15bedd59a5e46186705059209844432a1b02d405da83a450856634985989f022",
+      "source_sha256": "32db2e2c5ee5625f77d0d5290e96c651cd02442f6a2c138c2294c71163b59ee9"
+    },
+    "V031__meta_launch_drafts": {
+      "ledger_hash": "3a12ae5f000071055b1c020c88beddbf19b01eac4dd063dca6ac29e4ce0dbe3b",
+      "source_sha256": "fc6defcc740950e69918bdc9c883c21d7b9db7a5040060e45cb43ef438a13a9e"
+    },
+    "V032__meta_launch_discard_tombstones": {
+      "ledger_hash": "5b2e2e3bec083010f20eb6e9db08d55cd70b87712fdffb0ad2a8c6913b7c5a60",
+      "source_sha256": "a41aa6b4ef218c525f814c419dcfa7b35dfbda31d8db966f086e2c1c5f9ba97b"
+    },
+    "V033__goal_runs": {
+      "ledger_hash": "52d8127dbdbe6d90f879c2ced815e7ea6e45b9c439709b66f668d326eb924081",
+      "source_sha256": "4b1b6105ee6f4eac204d27ad1afe3b95015aaac648bac3c17f74b0ec0b83d532"
+    },
+    "V034__goal_message_anchor": {
+      "ledger_hash": "95787682c392ecc7be85fb840c51c014ad9b286263b05a47d5a63c44b6dd6e1a",
+      "source_sha256": "853629d97471b71178836fd394a7830503193a5b39c9752ac6da8cbf12dd4e47"
+    },
+    "V035__pending_chat_inputs": {
+      "ledger_hash": "d49af6f58d176ee6cf74e2bb1974eabd0bee0f2866bf10c6bb4b149eeaa5d057",
+      "source_sha256": "5006354b910ac0c77a88796951bc4bcb12840a18e09540492596e23d79f9d965"
+    },
+    "V036__session_model_routing": {
+      "ledger_hash": "0f69476f0f367b5afa59cd4dc801b9db07aa09515050081dd72241d7a4dc74bf",
+      "source_sha256": "adbe56e4e0a7ecb9d66364df1d81d11b9ce73389800a45202d12193ba983f96d"
+    },
+    "V037__artifact_sessions": {
+      "ledger_hash": "ce6e395596f5baa0ffa504c56bfd16f515d2fcc0569df92fbfe1eef51756b51c",
+      "source_sha256": "a709c734aba365541f156cd330c16a8b243dd47fa569d5cde52efcfee5ed28b5"
+    },
+    "V038__artifact_prompt_annotations": {
+      "ledger_hash": "09bcc9c4698eaa5e9de48762aab706514fb9c9f53bee51b72155eb6e2f4c1d1d",
+      "source_sha256": "a80478649d42125cd5ad856e0863faec9cbbacc0da6179a725cb173ffcbc82f9"
+    },
+    "V039__artifact_mutation_attempts": {
+      "ledger_hash": "bff7a977a8e3a5f5c1a4b4bcbae0c72669f55a09d9554b61d2a52525db3d0010",
+      "source_sha256": "46fdee852b5b66a704eae6a726c53c5e51b4865feb84cf9a81a31f71f2671d0e"
+    },
+    "V040__document_resources": {
+      "ledger_hash": "fdeab5dfd8c3813b9167a01fc08b14f2a718b6fe3da6cd8b6bb14b2df90c8a62",
+      "source_sha256": "2400a0aa7d553252dfe3ba8af34c2313281c1e752201794acf87ef24a7ad3db5"
+    },
+    "V041__retire_html_editor": {
+      "ledger_hash": "efc2f635e1ca985ccbb472db49782031561de95527399ae8846027adced65cf0",
+      "source_sha256": "12f50bcc4394a9bd79afc5e8533309e1c6120a2ca0e1e97ee08511c9d4799e0c"
+    },
+    "V042__assistant_replay": {
+      "ledger_hash": "0ef9371614a6800ee6480199af8e3f1b530b779b134d0b6be4ef31b8b43057f6",
+      "source_sha256": "bf35e227bbcf6fdb09995138376059c4e9b1ee5300cb9bbde1bb354c4a590068"
+    },
+    "V043__session_execution_workspace": {
+      "ledger_hash": "0d2ff8b537563abad52168cfce131e34265c305df55fd0aa963a299161869f22",
+      "source_sha256": "0c46a264f16be6e97bf9f8719572f34264c35b032072bd2e0650f77d8f626416"
+    },
+    "V044__retire_legacy_memory_flush": {
+      "ledger_hash": "c3689d9c8889ac3e05baf40e38feb4794c66dc3d092b3d0756cfec34501b9f67",
+      "source_sha256": "ebf06d07462a4fbaf4e42eab86574d333cee02b543019aa008903b0bb88847c5"
+    },
+    "V045__goal_runtime_accounting": {
+      "ledger_hash": "a54c31a08ede7e466fbdaf0cc46d1841b868834fbd95cc75b988d359eef4ee7d",
+      "source_sha256": "3da328e3a31e4242c660f7a9f0e78cdc3e8c350f4449f329a944d4260548a486"
+    },
+    "V046__plan_presentation": {
+      "ledger_hash": "f5f53dd40843149971a6409d990bdd24d42e82c4e769dd31ca3371f32e6f3ef3",
+      "source_sha256": "762cd00beb2d3186280d7f4ad3e09c0fede3391086908d5fbf7f7a596b1f3ef4"
+    },
+    "V047__retire_product_modes": {
+      "ledger_hash": "5f062ca3e463f98d75524c38e9b79bc69c667079ccebe7d44defa0454a06a658",
+      "source_sha256": "cda05434aff20361eea794441bb1bf2bc30a1ca3c8bee2e2b53cfc7f8855430c"
+    },
+    "V048__office_materializations": {
+      "ledger_hash": "3e751d69491114984f55f67db23a8cb7b987fec43a911b5d6b23ce9d1f229a24",
+      "source_sha256": "81026892d0492dc76436197ab1a964f1e566a2f4912da08ef606c46b67d46ca6"
+    },
+    "V049__usage_metering_settlements": {
+      "ledger_hash": "0579e822e805b0bdb1c855ca4ca73813288f7ab6f0290b0dc456eab358471484",
+      "source_sha256": "c0c63761878055892b189521a963d467619d93b501e34b556f4db38ea2c90c55"
+    },
+    "V050__usage_task_attribution": {
+      "ledger_hash": "dd1ec9d58e77c57a747e81ca6028fad1878d340396da1c368a546cc0fd68b259",
+      "source_sha256": "75cbbba634507398840d2888319ea684db983f2b1766a4c197b79a9631cc4b14"
+    }
+  },
+  "version": 1
+}

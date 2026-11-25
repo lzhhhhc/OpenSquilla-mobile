@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from opensquilla.artifact_archives import validate_html_archive
 from opensquilla.artifact_validation import (
     ArtifactValidationError,
     is_pptx_candidate,
@@ -19,27 +21,31 @@ from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_MAX_BYTES,
     INSTALLER_ARTIFACT_SUFFIXES,
     ArtifactBudgetError,
+    ArtifactSource,
     ArtifactStore,
     _safe_filename,
+    artifact_bundle_manifest,
     artifact_mime_for_name,
     artifact_payload,
     artifact_publish_max_bytes_for_name,
+    collect_artifact_bundle,
 )
+from opensquilla.contracts.content_material import ContentExportError
 from opensquilla.tools.path_aliases import resolve_workspace_alias
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import CallerKind, ToolContext
 
 log = logging.getLogger(__name__)
 
+_HTML_SUFFIXES = frozenset({".html", ".htm"})
 _DELIVERABLE_SUFFIXES = frozenset(
     {
         ".csv",
-        ".htm",
-        ".html",
         ".json",
         ".pdf",
         ".pptx",
         ".tsv",
         ".xlsx",
+        *_HTML_SUFFIXES,
         *INSTALLER_ARTIFACT_SUFFIXES,
     }
 )
@@ -51,62 +57,6 @@ class OmittedArtifactPublishResult:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     failure_summaries: list[str] = field(default_factory=list)
     resolved_target_keys: list[str] = field(default_factory=list)
-
-
-def _plan_run_is_delivery_ready(run: Any, ctx: ToolContext) -> bool:
-    status = str(getattr(run, "status", "") or "")
-    if status == "completed":
-        return True
-    if status != "running":
-        return False
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
-    step_states = list(getattr(run, "step_states", []) or [])
-    return (
-        bool(task_id)
-        and active_task_id == task_id
-        and getattr(run, "current_step_id", None) is None
-        and bool(step_states)
-        and all(
-            isinstance(state, dict)
-            and str(state.get("status") or "") in {"completed", "skipped"}
-            for state in step_states
-        )
-    )
-
-
-async def attached_plan_run_ready_for_auto_publish(
-    ctx: ToolContext | None,
-) -> bool | None:
-    """Resolve live PlanRun delivery readiness before the blocking publish phase.
-
-    ``None`` means the turn has no attached PlanRun. Attached runs fail closed
-    when their authoritative state cannot be read.
-    """
-
-    if ctx is None:
-        return None
-    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
-    if not run_id:
-        return None
-    storage = getattr(ctx, "plan_storage", None)
-    get_plan_run = getattr(storage, "get_plan_run", None)
-    if not callable(get_plan_run):
-        log.warning(
-            "artifact_delivery.plan_run_readiness_unavailable",
-            extra={"plan_run_id": run_id, "reason": "storage_unavailable"},
-        )
-        return False
-    try:
-        run = await get_plan_run(run_id)
-    except Exception:  # noqa: BLE001 - delivery backstop must fail closed
-        log.warning(
-            "artifact_delivery.plan_run_readiness_lookup_failed",
-            extra={"plan_run_id": run_id},
-            exc_info=True,
-        )
-        return False
-    return run is not None and _plan_run_is_delivery_ready(run, ctx)
 
 
 def artifact_delivery_publish_target_key(
@@ -172,38 +122,127 @@ def _text_mentions_written_file(final_text: str, record: dict[str, Any]) -> bool
     return any(candidate and candidate.casefold() in text for candidate in candidates)
 
 
-def _published_artifact_keys(ctx: ToolContext) -> set[tuple[str, str]]:
+def _same_source_file(first: Path, second: Path) -> bool:
+    """Match source aliases without merging distinct hardlink directory entries."""
+
+    try:
+        first = first.resolve(strict=True)
+        second = second.resolve(strict=True)
+        # Path equality folds case on Windows, including case-sensitive directories.
+        if str(first) == str(second):
+            return True
+        if not os.path.samestat(first.parent.stat(), second.parent.stat()):
+            return False
+        if first.name == second.name:
+            return True
+        if first.name.casefold() != second.name.casefold():
+            return False
+        if not os.path.samestat(first.stat(), second.stat()):
+            return False
+        # On macOS resolve() preserves caller casing. One actual directory entry
+        # proves a case alias; two entries may be intentional case-only hardlinks.
+        with os.scandir(first.parent) as entries:
+            return sum(
+                entry.name.casefold() == first.name.casefold() for entry in entries
+            ) == 1
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _published_source_version_matches(
+    target: Path,
+    target_sha256: str,
+    source: ArtifactSource,
+    artifact: dict[str, Any],
+    *,
+    store: ArtifactStore,
+    workspace: Path,
+    session_id: str,
+) -> bool:
+    if artifact.get("sha256") != target_sha256:
+        return False
+    if not _same_source_file(Path(source.path), target):
+        return False
+    try:
+        published_bundle = store.describe_preview_bundle(
+            source.artifact_id, session_id=session_id,
+        )
+        if published_bundle is None:
+            return True
+        # An unchanged HTML entrypoint can still refer to changed CSS/JS/images.
+        current_bundle = collect_artifact_bundle(
+            source.path,
+            workspace_root=workspace,
+            mode=source.bundle_mode,
+            bundle_root=source.bundle_root,
+            entry_mime=artifact.get("mime"),
+        )
+        return (
+            current_bundle is not None
+            and artifact_bundle_manifest(current_bundle).bundle_digest
+            == published_bundle.bundle_digest
+        )
+    except (OSError, RuntimeError, ValueError):
+        # An unreadable source or stored snapshot is not proof of delivery.
+        return False
+
+
+def _published_artifact_keys(
+    ctx: ToolContext, *, source_artifact_ids: set[str],
+) -> set[tuple[str, str]]:
     return {
         (
             str(artifact.get("sha256")),
             _safe_filename(str(artifact.get("name"))),
         )
         for artifact in ctx.published_artifacts
-        if artifact.get("sha256") and artifact.get("name")
+        if artifact.get("sha256")
+        and artifact.get("name")
+        and artifact.get("id") not in source_artifact_ids
     }
+
+
+def _is_registered_preview_path(
+    target: Path, *, workspace: Path, scopes: list[dict[str, str]],
+) -> bool:
+    """Keep ordinary webpage sources out of the implicit delivery backstop."""
+    for scope in scopes:
+        try:
+            if Path(scope.get("workspace", "")).resolve() != workspace:
+                continue
+            source = (workspace / scope["source_path"]).resolve()
+            mode = scope.get("bundle_mode", "auto")
+            if target == source:
+                return True
+            # Only an explicitly selected directory grants a subtree scope.
+            # Auto-discovered dependencies must not suppress unrelated PDFs.
+            if mode == "directory" and scope.get("bundle_root"):
+                root = (workspace / scope["bundle_root"]).resolve()
+                if (
+                    root != workspace
+                    and root.is_relative_to(workspace)
+                    and target.is_relative_to(root)
+                ):
+                    return True
+        except (KeyError, OSError, RuntimeError, ValueError):
+            continue
+    return False
 
 
 def auto_publish_omitted_workspace_artifacts(
     ctx: ToolContext | None,
     *,
     final_text: str,
-    attached_plan_run_ready: bool | None = None,
 ) -> OmittedArtifactPublishResult:
-    """Publish deliverable files the model wrote but forgot to publish.
+    """Publish deliverables the model wrote but forgot to publish.
 
     This is intentionally conservative: a file must be written through a tracked
     workspace file tool during the current turn, have a deliverable suffix, and
-    be named in the assistant's final text. Attached PlanRuns additionally
-    require live delivery-ready authorization resolved before entering this
-    blocking filesystem phase.
+    be named in the assistant's final text. HTML is excluded on surfaces that
+    can open workspace previews, but still needs delivery on other surfaces.
     """
 
     if ctx is None:
-        return OmittedArtifactPublishResult()
-    if (
-        str(getattr(ctx, "plan_run_id", "") or "").strip()
-        and attached_plan_run_ready is not True
-    ):
         return OmittedArtifactPublishResult()
     if not (
         ctx.workspace_dir
@@ -217,13 +256,33 @@ def auto_publish_omitted_workspace_artifacts(
     if not records or not final_text.strip():
         return OmittedArtifactPublishResult()
 
+    preview_tool = "open_workspace_preview"
+    can_preview = (
+        ctx.caller_kind is CallerKind.WEB
+        and ctx.is_owner
+        and not ctx.guest_safe
+        and ctx.workspace_preview_opener is not None
+        and preview_tool not in ctx.denied_tools
+        and (ctx.allowed_tools is None or preview_tool in ctx.allowed_tools)
+        and (ctx.authorized_tool_names is None or preview_tool in ctx.authorized_tool_names)
+    )
     workspace = Path(ctx.workspace_dir).resolve()
     store = ArtifactStore(ctx.artifact_media_root)
     published: list[dict[str, Any]] = []
     failure_summaries: list[str] = []
     resolved_target_keys: list[str] = []
-    seen_paths: set[Path] = set()
-    known_artifact_keys = _published_artifact_keys(ctx)
+    seen_paths: set[str] = set()
+    published_by_id = {artifact.get("id"): artifact for artifact in ctx.published_artifacts}
+    published_sources = [
+        (source, published_by_id[source.artifact_id])
+        for source in ctx.artifact_source_paths.values()
+        if source.artifact_id in published_by_id
+    ]
+    source_artifact_ids = {source.artifact_id for source, _ in published_sources}
+    # Name-based compatibility is only for tools without source publication facts.
+    known_artifact_keys = _published_artifact_keys(
+        ctx, source_artifact_ids=source_artifact_ids,
+    )
 
     for record in records:
         if not record.get("created"):
@@ -231,9 +290,14 @@ def auto_publish_omitted_workspace_artifacts(
             # files are tracked for diagnostics and are not deliverables.
             continue
         target = Path(str(record.get("path") or "")).expanduser().resolve(strict=False)
-        if target in seen_paths:
+        if can_preview and _is_registered_preview_path(
+            target, workspace=workspace,
+            scopes=ctx.workspace_preview_scopes,
+        ):
             continue
-        seen_paths.add(target)
+        if str(target) in seen_paths:
+            continue
+        seen_paths.add(str(target))
         try:
             target.relative_to(workspace)
         except ValueError:
@@ -241,7 +305,8 @@ def auto_publish_omitted_workspace_artifacts(
         relative_path = target.relative_to(workspace)
         if relative_path.parts and relative_path.parts[0] in _EXCLUDED_TOP_LEVEL_DIRS:
             continue
-        if target.suffix.casefold() not in _DELIVERABLE_SUFFIXES:
+        suffix = target.suffix.casefold()
+        if suffix not in _DELIVERABLE_SUFFIXES or (can_preview and suffix in _HTML_SUFFIXES):
             continue
         if not target.is_file():
             continue
@@ -284,16 +349,35 @@ def auto_publish_omitted_workspace_artifacts(
                     )
                     continue
 
-            target_sha256 = hashlib.sha256(
-                pptx_payload if pptx_payload is not None else target.read_bytes()
-            ).hexdigest()
+            bundle_snapshot = (
+                collect_artifact_bundle(target, workspace_root=workspace, mode="auto")
+                if suffix in _HTML_SUFFIXES else None
+            )
+            bundle_manifest = None
+            if bundle_snapshot is not None:
+                validate_html_archive(bundle_snapshot)
+                bundle_manifest = artifact_bundle_manifest(bundle_snapshot)
+                target_sha256 = next(
+                    item.sha256 for item in bundle_manifest.files
+                    if item.path == bundle_manifest.entrypoint
+                )
+            else:
+                target_sha256 = hashlib.sha256(
+                    pptx_payload if pptx_payload is not None else target.read_bytes()
+                ).hexdigest()
             artifact_key = (target_sha256, _safe_filename(target.name))
             target_key = artifact_delivery_publish_target_key(
                 str(target),
                 workspace_dir=workspace,
             )
             name_key = artifact_delivery_name_target_key(target.name)
-            if artifact_key in known_artifact_keys:
+            if (bundle_manifest is None and artifact_key in known_artifact_keys) or any(
+                _published_source_version_matches(
+                    target, target_sha256, source, artifact,
+                    store=store, workspace=workspace, session_id=ctx.artifact_session_id,
+                )
+                for source, artifact in published_sources
+            ):
                 for resolved_key in (target_key, name_key):
                     if (
                         resolved_key is not None
@@ -307,7 +391,13 @@ def auto_publish_omitted_workspace_artifacts(
                 sha256=target_sha256,
                 name=target.name,
                 mime=artifact_mime,
+                bundle_digest=bundle_manifest.bundle_digest if bundle_manifest else None,
+                require_single_file=bundle_manifest is None,
             )
+            if existing is not None and existing.id in source_artifact_ids:
+                # Its source/version already failed the check above. A matching
+                # display name cannot turn a different source into this file.
+                existing = None
             if existing is not None and any(
                 item.get("id") == existing.id for item in ctx.published_artifacts
             ):
@@ -317,7 +407,6 @@ def auto_publish_omitted_workspace_artifacts(
                         and resolved_key not in resolved_target_keys
                     ):
                         resolved_target_keys.append(resolved_key)
-                known_artifact_keys.add(artifact_key)
                 continue
             if existing is None:
                 disk_budget_bytes = (
@@ -325,7 +414,18 @@ def auto_publish_omitted_workspace_artifacts(
                     if ctx.artifact_disk_budget_bytes is not None
                     else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES
                 )
-                if pptx_payload is not None:
+                if bundle_snapshot is not None:
+                    ref = store.publish_bundle(
+                        bundle_snapshot,
+                        session_id=ctx.artifact_session_id,
+                        session_key=ctx.session_key,
+                        name=target.name,
+                        mime=artifact_mime,
+                        source="auto_publish_omitted",
+                        max_bytes=publish_max_bytes,
+                        disk_budget_bytes=disk_budget_bytes,
+                    )
+                elif pptx_payload is not None:
                     ref = store.publish_bytes(
                         pptx_payload,
                         session_id=ctx.artifact_session_id,
@@ -350,13 +450,21 @@ def auto_publish_omitted_workspace_artifacts(
             else:
                 ref = existing
             payload = artifact_payload(ref)
+            publication_id = secrets.token_hex(24)
+            source = ArtifactSource(
+                str(target), bundle_mode="auto" if bundle_snapshot is not None else "none",
+                artifact_id=ref.id,
+            )
+            ctx.artifact_source_paths[publication_id] = source
+            payload = {**payload, "publication_id": publication_id}
             ctx.published_artifacts.append(payload)
             published.append(payload)
+            published_sources.append((source, payload))
+            source_artifact_ids.add(ref.id)
             for resolved_key in (target_key, name_key):
                 if resolved_key is not None and resolved_key not in resolved_target_keys:
                     resolved_target_keys.append(resolved_key)
-            known_artifact_keys.add(artifact_key)
-        except (ArtifactBudgetError, OSError, ValueError) as exc:
+        except (ArtifactBudgetError, ContentExportError, OSError, ValueError) as exc:
             failure_summaries.append(f"auto-publish failed for {target.name}: {exc}")
             log.warning(
                 "artifact_delivery.auto_publish_failed path=%s error=%s",

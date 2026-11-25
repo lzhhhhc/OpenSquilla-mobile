@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -34,6 +35,12 @@ from opensquilla.session.usage_ledger import (
     UsageEventItem,
     UsageEventStart,
     UsageItemBillingReceipt,
+)
+from opensquilla.usage_metering import (
+    UsageItemMetering,
+    UsageMeter,
+    UsagePriceSnapshot,
+    UsageSettlementRevision,
 )
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
@@ -218,6 +225,12 @@ def _reconciled_items(
             estimate_basis=result.estimate_basis,
             price_source=result.price_source,
             billing_receipt=billing_receipt,
+            # Inconsistent adapter items cannot lend an authoritative valuation
+            # to this defensive envelope-only projection.
+            meters=(),
+            price_snapshot=None,
+            settlement=None,
+            token_usage_known=all(item.token_usage_known for item in items),
         ),
     )
 
@@ -231,8 +244,10 @@ class SessionUsageEventSink:
         *,
         start_retry_delays: tuple[float, ...] = (0.1,),
         retry_delays: tuple[float, ...] = (0.05, 0.2, 1.0, 5.0),
+        on_goal_usage: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._storage = storage
+        self.on_goal_usage = on_goal_usage
         self._start_retry_delays = tuple(
             max(0.0, float(delay)) for delay in start_retry_delays
         )
@@ -255,6 +270,7 @@ class SessionUsageEventSink:
             agent_id=call.agent_id or "main",
             session_epoch=max(0, int(call.session_epoch)),
             turn_id=call.turn_id,
+            root_turn_id=call.root_turn_id or call.turn_id,
             agent_run_id=call.agent_run_id,
             parent_turn_id=call.parent_turn_id,
             run_kind=call.run_kind or "agent",
@@ -268,7 +284,7 @@ class SessionUsageEventSink:
         attempt = 0
         while True:
             try:
-                await self._storage.start_usage_event(record)
+                await self._storage.start_usage_event(record, preserve_session_epoch=True)
                 return
             except StorageBusyError as exc:
                 if attempt >= len(self._start_retry_delays):
@@ -295,6 +311,24 @@ class SessionUsageEventSink:
                     "usage ledger is temporarily unavailable; provider request was not sent"
                 ) from exc
 
+    async def _notify_goal_usage(self, record: Any) -> None:
+        goal_id = getattr(record, "goal_id", None)
+        if (not goal_id or getattr(record, "transition_applied", False) is not True
+                or self.on_goal_usage is None):
+            return
+        try:
+            await self.on_goal_usage(goal_id)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            # An observer awaiting a cancelled transport future must not turn
+            # a successfully committed provider receipt into a cancelled turn.
+            log.warning("usage.goal_observer_cancelled", event_id=record.event_id)
+        except Exception:
+            # A transport/UI observer cannot roll back or retry a committed bill.
+            log.warning("usage.goal_observer_failed", event_id=record.event_id)
+
     async def finalize(self, call: UsageCallStart, result: UsageCallResult) -> None:
         completion = _completion(call, result)
         reconciled = _reconciled_items(call, result)
@@ -304,28 +338,68 @@ class SessionUsageEventSink:
             for value in reconciled
             if (receipt := _receipt(call.event_id, value)) is not None
         )
+        metering = {
+            value.ordinal: UsageItemMetering(
+                value.meters, value.price_snapshot, value.settlement, value.token_usage_known
+            )
+            for value in reconciled
+            if value.meters or value.price_snapshot is not None or value.settlement is not None
+        }
         try:
             kwargs: dict[str, Any] = {"items": items}
             if receipts:
                 kwargs["receipts"] = receipts
-            await self._storage.finalize_usage_event(call.event_id, completion, **kwargs)
+            if metering and hasattr(self._storage, "append_usage_settlement"):
+                kwargs["metering"] = metering
+            record = await self._storage.finalize_usage_event(call.event_id, completion, **kwargs)
+            await self._notify_goal_usage(record)
         except Exception:
+            # A finished provider call with an unwritten receipt must not look
+            # like a live, fully accounted request in Goal usage coverage.
+            # Reuse the existing ledger state; the bounded finalize retry can
+            # still replace unknown with its exact receipt later.
+            with contextlib.suppress(Exception):
+                record = await self._storage.mark_usage_event_unknown(
+                    call.event_id,
+                    completed_at_ms=completion.completed_at_ms,
+                    reason="usage_unknown",
+                )
+                await self._notify_goal_usage(record)
             self._schedule_retry(
-                self._retry_finalize(call.event_id, completion, items, receipts),
+                self._retry_finalize(call.event_id, completion, items, receipts, metering),
                 event_id=call.event_id,
                 operation="finalize",
             )
             raise
 
+    async def revise(
+        self,
+        call: UsageCallStart,
+        revision: UsageSettlementRevision,
+        *,
+        ordinal: int = 0,
+        meters: tuple[UsageMeter, ...] = (),
+        price_snapshot: UsagePriceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        """Replace the valuation of the original physical item, never its identity."""
+        result: dict[str, Any] = await self._storage.append_usage_settlement(
+            call.event_id, ordinal, revision, meters=meters, price_snapshot=price_snapshot
+        )
+        from types import SimpleNamespace
+
+        await self._notify_goal_usage(SimpleNamespace(**result))
+        return result
+
     async def mark_unknown(self, call: UsageCallStart, reason: str) -> None:
         completed_at_ms = max(call.started_at_ms, time.time_ns() // 1_000_000)
         stable_reason = normalize_usage_unknown_reason(reason)
         try:
-            await self._storage.mark_usage_event_unknown(
+            record = await self._storage.mark_usage_event_unknown(
                 call.event_id,
                 completed_at_ms=completed_at_ms,
                 reason=stable_reason,
             )
+            await self._notify_goal_usage(record)
         except Exception:
             self._schedule_retry(
                 self._retry_unknown(call.event_id, completed_at_ms, stable_reason),
@@ -366,6 +440,7 @@ class SessionUsageEventSink:
         completion: UsageEventCompletion,
         items: tuple[UsageEventItem, ...],
         receipts: tuple[UsageItemBillingReceipt, ...],
+        metering: dict[int, UsageItemMetering] | None = None,
     ) -> None:
         for delay in self._retry_delays:
             await asyncio.sleep(delay)
@@ -373,7 +448,10 @@ class SessionUsageEventSink:
                 kwargs: dict[str, Any] = {"items": items}
                 if receipts:
                     kwargs["receipts"] = receipts
-                await self._storage.finalize_usage_event(event_id, completion, **kwargs)
+                if metering and hasattr(self._storage, "append_usage_settlement"):
+                    kwargs["metering"] = metering
+                record = await self._storage.finalize_usage_event(event_id, completion, **kwargs)
+                await self._notify_goal_usage(record)
                 return
             except Exception:  # noqa: BLE001 - bounded retry; recovery handles residue.
                 continue
@@ -388,11 +466,12 @@ class SessionUsageEventSink:
         for delay in self._retry_delays:
             await asyncio.sleep(delay)
             try:
-                await self._storage.mark_usage_event_unknown(
+                record = await self._storage.mark_usage_event_unknown(
                     event_id,
                     completed_at_ms=completed_at_ms,
                     reason=reason,
                 )
+                await self._notify_goal_usage(record)
                 return
             except Exception:  # noqa: BLE001 - bounded retry; recovery handles residue.
                 continue

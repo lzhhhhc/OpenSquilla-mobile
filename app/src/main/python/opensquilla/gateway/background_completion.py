@@ -22,6 +22,63 @@ EventEmitter = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 ChannelManagerRef = Callable[[], Any | None]
 
 
+def _accepts_keyword_arg(call: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
+
+
+def _accepts_explicit_keyword_arg(call: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(call).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _session_owner_kwargs(
+    operation: Any,
+    *,
+    session_id: object,
+    session_epoch: object,
+) -> dict[str, object]:
+    if session_epoch is None:
+        if session_id is None:
+            return {}
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string when present")
+        if _accepts_keyword_arg(operation, "expected_session_id"):
+            return {"expected_session_id": session_id}
+        return {}
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        raise ValueError("session_epoch requires a valid session_id and non-negative epoch")
+    if not all(
+        _accepts_explicit_keyword_arg(operation, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError(
+            "Modern subagent completion requires an exact session-owner operation"
+        )
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
 @dataclass(frozen=True)
 class _DeliveryResult:
     status: str
@@ -92,8 +149,47 @@ class BackgroundCompletionManager:
         self._watch_task_owners: dict[asyncio.Task[None], tuple[str, str]] = {}
         self._parent_fence_refcounts: dict[str, int] = {}
         self._group_admissions: dict[str, dict[str, int]] = {}
+        self._pending_evictions: set[str] = set()
+        self._cancelling_groups: set[str] = set()
         self._watch_state_changed = asyncio.Event()
         self._closing = False
+        self._cancel_on_close = False
+        self._idle_listener: Callable[[str], None] | None = None
+        self._cancel_listener: Callable[[str, str], Awaitable[None]] | None = None
+
+    def set_idle_listener(self, listener: Callable[[str], None] | None) -> None:
+        """Notify ordinary producers after a completion group releases its parent."""
+        self._idle_listener = listener
+
+    def set_cancel_listener(
+        self, listener: Callable[[str, str], Awaitable[None]] | None,
+    ) -> None:
+        """Settle parent authority before a cancelled group releases its idle fence."""
+        self._cancel_listener = listener
+
+    def _notify_parent_idle(self, parent_session_key: str) -> None:
+        if self._idle_listener is not None:
+            try:
+                self._idle_listener(parent_session_key)
+            except Exception:
+                log.exception("background_completion.idle_listener_failed")
+
+    async def _finish_group_cancellations(
+        self, parent_session_key: str, group_ids: set[str],
+    ) -> None:
+        # Tombstones already block late wakes, while these groups stay visible
+        # to ordinary idle producers until cancellation authority is durable.
+        # On failure retain the fence; an exact cancellation retry can finish it.
+        if self._cancel_listener is not None:
+            prefix = f"subagent:{parent_session_key}:"
+            for group_id in sorted(group_ids):
+                await self._cancel_listener(parent_session_key, group_id.removeprefix(prefix))
+        async with self._state_lock:
+            released = bool(self._cancelling_groups.intersection(group_ids))
+            self._cancelling_groups.difference_update(group_ids)
+            self._notify_watch_state_changed()
+        if released:
+            self._notify_parent_idle(parent_session_key)
 
     @staticmethod
     def group_id(parent_session_key: str, parent_task_id: str) -> str:
@@ -105,6 +201,7 @@ class BackgroundCompletionManager:
         parent_session_key: str,
         parent_task_id: str,
         pending_count: int | None = None,
+        parent_envelope: Any | None = None,
     ) -> None:
         group_id = self.group_id(parent_session_key, parent_task_id)
         async with self._state_lock:
@@ -117,10 +214,15 @@ class BackgroundCompletionManager:
             if group_id in self._waiting_groups or group_id in self._wake_groups:
                 return
             self._waiting_groups.add(group_id)
+            if parent_envelope is not None:
+                self._parent_envelopes[group_id] = parent_envelope
+            else:
+                parent_envelope = self._parent_envelopes.get(group_id)
         payload = self._base_payload(
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="waiting",
+            parent_envelope=parent_envelope,
         )
         if pending_count is not None:
             payload["pending_count"] = pending_count
@@ -132,12 +234,17 @@ class BackgroundCompletionManager:
         parent_session_key: str,
         parent_task_id: str,
         task_runtime: Any,
+        parent_envelope: Any | None = None,
     ) -> None:
         group_id = self.group_id(parent_session_key, parent_task_id)
         if not await self._begin_group_admission(parent_session_key, group_id):
             return
         try:
-            parent_envelope = _parent_envelope_from_task_runtime(task_runtime, parent_task_id)
+            admitted_parent_envelope = parent_envelope
+            parent_envelope = admitted_parent_envelope or _parent_envelope_from_task_runtime(
+                task_runtime,
+                parent_task_id,
+            )
             parent_run_mode_override = _parent_run_mode_override_from_task_runtime(
                 task_runtime,
                 parent_task_id,
@@ -161,7 +268,10 @@ class BackgroundCompletionManager:
                     return
                 self._group_parents[group_id] = parent_session_key
                 if parent_envelope is not None:
-                    self._parent_envelopes.setdefault(group_id, parent_envelope)
+                    if admitted_parent_envelope is not None:
+                        self._parent_envelopes[group_id] = parent_envelope
+                    else:
+                        self._parent_envelopes.setdefault(group_id, parent_envelope)
                 if parent_run_mode_override is not None:
                     self._parent_run_mode_overrides.setdefault(
                         group_id,
@@ -176,8 +286,13 @@ class BackgroundCompletionManager:
         """Prevent existing subagent groups from waking an aborted parent."""
         async with self._state_lock:
             group_ids = self._group_ids_for_parent_sessions_locked((parent_session_key,))
+            active = group_ids & (
+                self._waiting_groups | self._wake_groups | self._cancelling_groups
+            )
             for group_id in group_ids:
                 self._cancel_group_locked(group_id)
+            self._cancelling_groups.update(active)
+        await self._finish_group_cancellations(parent_session_key, active)
         return len(group_ids)
 
     async def cancel_task(self, parent_session_key: str, parent_task_id: str) -> int:
@@ -188,11 +303,18 @@ class BackgroundCompletionManager:
                 (parent_session_key,)
             )
             was_known = group_id in known_group_ids
+            active = group_id in (
+                self._waiting_groups | self._wake_groups | self._cancelling_groups
+            )
             # Remember the exact cancellation even if group admission is racing
             # this call. A later admission for the same task must not revive it.
             self._group_parents.setdefault(group_id, parent_session_key)
             self._cancel_group_locked(group_id)
+            if active:
+                self._cancelling_groups.add(group_id)
             self._notify_watch_state_changed()
+        if active:
+            await self._finish_group_cancellations(parent_session_key, {group_id})
         return int(was_known)
 
     @contextlib.asynccontextmanager
@@ -242,9 +364,11 @@ class BackgroundCompletionManager:
         async with self._state_lock:
             return sorted(
                 group_id
-                for group_id in self._waiting_groups | self._wake_groups
+                for group_id in (
+                    self._waiting_groups | self._wake_groups | self._cancelling_groups
+                )
                 if self._group_parents.get(group_id) == parent_session_key
-                and group_id not in self._cancelled_groups
+                and (group_id not in self._cancelled_groups or group_id in self._cancelling_groups)
             )
 
     async def active_run_mode_override(self, parent_session_key: str) -> Any | None:
@@ -271,13 +395,18 @@ class BackgroundCompletionManager:
         task_runtime: Any,
         message: str,
         provenance: dict[str, Any],
+        parent_envelope: Any | None = None,
     ) -> None:
         """Schedule a parent wake without waiting inline for same-session work."""
         group_id = self.group_id(parent_session_key, parent_task_id)
         if not await self._begin_group_admission(parent_session_key, group_id):
             return
         try:
-            parent_envelope = _parent_envelope_from_task_runtime(task_runtime, parent_task_id)
+            admitted_parent_envelope = parent_envelope
+            parent_envelope = admitted_parent_envelope or _parent_envelope_from_task_runtime(
+                task_runtime,
+                parent_task_id,
+            )
             parent_run_mode_override = _parent_run_mode_override_from_task_runtime(
                 task_runtime,
                 parent_task_id,
@@ -302,7 +431,11 @@ class BackgroundCompletionManager:
                 self._group_parents[group_id] = parent_session_key
                 self._wake_groups.add(group_id)
                 self._waiting_groups.discard(group_id)
-                parent_envelope = self._parent_envelopes.get(group_id) or parent_envelope
+                parent_envelope = (
+                    admitted_parent_envelope
+                    or self._parent_envelopes.get(group_id)
+                    or parent_envelope
+                )
                 if parent_envelope is not None:
                     self._parent_envelopes[group_id] = parent_envelope
                 parent_run_mode_override = self._parent_run_mode_overrides.get(
@@ -360,30 +493,90 @@ class BackgroundCompletionManager:
                 )
                 return
 
-    async def close(self, *, timeout: float | None = 30.0) -> None:
-        async with self._state_lock:
-            self._closing = True
-        await self.drain(timeout=timeout)
+    def shutdown_activity_count(self) -> int:
+        return sum(not task.done() for task in self._watch_tasks) + sum(
+            count for groups in self._group_admissions.values() for count in groups.values()
+        )
+
+    def begin_shutdown(self, *, cancel: bool = False) -> None:
+        """Fence completion admission before the quit acknowledgement is returned."""
+        self._closing = True
+        if cancel:
+            self._cancel_on_close = True
+            self._cancelled_groups.update(self._group_parents)
+            self._cancelled_groups.update(self._waiting_groups | self._wake_groups)
+            for task in tuple(self._watch_tasks):
+                if not task.done():
+                    task.cancel()
+        self._notify_watch_state_changed()
+
+    async def close(
+        self, *, timeout: float | None = 30.0, cancel: bool = False,
+        deadline: float | None = None,
+    ) -> bool:
+        now = asyncio.get_running_loop().time()
+        remaining: float | None
+        if deadline is None and timeout is not None:
+            deadline = now + timeout + (0.0 if cancel else 5.0)
+        self.begin_shutdown(cancel=cancel)
+        if not self._cancel_on_close:
+            drain_timeout = timeout
+            if deadline is not None:
+                remaining = max(0.0, deadline - now)
+                drain_timeout = remaining if timeout is None else min(timeout, remaining)
+            await self.drain(timeout=drain_timeout)
+        if not self._cancel_on_close:
+            cancel_deadline = asyncio.get_running_loop().time() + 5.0
+            deadline = cancel_deadline if deadline is None else min(deadline, cancel_deadline)
         tasks = await self._snapshot_watch_tasks()
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            remaining = None if deadline is None else max(
+                0.0, deadline - asyncio.get_running_loop().time()
+            )
+            _, pending = await asyncio.wait(tasks, timeout=remaining)
+            if pending:
+                log.warning("background_completion.close_timeout", remaining=len(pending))
+                return False
+        while self._group_admissions:
+            # Route lookups admitted before the fence still hold session storage.
+            changed = self._watch_state_changed
+            remaining = None if deadline is None else max(
+                0.0, deadline - asyncio.get_running_loop().time()
+            )
+            if remaining is not None and remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=remaining)
+            except TimeoutError:
+                return False
         async with self._state_lock:
+            released_parents = {
+                self._group_parents[group_id]
+                for group_id in (
+                    self._waiting_groups | self._wake_groups | self._cancelling_groups
+                )
+                if group_id in self._group_parents
+            }
             self._waiting_groups.clear()
             self._wake_groups.clear()
             self._delivery_attempted.clear()
             self._delivery_targets.clear()
             self._parent_envelopes.clear()
             self._parent_run_mode_overrides.clear()
-            self._cancelled_groups.clear()
             self._group_parents.clear()
             self._watch_tasks.clear()
             self._watch_task_owners.clear()
             self._parent_fence_refcounts.clear()
             self._group_admissions.clear()
+            self._pending_evictions.clear()
+            self._cancelling_groups.clear()
             self._notify_watch_state_changed()
             self._closing = True
+        for parent_session_key in released_parents:
+            self._notify_parent_idle(parent_session_key)
+        return True
 
     async def _snapshot_watch_tasks(self) -> list[asyncio.Task[None]]:
         async with self._state_lock:
@@ -424,6 +617,9 @@ class BackgroundCompletionManager:
                 if not groups:
                     self._group_admissions.pop(parent_session_key, None)
             self._notify_watch_state_changed()
+            retry_eviction = group_id in self._pending_evictions
+        if retry_eviction:
+            await self._evict_group(group_id)
 
     async def _finish_quiesce_drain(self, keys: tuple[str, ...]) -> None:
         drain = asyncio.create_task(self._cancel_and_drain_parent_watchers(keys))
@@ -470,6 +666,7 @@ class BackgroundCompletionManager:
             await state_changed.wait()
 
     async def _release_parent_fences(self, keys: tuple[str, ...]) -> None:
+        released = []
         async with self._state_lock:
             for session_key in keys:
                 remaining = self._parent_fence_refcounts.get(session_key, 0) - 1
@@ -477,7 +674,10 @@ class BackgroundCompletionManager:
                     self._parent_fence_refcounts[session_key] = remaining
                 else:
                     self._parent_fence_refcounts.pop(session_key, None)
+                    released.append(session_key)
             self._notify_watch_state_changed()
+        for session_key in released:
+            self._notify_parent_idle(session_key)
 
     def _discard_watch_task(self, task: asyncio.Task[None]) -> None:
         self._watch_tasks.discard(task)
@@ -501,6 +701,7 @@ class BackgroundCompletionManager:
             *self._delivery_targets,
             *self._parent_envelopes,
             *self._parent_run_mode_overrides,
+            *self._cancelling_groups,
         }
         group_ids = {
             group_id for group_id in candidates if self._group_parents.get(group_id) in key_set
@@ -519,6 +720,8 @@ class BackgroundCompletionManager:
         return group_ids
 
     def _cancel_group_locked(self, group_id: str) -> None:
+        self._pending_evictions.discard(group_id)
+        self._cancelling_groups.discard(group_id)
         self._cancelled_groups.add(group_id)
         self._waiting_groups.discard(group_id)
         self._wake_groups.discard(group_id)
@@ -533,13 +736,25 @@ class BackgroundCompletionManager:
         parent_session_key: str,
         parent_task_id: str,
         status: str,
+        parent_envelope: Any | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "group_id": self.group_id(parent_session_key, parent_task_id),
             "parent_session_key": parent_session_key,
             "parent_task_id": parent_task_id,
             "status": status,
         }
+        session_id = getattr(parent_envelope, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            payload["session_id"] = session_id
+        session_epoch = getattr(parent_envelope, "session_epoch", None)
+        if (
+            isinstance(session_epoch, int)
+            and not isinstance(session_epoch, bool)
+            and session_epoch >= 0
+        ):
+            payload["epoch"] = session_epoch
+        return payload
 
     async def _enqueue_and_watch_parent_wake(
         self,
@@ -588,16 +803,26 @@ class BackgroundCompletionManager:
         try:
             await self._wait_for_parent_task_to_release(task_runtime, parent_task_id)
             async with self._state_lock:
-                if group_id in self._cancelled_groups:
+                if self._cancel_on_close or group_id in self._cancelled_groups:
                     return
             send_with_envelope = getattr(task_runtime, "send_with_envelope", None)
             if parent_envelope is not None and callable(send_with_envelope):
+                if getattr(parent_envelope, "session_epoch", None) is not None and not (
+                    _accepts_explicit_keyword_arg(send_with_envelope, "envelope")
+                ):
+                    raise RuntimeError(
+                        "Modern subagent completion requires owner-bound wake admission"
+                    )
                 handle = await send_with_envelope(
                     parent_envelope,
                     message,
                     provenance=provenance,
                     stream_event_sink=stream_collector,
                     accepted_run_mode_override=parent_run_mode_override,
+                )
+            elif getattr(parent_envelope, "session_epoch", None) is not None:
+                raise RuntimeError(
+                    "Modern subagent completion requires owner-bound wake admission"
                 )
             else:
                 handle = await task_runtime.send(
@@ -623,6 +848,7 @@ class BackgroundCompletionManager:
                 synthesis_task_id=None,
                 error_class=error_class,
                 error_message=error_message,
+                parent_envelope=parent_envelope,
             )
             async with self._state_lock:
                 self._wake_groups.discard(group_id)
@@ -633,6 +859,7 @@ class BackgroundCompletionManager:
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="synthesizing",
+            parent_envelope=parent_envelope,
         )
         if isinstance(synthesis_task_id, str) and synthesis_task_id:
             payload["synthesis_task_id"] = synthesis_task_id
@@ -646,6 +873,7 @@ class BackgroundCompletionManager:
                 synthesis_task_id=None,
                 error_class="MissingTaskHandle",
                 error_message="parent wake did not return a synthesis task id",
+                parent_envelope=parent_envelope,
             )
             return
 
@@ -656,6 +884,7 @@ class BackgroundCompletionManager:
             final_text=stream_collector.text,
             delivery_target=delivery_target,
             task_runtime=task_runtime,
+            parent_envelope=parent_envelope,
         )
 
     async def _wait_for_parent_task_to_release(
@@ -685,6 +914,7 @@ class BackgroundCompletionManager:
         final_text: Callable[[], str],
         delivery_target: _DeliveryTarget | None,
         task_runtime: Any,
+        parent_envelope: Any | None,
     ) -> None:
         try:
             record = await task_runtime.wait(synthesis_task_id)
@@ -705,12 +935,16 @@ class BackgroundCompletionManager:
                 synthesis_task_id=synthesis_task_id,
                 error_class=error_class,
                 error_message=error_message,
+                parent_envelope=parent_envelope,
             )
             return
 
         synthesis_status = _status_value(getattr(record, "status", None))
         async with self._state_lock:
-            if self.group_id(parent_session_key, parent_task_id) in self._cancelled_groups:
+            if (
+                self._cancel_on_close
+                or self.group_id(parent_session_key, parent_task_id) in self._cancelled_groups
+            ):
                 return
         if synthesis_status != AgentTaskStatus.SUCCEEDED.value:
             await self._emit_terminal_failure(
@@ -720,6 +954,35 @@ class BackgroundCompletionManager:
                 synthesis_status=synthesis_status,
                 error_class=_optional_str(getattr(record, "error_class", None)),
                 error_message=_optional_str(getattr(record, "error_message", None)),
+                parent_envelope=parent_envelope,
+            )
+            return
+
+        try:
+            await _require_current_parent_owner(
+                self._session_manager,
+                parent_session_key=parent_session_key,
+                parent_envelope=parent_envelope,
+            )
+        except Exception as exc:  # noqa: BLE001 - stale owner becomes a group failure.
+            error_class, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_class=type(exc).__name__,
+                fallback_error_message=str(exc) or "Agent error",
+            )
+            await self._emit_terminal_failure(
+                parent_session_key=parent_session_key,
+                parent_task_id=parent_task_id,
+                synthesis_task_id=synthesis_task_id,
+                synthesis_status=synthesis_status,
+                error_class=error_class,
+                error_message=error_message,
+                parent_envelope=parent_envelope,
             )
             return
 
@@ -733,6 +996,7 @@ class BackgroundCompletionManager:
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="done",
+            parent_envelope=parent_envelope,
         )
         payload.update(
             {
@@ -757,11 +1021,13 @@ class BackgroundCompletionManager:
         error_class: str | None = None,
         error_message: str | None = None,
         synthesis_status: str | None = None,
+        parent_envelope: Any | None = None,
     ) -> None:
         payload = self._base_payload(
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="failed",
+            parent_envelope=parent_envelope,
         )
         if synthesis_task_id:
             payload["synthesis_task_id"] = synthesis_task_id
@@ -795,6 +1061,8 @@ class BackgroundCompletionManager:
             return _DeliveryResult("not_applicable")
 
         async with self._state_lock:
+            if self._cancel_on_close:
+                return _DeliveryResult("not_applicable")
             if group_id in self._delivery_attempted:
                 return _DeliveryResult("sent")
             self._delivery_attempted.add(group_id)
@@ -840,6 +1108,7 @@ class BackgroundCompletionManager:
             )
 
     async def _evict_group(self, group_id: str) -> None:
+        released_parent = None
         async with self._state_lock:
             current_task = asyncio.current_task()
             if any(
@@ -848,7 +1117,15 @@ class BackgroundCompletionManager:
             ):
                 return
             if any(groups.get(group_id, 0) > 0 for groups in self._group_admissions.values()):
+                self._pending_evictions.add(group_id)
                 return
+            self._pending_evictions.discard(group_id)
+            if (
+                not self._closing
+                and group_id not in self._cancelled_groups
+                and group_id in self._waiting_groups | self._wake_groups
+            ):
+                released_parent = self._group_parents.get(group_id)
             self._waiting_groups.discard(group_id)
             self._wake_groups.discard(group_id)
             self._delivery_attempted.discard(group_id)
@@ -857,6 +1134,37 @@ class BackgroundCompletionManager:
             self._parent_run_mode_overrides.pop(group_id, None)
             if group_id not in self._cancelled_groups:
                 self._group_parents.pop(group_id, None)
+        if released_parent is not None:
+            self._notify_parent_idle(released_parent)
+
+
+async def _require_current_parent_owner(
+    session_manager: Any,
+    *,
+    parent_session_key: str,
+    parent_envelope: Any | None,
+) -> None:
+    session_id = getattr(parent_envelope, "session_id", None)
+    session_epoch = getattr(parent_envelope, "session_epoch", None)
+    if session_id is None and session_epoch is None:
+        return
+    get_session = getattr(session_manager, "get_session", None)
+    if not callable(get_session):
+        if session_epoch is not None:
+            raise RuntimeError(
+                "Modern subagent completion requires an exact parent-owner read"
+            )
+        return
+    current = await get_session(
+        parent_session_key,
+        **_session_owner_kwargs(
+            get_session,
+            session_id=session_id,
+            session_epoch=session_epoch,
+        ),
+    )
+    if current is None:
+        raise RuntimeError("Parent session is no longer current")
 
 
 async def _get_session(session_manager: Any, session_key: str) -> Any | None:

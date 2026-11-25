@@ -1,6 +1,8 @@
 ---
 name: pptx
-description: "Read, edit, or create PowerPoint .pptx files. Trigger this skill whenever the user mentions a deck, slides, slide deck, presentation, or a `.pptx` filename — whether the goal is to extract text, modify an existing deck, build one from scratch, or prepare slides for review. Three execution paths are supported: text extraction (always available), template editing (unzip → patch slide XML → repack), and creation from scratch (python-pptx for Python or PptxGenJS for Node)."
+visibility: public
+invocation: direct
+description: "Read, inspect, edit, or create PowerPoint `.pptx` presentations, including text extraction, template-preserving changes, slide review, and generation from a brief."
 description_zh: "读取、编辑或创建PowerPoint .pptx 文件。当用户提到演示文稿、幻灯片、slide deck、presentation 或 .pptx 文件名时触发——无论目标是提取文本、修改现有演示、从零构建还是准备评审幻灯片。支持三种执行路径：文本提取（始终可用）、模板编辑（解压→修补幻灯片XML→重新打包）以及从零创建（Python用python-pptx，Node用PptxGenJS）。"
 homepage: https://python-pptx.readthedocs.io/
 provenance:
@@ -66,16 +68,11 @@ If `write_file`, `edit_file`, `apply_patch`, or `execute_code` is available:
   that tool is available.
 - The code examples later in this document apply.
 
-If only `create_pptx` is available:
-
-- Use it only for a basic text-only deck from slide titles, body text, and
-  bullets.
-- Do not use it for illustrated, image-heavy, chart-heavy, template-based, or
-  visually designed decks. It does not support images, icons, charts, custom
-  layouts, or visual QA.
-- If the user asked for those visual features, explain that full visual deck
-  authoring is unavailable in this session instead of calling `create_pptx` as
-  though it satisfies the request.
+In restricted channels, run the inline Python examples with `execute_code`
+and save workspace-relative files before calling `publish_artifact`. Shell,
+Node, and LibreOffice commands require the corresponding exposed tool and
+runtime. Do not use Python subprocesses to bypass an unavailable shell tool,
+and do not retry generation on the host when sandbox execution fails.
 
 If none of those file-authoring tools are available:
 
@@ -110,9 +107,9 @@ user explicitly says "start fresh" or there is no input deck.
 
 ## Path A: Read text from a `.pptx`
 
-Use the helper script. It walks slides via the python-pptx public API and
-prints text grouped by slide. This is always available because python-pptx is
-the only hard dependency.
+When shell execution is available, use the helper script. It walks slides via
+the python-pptx public API and prints text grouped by slide. With
+`execute_code`, use the inline Python example instead.
 
 ```bash
 python {baseDir}/scripts/extract_text.py /path/to/deck.pptx

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import csv
 import difflib
@@ -23,14 +24,14 @@ from xml.etree import ElementTree as ET
 
 import structlog
 
-from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.file_snapshot import build_file_edit_snapshot
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
@@ -58,11 +59,12 @@ from opensquilla.sandbox.path_validation import (
     trusted_write_auto_grant_allowed,
 )
 from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
+from opensquilla.source_symbols import _source_symbol_matches_line
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
 )
-from opensquilla.tools.path_policy import reject_foreign_host_path
+from opensquilla.tools.path_policy import reject_foreign_host_path, resolve_bound_workspace
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import (
     current_run_mode,
@@ -75,6 +77,7 @@ from opensquilla.tools.source_edit_contract import (
     build_diff_summary,
     build_line_receipt,
     source_revision_for_path,
+    workspace_reference_id,
 )
 from opensquilla.tools.types import (
     PlanAccess,
@@ -82,6 +85,7 @@ from opensquilla.tools.types import (
     SafeToolError,
     ToolError,
     WorkspaceAccessError,
+    current_file_snapshot,
     current_tool_context,
 )
 from opensquilla.tools.write_tracking import (
@@ -96,6 +100,12 @@ from opensquilla.tools.write_tracking import (
 )
 
 log = structlog.get_logger(__name__)
+
+
+def _capture_file_snapshot(snapshot: dict[str, Any]) -> None:
+    target = current_file_snapshot.get()
+    if target is not None:
+        target.update(snapshot)
 
 
 def _settlement_duration_bucket(duration_ms: int) -> str:
@@ -132,10 +142,7 @@ _BOOTSTRAP_SOURCE_FILENAMES_FALLBACK = frozenset(
         "AGENTS.md",
         "SOUL.md",
         "IDENTITY.md",
-        "TOOLS.md",
         "USER.md",
-        "BOOTSTRAP.md",
-        "HEARTBEAT.md",
     }
 )
 _GREP_DEFAULT_MAX_RESULTS = 100
@@ -228,121 +235,6 @@ async def _run_executor_mutation[ExecutorResult](
     return result  # type: ignore[return-value]
 
 
-_SOURCE_SYMBOL_REGEXES: tuple[tuple[frozenset[str], str, re.Pattern[str]], ...] = (
-    (
-        frozenset({".py", ".pyi"}),
-        "class",
-        re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-    (
-        frozenset({".py", ".pyi"}),
-        "function",
-        re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    ),
-    (
-        frozenset({".js", ".jsx", ".ts", ".tsx"}),
-        "class",
-        re.compile(r"^\s*(?:export\s+default\s+|export\s+)?class\s+([A-Za-z_$][\w$]*)\b"),
-    ),
-    (
-        frozenset({".js", ".jsx", ".ts", ".tsx"}),
-        "function",
-        re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("),
-    ),
-    (
-        frozenset({".js", ".jsx", ".ts", ".tsx"}),
-        "function",
-        re.compile(
-            r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*="
-            r"\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"
-        ),
-    ),
-    (
-        frozenset({".java", ".cs", ".kt", ".kts", ".scala"}),
-        "class",
-        re.compile(
-            r"^\s*(?:public|private|protected|internal|abstract|final|sealed|open|"
-            r"static|\s)*(?:class|interface|enum|record|object)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
-        ),
-    ),
-    (
-        frozenset({".java", ".cs", ".kt", ".kts", ".scala"}),
-        "function",
-        re.compile(
-            r"^\s*(?:public|private|protected|internal|static|final|abstract|open|"
-            r"override|async|suspend|\s)+[A-Za-z_<>\[\].?,\s]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
-        ),
-    ),
-    (
-        frozenset({".go"}),
-        "function",
-        re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    ),
-    (
-        frozenset({".rs"}),
-        "function",
-        re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-    (
-        frozenset({".rs"}),
-        "class",
-        re.compile(
-            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|impl)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
-        ),
-    ),
-    (
-        frozenset({".rb"}),
-        "class",
-        re.compile(r"^\s*(?:class|module)\s+([A-Za-z_][A-Za-z0-9_:]*)\b"),
-    ),
-    (
-        frozenset({".rb"}),
-        "function",
-        re.compile(r"^\s*def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_!?=]*)\b"),
-    ),
-    (
-        frozenset({".php"}),
-        "class",
-        re.compile(
-            r"^\s*(?:abstract\s+|final\s+)?(?:class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
-        ),
-    ),
-    (
-        frozenset({".php"}),
-        "function",
-        re.compile(
-            r"^\s*(?:public|private|protected|static|final|abstract|\s)*function\s+"
-            r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
-        ),
-    ),
-    (
-        frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}),
-        "class",
-        re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-    (
-        frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}),
-        "function",
-        re.compile(
-            r"^\s*(?:[A-Za-z_][\w:<>,~*&\s]+\s+)+([A-Za-z_][A-Za-z0-9_]*)\s*"
-            r"\([^;{}]*\)\s*(?:const\s*)?(?:\{|$)"
-        ),
-    ),
-)
-_SOURCE_SYMBOL_IGNORED_NAMES = frozenset(
-    {
-        "if",
-        "for",
-        "while",
-        "switch",
-        "catch",
-        "return",
-        "sizeof",
-        "function",
-    }
-)
-
-
 def _tool_path_request(args: Mapping[str, Any]) -> FilesystemOperationRequest:
     raw_path = args.get("path")
     path = Path(str(raw_path)) if raw_path else None
@@ -401,14 +293,15 @@ def _memory_source_root() -> Path | None:
 
 def _memory_roots() -> tuple[Path, ...]:
     roots: list[Path] = []
-    for root in (_workspace_root(), _memory_source_root()):
+    source = _memory_source_root()
+    for root in (source,) if source is not None else (_workspace_root(),):
         if root is None or root in roots:
             continue
         roots.append(root)
     return tuple(roots)
 
 
-def _resolve_path(path: str) -> Path:
+def _resolve_unmapped_path(path: str) -> Path:
     """Resolve *path* against the active workspace when relative.
 
     Reads are always allowed; any workspace enforcement for writes happens in
@@ -425,21 +318,143 @@ def _resolve_path(path: str) -> Path:
     from opensquilla.tools.path_aliases import resolve_workspace_alias
 
     raw = Path(path).expanduser()
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        resolve_bound_workspace(ctx.workspace_dir)
+        if ctx is not None and ctx.workspace_dir else _workspace_root()
+    )
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
     alias = resolve_workspace_alias(raw, root)
-    if alias is not None:
-        assert isinstance(alias, Path)
-        return alias.resolve(strict=False)
-    if root is not None and not raw.is_absolute():
-        return (root / raw).resolve(strict=False)
-    return raw.resolve(strict=False) if raw.is_absolute() else raw
+    candidate = alias if alias is not None else (
+        root / raw if root is not None and not raw.is_absolute() else raw
+    )
+    assert isinstance(candidate, Path)
+    resolved = candidate.resolve(strict=False) if candidate.is_absolute() else candidate
+    if root is not None:
+        from opensquilla.attachment_working_files import attachment_original_key
+
+        attachment_path = attachment_original_key(candidate, root) is not None or (
+            candidate.is_relative_to(root / ".opensquilla" / "attachments")
+        )
+        if attachment_path and resolved != candidate:
+            raise SafeToolError("Attachment path is redirected; original was preserved")
+    return resolved
+
+
+def _resolve_path(path: str) -> Path:
+    from opensquilla.attachment_working_files import attachment_original_key, working_path_for_entry
+
+    resolved = _resolve_unmapped_path(path)
+    ctx = current_tool_context.get()
+    root = _workspace_root()
+    if ctx is not None and root is not None:
+        key = attachment_original_key(resolved, root)
+        entry = ctx.attachment_working_files.get(key or "")
+        if entry is None and resolved.is_relative_to(root):
+            relative = resolved.relative_to(root).as_posix()
+            entry = next((record for record in ctx.attachment_working_files.values()
+                          if record.get("path") == relative), None)
+        if entry and entry.get("path"):
+            try:
+                return working_path_for_entry(
+                    entry, workspace=root, session_id=ctx.artifact_session_id or "",
+                )
+            except ValueError as exc:
+                raise SafeToolError(str(exc)) from exc
+    return resolved
+
+
+async def _prepare_attachment_edit_path(
+    path: str, *, tool_name: str, approval_id: str | None = None,
+    sandbox_permissions: str = "use_default", justification: str = "",
+    prefix_rule: list[str] | None = None,
+) -> tuple[Path, str | None]:
+    from opensquilla.attachment_working_files import attachment_original_key, copy_attachment_file
+    from opensquilla.attachment_workspace import _safe_path_segment
+
+    source = _resolve_path(path)
+    root = _workspace_root()
+    ctx = current_tool_context.get()
+    if ctx is not None and root is not None:
+        if (
+            ctx.sandbox_session_manager is not None
+            and source.is_relative_to(root / ".opensquilla" / "attachments")
+            and (ctx.session_epoch is None or ctx.persist_attachment_working_files is None)
+        ):
+            raise SafeToolError(
+                "Attachment edit requires a current durable session; retry after session recovery"
+            )
+        relative = source.relative_to(root).as_posix() if source.is_relative_to(root) else ""
+        if any(entry.get("path") == relative for entry in ctx.attachment_working_files.values()):
+            if ctx.persist_attachment_working_files is not None:
+                await ctx.persist_attachment_working_files()
+            return source, None
+    key = attachment_original_key(source, root) if root is not None else None
+    if key is None:
+        return source, None
+    if ctx is None or root is None or not ctx.artifact_session_id:
+        raise SafeToolError("Editing an immutable attachment requires its active session")
+    scope = _safe_path_segment(ctx.artifact_session_id, fallback="session")
+    if Path(key).parts[2] != scope:
+        raise SafeToolError("Cannot edit another session's immutable attachment")
+    blocked = _sensitive_access_block(tool_name, source, path)
+    blocked = blocked or _sandbox_path_access_envelope(source, write=False)
+    if blocked is not None:
+        return source, json.dumps(blocked)
+    _gate_workspace_strict_read(tool_name, source, path)
+    require_fresh_workspace_file_read(source, tool_name=tool_name, original_path=path)
+    target = source.parent / "working" / source.name
+    if target.parent.resolve() != target.parent:
+        raise SafeToolError("Attachment working directory is redirected")
+    approval, elevated, _ = await _gate_out_of_workspace_write(
+        tool_name, target, str(target), approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if approval is not None:
+        return source, json.dumps(approval)
+    expected_sha = str(ctx.attachment_working_files.get(key, {}).get("sha256") or "")
+
+    async def copy_and_persist() -> None:
+        result = await _run_sandbox_operation_if_required(
+            SandboxOperation.filesystem(
+                kind="copy_attachment", workspace=root, run_mode=_active_filesystem_run_mode(),
+                path=target, paths=(target,), source_path=source, expected_revision=expected_sha,
+            ), host_execution_active=elevated,
+        )
+        if result is None:
+            sha = await asyncio.to_thread(copy_attachment_file, source, target, expected_sha)
+        else:
+            sha = str(getattr(result, "metadata", {}).get("sha256", ""))
+        ctx.attachment_working_files[key] = {
+            "path": target.relative_to(root).as_posix(), "sha256": sha,
+            "session_id": ctx.artifact_session_id, "workspace_root": str(root),
+        }
+        if ctx.persist_attachment_working_files is not None:
+            await ctx.persist_attachment_working_files()
+
+    pending = asyncio.create_task(copy_and_persist())
+    cancelled: asyncio.CancelledError | None = None
+    while not pending.done():
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    pending.result()
+    if cancelled is not None:
+        raise cancelled
+    record_workspace_file_read(target, operation="attachment_working_copy", complete=True)
+    return target, None
 
 
 def _resolve_base(path: str | None) -> Path:
     if path:
         return _resolve_path(path)
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        resolve_bound_workspace(ctx.workspace_dir)
+        if ctx is not None and ctx.workspace_dir else _workspace_root()
+    )
     return root if root is not None else Path.cwd()
 
 
@@ -459,6 +474,15 @@ def _workspace_display_path(path: Path, original_path: str) -> str:
 
 def _memory_source_rel_path(path: Path) -> str | None:
     resolved = path.resolve(strict=False)
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.memory_notes_dir:
+        try:
+            note = resolved.relative_to(Path(ctx.memory_notes_dir).expanduser().resolve())
+        except ValueError:
+            pass
+        else:
+            if note.suffix == ".md" and not any(part.startswith(".") for part in note.parts):
+                return (Path("memory") / note).as_posix()
     for root in _memory_roots():
         try:
             rel = resolved.relative_to(root)
@@ -467,13 +491,20 @@ def _memory_source_rel_path(path: Path) -> str | None:
 
         if rel.parts in {("MEMORY.md",), ("memory.md",)}:
             return rel.as_posix()
-        if len(rel.parts) >= 2 and rel.parts[0] == "memory" and rel.suffix == ".md":
+        if (
+            len(rel.parts) >= 2 and rel.parts[0] == "memory" and rel.suffix == ".md"
+            and not (ctx is not None and ctx.memory_notes_dir)
+        ):
             return rel.as_posix()
     return None
 
 
 def _bootstrap_source_rel_path(path: Path) -> str | None:
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        Path(ctx.bootstrap_source_dir).expanduser().resolve()
+        if ctx is not None and ctx.bootstrap_source_dir else _workspace_root()
+    )
     if root is None:
         return None
     resolved = path.resolve(strict=False)
@@ -537,6 +568,41 @@ def _looks_binary(raw: bytes, p: Path) -> str | None:
 def _read_binary_sample(p: Path, size: int = 8192) -> bytes:
     with p.open("rb") as fh:
         return fh.read(size)
+
+
+def _read_image_file_result(p: Path, sample: bytes) -> dict[str, object] | None:
+    """Build an image result inside the same read boundary as ordinary files."""
+    from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
+    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES, IMAGE_ATTACHMENT_MIMES
+    from opensquilla.contracts.image_validation import validate_image_bytes
+
+    mime = sniff_mime_from_bytes(sample)
+    if mime not in IMAGE_ATTACHMENT_MIMES:
+        mime = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp",
+        }.get(p.suffix.lower())
+    if mime is None:
+        return None
+    with p.open("rb") as stream:
+        payload = stream.read(IMAGE_ATTACHMENT_BYTES + 1)
+    if len(payload) > IMAGE_ATTACHMENT_BYTES:
+        raise SafeToolError("Image exceeds the supported attachment byte limit.")
+    try:
+        validate_image_bytes(payload, mime)
+    except ValueError:
+        raise SafeToolError("Image is corrupt, unreadable, or has an unsupported format.") from None
+    return {
+        "message": f"Loaded image ({mime}) for model input; it has not yet been analyzed.",
+        "image": {"mime": mime, "data": base64.b64encode(payload).decode("ascii")},
+    }
+
+
+def _publish_read_image(image: object, *, tool_use_id: str) -> None:
+    context = current_tool_context.get()
+    if context is None or not tool_use_id or not isinstance(image, dict):
+        raise SafeToolError("Image loading requires a model tool call to receive the image.")
+    context.tool_result_media[tool_use_id] = [image]
 
 
 def _is_search_excluded_path(path: Path) -> bool:
@@ -886,15 +952,6 @@ async def _run_sandbox_operation_if_required(
                 filesystem=filesystem_permissions,
             ),
         )
-    if (
-        trusted_sandbox_active()
-        and ctx is not None
-        and ctx.is_owner
-        and runtime is not None
-        and isinstance(runtime.backend, UnavailableBackend)
-        and operation.kind not in {"create_source", "edit_source"}
-    ):
-        return None
     return await SandboxOperationRuntime(
         runtime,
         host_execution_active=full_host_access_active() or host_execution_active,
@@ -1204,6 +1261,11 @@ def _gate_workspace_strict_read(tool_name: str, resolved: Path, original_path: s
     become an existence oracle for outside paths.
     """
 
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.sandboxed_workspace_authoring is not None:
+        from opensquilla.tools.workspace_authoring import guard_channel_workspace_path
+
+        guard_channel_workspace_path(ctx, resolved)
     blocked = _workspace_strict_read_block(tool_name, resolved, original_path)
     if blocked is not None:
         raise WorkspaceAccessError(str(blocked["message"]))
@@ -1328,6 +1390,9 @@ def _is_under_configured_scratch_dir(resolved: Path) -> bool:
 
 
 def _gate_workspace_lockdown_write(tool_name: str, resolved: Path, original_path: str) -> None:
+    from opensquilla.tools.workspace_authoring import guard_channel_workspace_path
+
+    guard_channel_workspace_path(current_tool_context.get(), resolved)
     if full_host_access_active():
         return
     roots = _workspace_lockdown_roots()
@@ -1352,6 +1417,16 @@ async def _gate_out_of_workspace_write(
     prefix_rule: list[str] | None = None,
 ) -> tuple[dict[str, object] | None, bool, tuple[BackupReceiptSummary, ...]]:
     """Return ``(block, elevated, backups)`` after exact-action gating."""
+    from opensquilla.tools.workspace_authoring import (
+        guard_channel_workspace_path,
+        restricted_channel_context,
+    )
+
+    ctx = current_tool_context.get()
+    if restricted_channel_context(ctx):
+        guard_channel_workspace_path(ctx, resolved)
+        if sandbox_permissions != "use_default" or approval_id:
+            raise WorkspaceAccessError("Channel workspace tools cannot request host execution.")
     if full_host_access_active():
         return None, False, ()
 
@@ -1491,7 +1566,7 @@ async def _gate_out_of_workspace_write(
                 if not destructive.allowed:
                     return destructive.envelope, False, ()
                 return None, True, summarize_backup_receipts(destructive.receipts)
-            gate = gate_elevated_action(
+            gate = await gate_elevated_action_async(
                 action,
                 approval_id=approval_id,
                 session_key=ctx.session_key if ctx is not None else None,
@@ -1626,7 +1701,7 @@ async def _gate_safe_policy_file_mutation(
             )
             return envelope, False, ()
         return None, True, summarize_backup_receipts(destructive.receipts)
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,
@@ -1662,7 +1737,10 @@ def _backup_receipt_note(
 @tool(
     name="read_file",
     description=(
-        "Read UTF-8 text file contents with line numbers. Supports offset and limit. "
+        "Read text, images, PDF pages, DOCX paragraphs, PPTX slides, "
+        "email messages, or spreadsheet rows. "
+        "Images are supplied directly to the model, without a separate analysis call. "
+        "Supports offset/limit in the format-specific units, with continuation positions. "
         "Before modifying an existing workspace file with edit_file or write_file, "
         "read it once without offset or limit to establish fresh edit context. "
         "Use offset/limit for inspection windows only. For CSV/TSV/Excel workbook "
@@ -1672,12 +1750,21 @@ def _backup_receipt_note(
         "path": {"type": "string", "description": "Absolute path to the file."},
         "offset": {
             "type": "integer",
-            "description": "Line offset to start reading from (1-indexed).",
+            "description": "First line, paragraph, slide, page, message, or row (1-indexed).",
         },
-        "limit": {"type": "integer", "description": "Maximum number of lines to read."},
+        "limit": {
+            "type": "integer",
+            "description": "Maximum units (PDF up to 10; other documents up to 200).",
+        },
+        "character_offset": {
+            "type": "integer",
+            "description": "Continuation character offset within the first unit.",
+        },
+        "sheet": {"type": "string", "description": "Spreadsheet sheet name or 1-based index."},
     },
     required=["path"],
     plan_access=PlanAccess.READ_ONLY,
+    runtime_only_arguments={"_tool_use_id"},
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_file",
         argv_factory=lambda a: ("read_file", str(a.get("path", ""))),
@@ -1686,7 +1773,14 @@ def _backup_receipt_note(
         record_payload=False,
     ),
 )
-async def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
+async def read_file(
+    path: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    _tool_use_id: str = "",
+    character_offset: int = 0,
+    sheet: str | int | None = None,
+) -> str:
     p = _resolve_path(path)
     blocked = _sensitive_access_block("read_file", p, path)
     if blocked is not None:
@@ -1711,20 +1805,46 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
                 display_path=path,
                 offset=offset,
                 limit=limit,
+                document_options={"character_offset": character_offset, "sheet": sheet},
             )
         )
         if sandbox_result is not None:
+            metadata = getattr(sandbox_result, "metadata", {})
+            if isinstance(metadata, dict) and "image" in metadata:
+                _publish_read_image(metadata.pop("image"), tool_use_id=_tool_use_id)
             record_workspace_file_read(
                 p,
                 operation="read_file",
                 offset=offset,
                 limit=limit,
-                complete=limit is None and (offset is None or offset <= 1),
+                complete=bool(metadata.get(
+                    "complete_read", limit is None and (offset is None or offset <= 1),
+                )),
             )
             return str(getattr(sandbox_result, "message"))
 
     loop = asyncio.get_event_loop()
+    from opensquilla.tools.document_readers import complete_document_read, read_document
+
+    document = await asyncio.to_thread(
+        read_document, p, offset=offset, limit=limit,
+        character_offset=character_offset, sheet=sheet,
+    )
+    if document is not None:
+        record_workspace_file_read(
+            p, operation="read_file", offset=offset, limit=limit,
+            complete=complete_document_read(
+                document, offset=offset, limit=limit,
+                character_offset=character_offset, sheet=sheet,
+            ),
+        )
+        return json.dumps(document, ensure_ascii=False)
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
+    image_result = await loop.run_in_executor(None, _read_image_file_result, p, sample)
+    if image_result is not None:
+        _publish_read_image(image_result["image"], tool_use_id=_tool_use_id)
+        record_workspace_file_read(p, operation="read_file", complete=True)
+        return str(image_result["message"])
     if not sample:
         record_workspace_file_read(
             p,
@@ -1758,7 +1878,8 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
     description=(
         "Read a UTF-8 workspace source line range and return a JSON revision receipt. "
         "Use the returned revision as edit_source.expected_revision before editing "
-        "that file. Returned lines are plain text without read_file line-number prefixes."
+        "that file. Returned lines are plain text without read_file line-number prefixes. "
+        "An empty file returns range [0, 0], total_lines 0, and a valid revision."
     ),
     params={
         "path": {
@@ -1778,7 +1899,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
         },
     },
     required=["path"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def read_source(path: str, start_line: int = 1, end_line: int | None = None) -> str:
@@ -1801,13 +1922,20 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         if binary_reason:
             raise _binary_file_error(path, p, reason=binary_reason)
     try:
+        context = current_tool_context.get()
+        workspace = _workspace_root()
         receipt = await loop.run_in_executor(
             None,
             lambda: build_line_receipt(
                 p,
                 start_line=start_line,
                 end_line=end_line,
-                display_path=_workspace_display_path(p, path),
+                display_path=_workspace_display_path_for_root(p, path, workspace),
+                session_key=context.session_key if context else None,
+                workspace_id=(
+                    context.workspace_id if context and context.workspace_id
+                    else workspace_reference_id(workspace) if workspace else None
+                ),
             ),
         )
     except UnicodeDecodeError as exc:
@@ -1817,8 +1945,11 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         p,
         operation="read_source",
         offset=receipt["range"][0],
-        limit=receipt["range"][1] - receipt["range"][0] + 1,
-        complete=(receipt["range"][0] == 1 and receipt["range"][1] == receipt["total_lines"]),
+        limit=(receipt["range"][1] - receipt["range"][0] + 1 if receipt["total_lines"] else 0),
+        complete=(
+            receipt["total_lines"] == 0
+            or receipt["range"][0] == 1 and receipt["range"][1] == receipt["total_lines"]
+        ),
     )
     return json.dumps(receipt, ensure_ascii=False)
 
@@ -2110,7 +2241,13 @@ async def write_file(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    p = _resolve_path(path)
+    p, attachment_block = await _prepare_attachment_edit_path(
+        path, tool_name="write_file", approval_id=approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if attachment_block is not None:
+        return attachment_block
     if full_host_access_active():
         created = not p.exists()
 
@@ -2128,6 +2265,7 @@ async def write_file(
             _write_full_host,
             settle=_settle_full_host,
         )
+        _capture_file_snapshot({"kind": "write", "path": path, "content": content})
         return f"Written {len(content)} bytes to {p}"
 
     approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
@@ -2178,6 +2316,7 @@ async def write_file(
             record_scratch_file_write(p)
             _notify_memory_source_write(p)
             _notify_bootstrap_source_write(p)
+            _capture_file_snapshot({"kind": "write", "path": path, "content": content})
             return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
                 backup_summaries
             )
@@ -2206,6 +2345,7 @@ async def write_file(
             _notify_bootstrap_source_write(p)
 
     await _run_executor_mutation(_write, settle=_settle_write)
+    _capture_file_snapshot({"kind": "write", "path": path, "content": content})
     return (
         f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
         f"{_backup_receipt_note(backup_summaries)}"
@@ -2271,7 +2411,7 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         },
     },
     required=["path", "content"],
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.write_scratch", str(a.get("path", ""))),
@@ -2337,7 +2477,7 @@ async def write_scratch(path: str, content: str) -> str:
     },
     required=["path", "content"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.create_source", str(a.get("path", ""))),
@@ -2678,7 +2818,13 @@ async def edit_file(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    p = _resolve_path(path)
+    p, attachment_block = await _prepare_attachment_edit_path(
+        path, tool_name="edit_file", approval_id=approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if attachment_block is not None:
+        return attachment_block
     replacements = _normalize_edit_replacements(
         path=path,
         old_text=old_text,
@@ -2706,6 +2852,9 @@ async def edit_file(
         await _run_executor_mutation(
             _write_full_host,
             settle=_settle_full_host,
+        )
+        _capture_file_snapshot(
+            await asyncio.to_thread(build_file_edit_snapshot, path, original, updated),
         )
         if len(replacements) == 1:
             replacement = replacements[0]
@@ -2769,6 +2918,14 @@ async def edit_file(
                 record_scratch_file_write(p)
                 _notify_memory_source_write(p)
                 _notify_bootstrap_source_write(p)
+                metadata = getattr(sandbox_result, "metadata", {})
+                snapshot = metadata.get("file_snapshot") if isinstance(metadata, dict) else None
+                if (
+                    isinstance(snapshot, dict)
+                    and snapshot.get("kind") == "edit"
+                    and isinstance(snapshot.get("content"), str)
+                ):
+                    _capture_file_snapshot({**snapshot, "path": path})
                 return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
                     backup_summaries
                 )
@@ -2810,6 +2967,9 @@ async def edit_file(
             _notify_bootstrap_source_write(p)
 
     await _run_executor_mutation(_write, settle=_settle_edit)
+    _capture_file_snapshot(
+        await asyncio.to_thread(build_file_edit_snapshot, path, original, updated),
+    )
     if len(replacements) == 1:
         replacement = replacements[0]
         return (
@@ -2844,6 +3004,7 @@ async def edit_file(
             "type": "array",
             "description": (
                 "Non-overlapping inclusive line-range edits against the revision. "
+                "For an empty file, use one edit with start_line=0 and end_line=0. "
                 "Each replacement is complete source text for that range."
             ),
             "items": {
@@ -2887,7 +3048,7 @@ async def edit_file(
     },
     required=["path", "expected_revision", "edits"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.edit",
         argv_factory=lambda a: ("fs.edit", str(a.get("path", ""))),
@@ -2905,7 +3066,13 @@ async def edit_source(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    p = _resolve_path(path)
+    p, attachment_block = await _prepare_attachment_edit_path(
+        path, tool_name="edit_source", approval_id=approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if attachment_block is not None:
+        return attachment_block
     edit_digest = hashlib.sha256(
         json.dumps(
             {"expected_revision": expected_revision, "edits": edits},
@@ -2937,6 +3104,7 @@ async def edit_source(
                 path=p,
                 logical_path=Path(logical_tool_path(path, base=workspace)),
                 paths=(p,),
+                display_path=display_path,
                 expected_revision=expected_revision,
                 edits=tuple(edits),
             ),
@@ -2954,24 +3122,22 @@ async def edit_source(
                 )
             if status == "contract_error":
                 raise RetryableToolInputError(str(getattr(sandbox_result, "message", "")))
-            original_result = metadata.get("original")
-            updated_result = metadata.get("updated")
+            changed_result = metadata.get("changed")
+            diff_summary_result = metadata.get("diffSummary")
             before_revision_result = metadata.get("beforeRevision")
             after_revision_result = metadata.get("afterRevision")
             before_fingerprint = metadata.get("beforeFingerprint")
             after_fingerprint = metadata.get("afterFingerprint")
             if (
                 status != "applied"
-                or not isinstance(original_result, str)
-                or not isinstance(updated_result, str)
+                or not isinstance(changed_result, bool)
+                or not isinstance(diff_summary_result, str)
                 or not isinstance(before_revision_result, str)
                 or not isinstance(after_revision_result, str)
                 or not isinstance(before_fingerprint, dict)
                 or not isinstance(after_fingerprint, dict)
             ):
                 raise ToolError("edit_source worker returned an invalid revision receipt.")
-            original = original_result
-            updated = updated_result
             before_revision = before_revision_result
             after_revision = after_revision_result
             receipt = record_semantic_mutation_receipt(
@@ -2989,7 +3155,7 @@ async def edit_source(
                 },
             )
             workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-            if updated != original:
+            if changed_result:
                 record_workspace_file_write(p, operation="edit_source", created=False)
                 refresh_workspace_file_read_state(p, operation="edit_source")
                 record_scratch_file_write(p)
@@ -2999,11 +3165,11 @@ async def edit_source(
                 {
                     "status": "applied",
                     "path": display_path,
-                    "changed": updated != original,
+                    "changed": changed_result,
                     "before_revision": before_revision,
                     "after_revision": after_revision,
                     "workspace_epoch": workspace_epoch,
-                    "diff_summary": build_diff_summary(original, updated, path=display_path),
+                    "diff_summary": diff_summary_result,
                     "recoverableBackups": list(backup_summaries),
                 },
                 ensure_ascii=False,
@@ -3858,27 +4024,6 @@ def _source_symbol_files(
     return files
 
 
-def _source_symbol_matches_line(path: Path, line: str) -> list[tuple[str, str]]:
-    extension = path.suffix.casefold()
-    matches: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for extensions, kind, regex in _SOURCE_SYMBOL_REGEXES:
-        if extension not in extensions:
-            continue
-        match = regex.search(line)
-        if match is None:
-            continue
-        name = match.group(1)
-        if name in _SOURCE_SYMBOL_IGNORED_NAMES:
-            continue
-        key = (kind, name)
-        if key in seen:
-            continue
-        matches.append(key)
-        seen.add(key)
-    return matches
-
-
 def _source_symbol_query_matches(
     *,
     query: str | None,
@@ -3918,7 +4063,7 @@ def _source_symbol_query_matches(
         },
     },
     required=[],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def source_symbols(

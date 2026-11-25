@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 from opensquilla.contracts.gateway_transport import (
     ANSWER_GENERATION_RESET_CAPABILITY,
+    PROVIDER_CALL_RESET_CAPABILITY,
     TURN_COMMITTED_CAPABILITY,
     TURN_COMMITTED_EVENT,
 )
@@ -96,6 +97,8 @@ class AnswerGenerationResetWire(BaseModel):
     preserve_completed_tools: bool = True
     authoritative_text_snapshot: str = ""
     authoritative_reasoning_snapshot: str = ""
+    reset_scope: Literal["answer", "provider_call"] = "answer"
+    rollback_model_call_id: str = ""
     sequence: int = Field(default=0, ge=0)
     terminal: bool = False
     terminal_text_snapshot: str | None = None
@@ -123,6 +126,7 @@ class TurnCommittedWire(BaseModel):
     schema_version: int = Field(strict=True, ge=1, le=1)
     session_key: str = Field(min_length=1)
     session_id: str | None = None
+    epoch: int | None = Field(default=None, ge=0)
     task_id: str = Field(min_length=1)
     turn_id: str = Field(min_length=1)
     status: Literal["succeeded"]
@@ -157,6 +161,7 @@ _INTERNAL_TERMINAL_RESET_FIELDS = frozenset(
         "terminal_error_message",
         "terminal_error_code",
         "terminal_failure_kind",
+        "terminal_http_status",
     }
 )
 
@@ -227,6 +232,28 @@ def project_session_event_for_client(
             return None
         return event_name, public_payload
 
+    supports_call_reset = PROVIDER_CALL_RESET_CAPABILITY in (client_caps or ())
+    if (
+        not supports_call_reset
+        and event_name
+        in {
+            "session.event.text_delta",
+            "session.event.thinking",
+            "session.event.thinking_start",
+            "session.event.thinking_end",
+        }
+        and isinstance(payload, Mapping)
+        and isinstance(payload.get("model_call_id"), str)
+        and bool(payload["model_call_id"].strip())
+        and payload.get("provider_call_resettable") is not False
+    ):
+        # A legacy observer cannot retract a failed physical attempt. Turns
+        # without call rollback (including CLI-origin turns) can stream safely.
+        # For recoverable turns, keep their
+        # content behind the terminal authoritative snapshot from the first
+        # scoped delta, including when the observer joins through replay.
+        return None
+
     if event_name != _ANSWER_GENERATION_RESET_EVENT or not isinstance(payload, Mapping):
         return event_name, payload
 
@@ -234,9 +261,23 @@ def project_session_event_for_client(
     for field_name in _INTERNAL_TERMINAL_RESET_FIELDS:
         public_payload.pop(field_name, None)
 
+    if public_payload.get("reset_scope") == "provider_call" and not supports_call_reset:
+        if public_payload.get("terminal") is not True:
+            # Legacy clients must advance their generation guard before the next
+            # tool or terminal frame. Their existing replacement handler can
+            # install the accepted prefix and retain completed tool rows. This
+            # also preserves the existing capability-less nonterminal contract.
+            public_payload["reset_scope"] = "answer"
+            public_payload.pop("rollback_model_call_id", None)
+            return event_name, public_payload
+        # The call-local contract is new even for v1 replacement clients.
+        # Their sole failed outcome must use the existing error projection.
+        client_caps = ()
+
     if (
         public_payload.get("terminal") is not True
         or ANSWER_GENERATION_RESET_CAPABILITY in (client_caps or ())
+        or supports_call_reset
     ):
         return event_name, public_payload
 
@@ -318,10 +359,12 @@ class EventFrame(BaseModel):
 
 class PingFrame(BaseModel):
     type: Literal["ping"] = "ping"
+    nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[\x20-\x7e]+$")
 
 
 class PongFrame(BaseModel):
     type: Literal["pong"] = "pong"
+    nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[\x20-\x7e]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -380,11 +423,23 @@ class PolicyInfo(BaseModel):
     max_buffered_bytes: int = MAX_BUFFERED_BYTES
     tick_interval_ms: int = TICK_INTERVAL_MS
     concurrent_history_reads: bool = False
+    chat_send_initial_model: bool = False
+    sessions_routing_model_selection: bool = False
     concurrent_optional_read_methods: list[str] = []
+    cancellable_request_methods: list[str] = []
+    provider_probe_modes: list[str] = []
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000
-    client_ws_keepalive_timeout_ms: int = 120_000
+    client_ws_keepalive_timeout_ms: int = 0
+    transport_probe_nonce: bool = False
+    transport_flow: dict[str, Any] | None = None
+    turn_receipt_lookup: Literal["turns.receipt.read.v1"] | None = None
+    # Additive startup contract.  Older clients ignore this field; clients
+    # that understand startup.services.v1 can render core readiness separately
+    # from integrations that are still starting or degraded.
+    startup_services_v1: bool = False
+    services: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class HelloOk(BaseModel):

@@ -93,7 +93,6 @@ class SandboxSettings(BaseSettings):
     backend: BackendName = "auto"
     allow_legacy_mode: bool = False
     run_mode: RunModeName = "full"
-    auto_setup: bool = True
     host_root_readonly: bool = True
     exclude_slash_tmp: bool = False
     exclude_tmpdir_env_var: bool = False
@@ -113,10 +112,12 @@ class SandboxSettings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def _discard_removed_model_review_settings(cls, values: Any) -> Any:
+    def _discard_removed_settings(cls, values: Any) -> Any:
         if not isinstance(values, dict):
             return values
         cleaned = dict(values)
+        # Nested environment and profile .env inputs bypass the TOML migration.
+        cleaned.pop("auto_setup", None)
         cleaned.pop("approval_review_timeout_seconds", None)
         cleaned.pop("approval_review_max_attempts", None)
         raw_run_mode = cleaned.get("run_mode")

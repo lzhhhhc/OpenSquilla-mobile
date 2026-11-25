@@ -17,6 +17,7 @@ from opensquilla.search.types import (
     SearchResult,
 )
 from opensquilla.secrets import clean_header_secret
+from opensquilla.usage_request import accounted_request
 
 _API_URL = "https://api.bochaai.com/v1/web-search"
 _RECENCY_FRESHNESS: dict[Recency, str] = {
@@ -89,8 +90,13 @@ class BochaSearchProvider:
                 trust_env=self._trust_env,
                 transport=self._transport,
             ) as client:
-                response = await client.post(
+                response = await accounted_request(
+                    client,
+                    "POST",
                     _API_URL,
+                    provider=self.name,
+                    operation="web_search",
+                    base_url="https://api.bochaai.com/v1",
                     json=body,
                     headers={
                         "Authorization": f"Bearer {self._api_key}",
@@ -230,7 +236,7 @@ def _result_from_item(item: dict[str, Any], response_data: dict[str, Any]) -> Se
 
 
 def _safe_metadata(item: dict[str, Any], response_data: dict[str, Any]) -> dict[str, Any]:
-    metadata = {
+    metadata: dict[str, Any] = {
         key: response_data[key]
         for key in ("log_id", "msg")
         if key in response_data

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,18 @@ class SandboxPolicyStore:
         return connection
 
     def _ensure_schema(self) -> None:
-        default = SandboxPolicy()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
+            # Turn construction reads a policy on every request. An otherwise
+            # redundant INSERT OR IGNORE still reserves SQLite's writer slot
+            # and can block the event loop behind the async session writer.
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sandbox_policy'"
+            ).fetchone()
+            if exists and connection.execute(
+                "SELECT 1 FROM sandbox_policy WHERE singleton_id = 1"
+            ).fetchone():
+                return
+            default = SandboxPolicy()
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sandbox_policy (
@@ -68,7 +79,7 @@ class SandboxPolicyStore:
             )
 
     def read(self) -> SandboxPolicy:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT policy_version, policy_json FROM sandbox_policy "
                 "WHERE singleton_id = 1"
